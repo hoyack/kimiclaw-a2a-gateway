@@ -1,7 +1,7 @@
 """Entry point n8n runs on a schedule: python3 -m routing.cli poll --bot rivet
 
 Secrets come only from env (set on the n8n host from the n8n credentials, see RUNBOOK.md):
-JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, A2A_GATEWAY_URL (or A2A_GATEWAY_URL_<BOT>), A2A_GATEWAY_TOKEN.
+JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, A2A_GATEWAY_URL (or A2A_GATEWAY_URL_<BOT>), A2A_GATEWAY_TOKEN. Optional: ROUTING_BLOCKED_STATUS (default Blocked).
 Prints a JSON summary of issue keys only.
 """
 import argparse

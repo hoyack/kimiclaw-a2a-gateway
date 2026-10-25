@@ -27,3 +27,10 @@ def test_n8n_files_match_builder_one_per_bot_inactive_no_secrets():
         assert f"--bot {bot}" in raw and "flock -n" in raw
         assert not re.search(r"(?i)(token|password|secret)\s*[:=]\s*['\"]?\w", raw)
         assert "credentials" not in raw
+
+
+def test_no_brandon_poller_or_cli_choice():
+    import pytest
+    assert not os.path.exists(os.path.join(ROOT, "routing/n8n/poller-brandon.json"))
+    with pytest.raises(SystemExit):
+        main(["poll", "--bot", "brandon"], env={})

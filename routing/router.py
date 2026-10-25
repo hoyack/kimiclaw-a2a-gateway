@@ -4,11 +4,14 @@ Jira is the only dedupe store: the queue JQL only matches To Do, the claim moves
 In Progress, and signed comments mark pickup and result. Logs carry issue keys and error types only.
 """
 import logging
+import os
 import time
 
 LOG = logging.getLogger("routing")
-BOTS = ("rivet", "tugboat", "critic", "bastion", "cpo", "cto", "brandon")
+BOTS = ("rivet", "tugboat", "critic", "bastion", "cpo", "cto")  # bots with a poller
+OWNERS = BOTS + ("brandon",)  # valid owner_ labels; owner_brandon is a human queue, never handed off
 TODO, IN_PROGRESS = "To Do", "In Progress"
+BLOCKED = os.environ.get("ROUTING_BLOCKED_STATUS", "Blocked")
 ATTEMPTS, BACKOFF = 3, (1, 4)
 
 
@@ -28,7 +31,7 @@ def queue_jql(bot):
 
 def owner_of(labels):
     owners = [l[len("owner_"):] for l in labels if l.startswith("owner_")]
-    return owners[0] if len(owners) == 1 and owners[0] in BOTS else None
+    return owners[0] if len(owners) == 1 and owners[0] in OWNERS else None
 
 
 def lint(issues):
@@ -58,9 +61,22 @@ def with_retry(fn, sleep, attempts=ATTEMPTS):
         sleep(BACKOFF[min(n, len(BACKOFF) - 1)])
 
 
+def _since_pickup(bot, comments):
+    """Comments after the latest '[bot] picked up', or None if there is no pickup."""
+    marks = [i for i, c in enumerate(comments) if c.startswith(f"{sig(bot)} picked up")]
+    return comments[marks[-1] + 1:] if marks else None
+
+
+def claimed(bot, comments):
+    """A pickup blocks re-claim unless a later '[bot] failed' follows it (manual re-queue)."""
+    after = _since_pickup(bot, comments)
+    return after is not None and not any(c.startswith(f"{sig(bot)} failed") for c in after)
+
+
 def post_result(bot, jira, key, text, sleep):
     head = f"{sig(bot)} result"
-    if any(c.startswith(head) for c in with_retry(lambda: jira.comments(key), sleep)):
+    after = _since_pickup(bot, with_retry(lambda: jira.comments(key), sleep)) or []
+    if any(c.startswith(head) for c in after):
         return
     with_retry(lambda: jira.comment(key, f"{head}\n\n{text}"), sleep)
 
@@ -68,7 +84,7 @@ def post_result(bot, jira, key, text, sleep):
 def _fail(bot, jira, key, kind, sleep):
     LOG.warning("handoff failed key=%s error_type=%s", key, kind)
     with_retry(lambda: jira.comment(key, f"{sig(bot)} failed: {kind}"), sleep)
-    with_retry(lambda: jira.transition(key, TODO), sleep)
+    with_retry(lambda: jira.transition(key, BLOCKED), sleep)
 
 
 def process(bot, jira, gw, issue, sleep):
@@ -78,7 +94,7 @@ def process(bot, jira, gw, issue, sleep):
         LOG.info("skip malformed key=%s", key)
         return "skipped"
     # Re-read right before claiming: the search result may be stale if another poll ran.
-    if jira.status(key) != TODO or any(c.startswith(f"{sig(bot)} picked up") for c in jira.comments(key)):
+    if jira.status(key) != TODO or claimed(bot, jira.comments(key)):
         return "skipped"
     with_retry(lambda: jira.transition(key, IN_PROGRESS), sleep)
     with_retry(lambda: jira.comment(key, f"{sig(bot)} picked up"), sleep)

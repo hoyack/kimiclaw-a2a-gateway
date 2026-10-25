@@ -1,6 +1,6 @@
 import pytest
 
-from routing.router import BOTS, lint, owner_of, poll_once, queue_jql
+from routing.router import BOTS, OWNERS, lint, owner_of, poll_once, queue_jql
 from tests.ep09.fakes import FakeGateway, FakeJira
 
 NOSLEEP = lambda s: None
@@ -21,7 +21,15 @@ def test_owner_of():
     assert owner_of(["sp_3"]) is None
     assert owner_of(["owner_rivet", "owner_cto"]) is None
     assert owner_of(["owner_ghost"]) is None
-    assert set(BOTS) == {"rivet", "tugboat", "critic", "bastion", "cpo", "cto", "brandon"}
+    assert owner_of(["owner_brandon"]) == "brandon"
+    assert set(OWNERS) == {"rivet", "tugboat", "critic", "bastion", "cpo", "cto", "brandon"}
+
+
+def test_brandon_is_a_human_queue_with_no_poller():
+    assert "brandon" not in BOTS
+    with pytest.raises(ValueError):
+        queue_jql("brandon")
+    assert lint([dict(key="A2A-5", **task(labels=["owner_brandon"]))]) == []
 
 
 def test_lint_flags_missing_and_multiple():
@@ -89,7 +97,7 @@ def test_gateway_failure_bounded_retry_then_one_failure_comment():
     assert len(gw.calls) == 3 and slept == [1, 4]
     c = jira.issues["A2A-1"]["comments"]
     assert c == ["[rivet] picked up", "[rivet] failed: ConnectionError"]
-    assert jira.issues["A2A-1"]["status"] == "To Do"
+    assert jira.issues["A2A-1"]["status"] == "Blocked"
     assert out["failed"] == ["A2A-1"]
 
 
@@ -144,3 +152,44 @@ def test_jira_outage_on_one_issue_does_not_stop_the_poll():
     jira.transition = t
     out = poll_once("rivet", jira, gw, sleep=NOSLEEP)
     assert out["failed"] == ["A2A-1"] and out["completed"] == ["A2A-2"]
+
+
+def test_failure_goes_to_blocked_status_from_env(monkeypatch):
+    import routing.router as r
+    monkeypatch.setattr(r, "BLOCKED", "On Hold")
+    jira = FakeJira({"A2A-1": task()})
+    poll_once("rivet", jira, FakeGateway(fail="ConnectionError"), sleep=NOSLEEP)
+    assert jira.transitions == [("A2A-1", "In Progress"), ("A2A-1", "On Hold")]
+
+
+def test_manual_move_back_to_todo_requeues_exactly_once():
+    jira, bad = FakeJira({"A2A-1": task()}), FakeGateway(fail="ConnectionError")
+    poll_once("rivet", jira, bad, sleep=NOSLEEP)
+    assert jira.issues["A2A-1"]["status"] == "Blocked"
+    poll_once("rivet", jira, bad, sleep=NOSLEEP)  # Blocked is not in the queue
+    assert len(bad.calls) == 3
+    jira.issues["A2A-1"]["status"] = "To Do"  # human re-queues
+    good = FakeGateway(reply="second try")
+    poll_once("rivet", jira, good, sleep=NOSLEEP)
+    poll_once("rivet", jira, good, sleep=NOSLEEP)
+    assert len(good.calls) == 1
+    c = jira.issues["A2A-1"]["comments"]
+    assert c == ["[rivet] picked up", "[rivet] failed: ConnectionError",
+                 "[rivet] picked up", "[rivet] result\n\nsecond try"]
+
+
+def test_result_check_only_counts_results_after_latest_pickup():
+    from routing.router import post_result
+    jira = FakeJira({"A2A-1": task(status="In Progress")})
+    jira.issues["A2A-1"]["comments"] += ["[rivet] picked up", "[rivet] result\n\nold",
+                                         "[rivet] picked up"]
+    post_result("rivet", jira, "A2A-1", "new", sleep=NOSLEEP)
+    assert jira.issues["A2A-1"]["comments"][-1] == "[rivet] result\n\nnew"
+
+
+def test_done_task_moved_back_to_todo_is_not_rerun():
+    jira, gw = FakeJira({"A2A-1": task()}), FakeGateway()
+    poll_once("rivet", jira, gw, sleep=NOSLEEP)
+    jira.issues["A2A-1"]["status"] = "To Do"
+    poll_once("rivet", jira, gw, sleep=NOSLEEP)
+    assert len(gw.calls) == 1
