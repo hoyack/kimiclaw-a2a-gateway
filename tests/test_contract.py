@@ -213,9 +213,12 @@ def test_success_prompt_not_in_stdout_or_logs_by_default(tmp_path):
         assert "PROMPT-OK-77" not in text
 
 
-def test_success_prompt_logged_when_payload_flag_on(tmp_path):
-    out, _ = _run_success(tmp_path, {"GATEWAY_LOG_PAYLOADS": "1"})
-    assert "PROMPT-OK-77" in out
+def test_success_prompt_never_logged_even_with_legacy_payload_flag(tmp_path):
+    # F26: GATEWAY_LOG_PAYLOADS was removed; setting it must not log bodies.
+    out, logs = _run_success(tmp_path, {"GATEWAY_LOG_PAYLOADS": "1"})
+    assert "inbound task_id=" in out and "len=18" in out
+    for text in (out, logs):
+        assert "PROMPT-OK-77" not in text
 
 
 def test_notify_failure_logs_type_and_host_only(tmp_path):

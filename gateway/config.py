@@ -36,7 +36,6 @@ NOTIFY_EVENTS = {e.strip() for e in os.environ.get(
 NOTIFY_TIMEOUT = 10
 NOTIFY_FAIL_LIMIT = int(os.environ.get("GATEWAY_NOTIFY_FAIL_LIMIT", "5"))
 NOTIFY_COOLDOWN_S = int(os.environ.get("GATEWAY_NOTIFY_COOLDOWN_S", "900"))
-LOG_PAYLOADS = os.environ.get("GATEWAY_LOG_PAYLOADS", "0") == "1"
 MAX_TEXT = 200_000
 AGENT_TIMEOUT = 560           # seconds, passed to openclaw
 AGENT_CONCURRENCY = 3         # concurrent agent turns

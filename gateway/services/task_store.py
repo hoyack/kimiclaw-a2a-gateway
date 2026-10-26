@@ -4,7 +4,7 @@ import re
 import time
 import uuid
 
-from gateway.config import AGENT_CONCURRENCY, LOG, LOG_PAYLOADS, MAX_TEXT, TASK_TTL
+from gateway.config import AGENT_CONCURRENCY, LOG, MAX_TEXT, TASK_TTL
 from gateway.models import extract_text, make_agent_message, now, rpc_error
 from gateway.services.agent_runner import run_agent
 from gateway.services.notifier import notify
@@ -94,8 +94,9 @@ async def start_task(req_id, params, queue: asyncio.Queue | None):
     task_id = msg.get("taskId") or str(uuid.uuid4())
     ctx_id = msg.get("contextId") or str(uuid.uuid4())
 
-    if LOG_PAYLOADS:
-        LOG.info("inbound task_id=%s ctx=%s role=%s text=%r", task_id, ctx_id, msg.get("role"), text[:2000])
+    # F26: never log message bodies; ids and length only.
+    if msg.get("messageId"):
+        LOG.info("inbound task_id=%s message_id=%s len=%d", task_id, msg.get("messageId"), len(text))
     else:
         LOG.info("inbound task_id=%s len=%d", task_id, len(text))
 

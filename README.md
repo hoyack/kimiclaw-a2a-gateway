@@ -74,7 +74,6 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | `GATEWAY_NOTIFY_EVENTS` | `task_completed,task_failed` | `task_started` also allowed |
 | `GATEWAY_NOTIFY_FAIL_LIMIT` | `5` | consecutive failures before circuit breaker opens |
 | `GATEWAY_NOTIFY_COOLDOWN_S` | `900` | breaker pause |
-| `GATEWAY_LOG_PAYLOADS` | `0` | `1` logs inbound message text (first 2000 chars) to stdout; otherwise only task id and length |
 | `GATEWAY_TELEMETRY_DIR` | `telemetry` | new: where trace/metric/log files go |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | new: when set (e.g. `https://otel.example.com:4318`), traces, metrics and logs go via OTLP/HTTP **instead of** the files. Standard `OTEL_*` vars apply. `http://` to a non-localhost host logs a plaintext warning |
 | `OTEL_SERVICE_NAME` | `kimiclaw-a2a-gateway` | new |
