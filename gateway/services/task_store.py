@@ -81,6 +81,18 @@ async def execute_task(task_id: str, ctx_id: str, text: str, queue: asyncio.Queu
     })
 
 
+MAX_LOG_ID = 128
+
+
+def _log_safe(value) -> str:
+    """Client-supplied ids go in log lines: escape control chars (no log forging) and cap the length."""
+    s = str(value)[:MAX_LOG_ID]
+    return "".join(
+        c if c.isprintable() else (f"\\x{ord(c):02x}" if ord(c) < 256 else f"\\u{ord(c):04x}")
+        for c in s
+    )
+
+
 async def start_task(req_id, params, queue: asyncio.Queue | None):
     msg = params.get("message") or {}
     if msg.get("role") not in (None, "user"):
@@ -96,7 +108,7 @@ async def start_task(req_id, params, queue: asyncio.Queue | None):
 
     # F26: never log message bodies; ids and length only.
     if msg.get("messageId"):
-        LOG.info("inbound task_id=%s message_id=%s len=%d", task_id, msg.get("messageId"), len(text))
+        LOG.info("inbound task_id=%s message_id=%s len=%d", task_id, _log_safe(msg.get("messageId")), len(text))
     else:
         LOG.info("inbound task_id=%s len=%d", task_id, len(text))
 

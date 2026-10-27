@@ -69,9 +69,11 @@ def _read_spans(tdir):
     return [json.loads(l) for l in (tdir / "traces.jsonl").read_text().splitlines() if l.strip()]
 
 
-def _rpc(text, task_id, method="message/send"):
-    return {"jsonrpc": "2.0", "id": "1", "method": method,
-            "params": {"message": {"parts": [{"kind": "text", "text": text}], "taskId": task_id}}}
+def _rpc(text, task_id, method="message/send", message_id=None):
+    msg = {"parts": [{"kind": "text", "text": text}], "taskId": task_id}
+    if message_id is not None:
+        msg["messageId"] = message_id
+    return {"jsonrpc": "2.0", "id": "1", "method": method, "params": {"message": msg}}
 
 
 def test_rpc_agent_notify_spans_share_one_trace(tmp_path, mock):
@@ -200,7 +202,7 @@ def _run_success(tmp_path, env):
     tdir = tmp_path / "tel"
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_TELEMETRY_DIR": str(tdir), **env})
     h = {"Authorization": f"Bearer {TOKEN}"}
-    r = httpx.post(base + "/", json=_rpc("PROMPT-OK-77 hello", "ok77"), headers=h, timeout=30).json()
+    r = httpx.post(base + "/", json=_rpc("PROMPT-OK-77 hello", "ok77", message_id="mid-77"), headers=h, timeout=30).json()
     assert r["result"]["status"]["state"] != "failed"
     p.terminate(); p.wait(10)
     return (tmp_path / "gateway.log").read_text(), (tdir / "logs.jsonl").read_text()
@@ -208,7 +210,7 @@ def _run_success(tmp_path, env):
 
 def test_success_prompt_not_in_stdout_or_logs_by_default(tmp_path):
     out, logs = _run_success(tmp_path, {})
-    assert "inbound task_id=" in out and "len=18" in out
+    assert "inbound task_id=ok77 message_id=mid-77 len=18" in out
     for text in (out, logs):
         assert "PROMPT-OK-77" not in text
 
@@ -216,9 +218,26 @@ def test_success_prompt_not_in_stdout_or_logs_by_default(tmp_path):
 def test_success_prompt_never_logged_even_with_legacy_payload_flag(tmp_path):
     # F26: GATEWAY_LOG_PAYLOADS was removed; setting it must not log bodies.
     out, logs = _run_success(tmp_path, {"GATEWAY_LOG_PAYLOADS": "1"})
-    assert "inbound task_id=" in out and "len=18" in out
+    assert "inbound task_id=ok77 message_id=mid-77 len=18" in out
     for text in (out, logs):
         assert "PROMPT-OK-77" not in text
+
+
+def test_client_message_id_cannot_forge_log_lines(tmp_path):
+    import httpx
+    from conftest import start_gateway, TOKEN
+    p, base, _ = start_gateway(tmp_path, {})
+    h = {"Authorization": f"Bearer {TOKEN}"}
+    forged = "m1\r\nFORGED-LINE level=ERROR\x1b[31m\u2028x" + "A" * 500
+    r = httpx.post(base + "/", json=_rpc("hello", "forge1", message_id=forged), headers=h, timeout=30).json()
+    assert r["result"]["status"]["state"] != "failed"
+    p.terminate(); p.wait(10)
+    lines = (tmp_path / "gateway.log").read_text().splitlines()
+    inbound = [l for l in lines if "inbound task_id=forge1" in l]
+    assert len(inbound) == 1, lines
+    assert not any(l.startswith("FORGED-LINE") for l in lines)
+    assert "\x1b" not in inbound[0] and "\u2028" not in inbound[0] and "\r" not in inbound[0]
+    assert "A" * 129 not in inbound[0]
 
 
 def test_notify_failure_logs_type_and_host_only(tmp_path):
