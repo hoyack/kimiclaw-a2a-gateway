@@ -5,7 +5,7 @@ import json
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from gateway.config import AGENT_TIMEOUT, LOG
+from gateway.config import AGENT_TIMEOUT, LOG, log_safe
 from gateway.models import now, rpc_error
 from gateway.services.task_store import start_task, tasks
 
@@ -28,7 +28,7 @@ async def sse_events(req_id, queue: asyncio.Queue):
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        LOG.error("sse error req_id=%s error_type=%s", req_id, type(e).__name__)
+        LOG.error("sse error req_id=%s error_type=%s", log_safe(req_id), type(e).__name__)
         yield f"data: {json.dumps(rpc_error(req_id, -32000, f'stream error: {e}'))}\n\n"
 
 

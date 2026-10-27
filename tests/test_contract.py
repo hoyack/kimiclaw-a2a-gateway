@@ -223,21 +223,102 @@ def test_success_prompt_never_logged_even_with_legacy_payload_flag(tmp_path):
         assert "PROMPT-OK-77" not in text
 
 
+# Every char that str.splitlines()/a log viewer may treat as a line break or terminal control.
+# Assert on the RAW text (never splitlines(), which would swallow these separators and hide them).
+_BAD_CHARS = ["\r", "\x0b", "\x0c", "\x1b", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+_FORGE_TAIL = "\r\nFORGED-LINE level=ERROR\x1b[31m\u2028\u2029\x85\x1c\x1d\x1e\x0b\x0cx"
+
+
+def _assert_no_forgery(raw):
+    lines = raw.split("\n")  # '\n' only: splitlines() also splits on U+2028/2029/NEL/\x1c-\x1e and would hide them
+    for c in _BAD_CHARS:
+        assert c not in raw, f"unescaped {c!r} in log"
+    assert not any(l.startswith("FORGED-LINE") for l in lines), raw
+
+
+def _py(prog, *args):
+    import subprocess, sys
+    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "PYTHONIOENCODING": "utf-8"}
+    return subprocess.run([sys.executable, "-c", prog, *args], env=env, capture_output=True, timeout=30,
+                          cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def test_log_safe_escapes_all_line_separators_and_caps_length():
+    prog = ("import sys, json\nfrom gateway.config import log_safe, MAX_LOG_ID\n"
+            "print(json.dumps([log_safe(sys.argv[1]), log_safe(12345), log_safe({'a': 1}), MAX_LOG_ID]))")
+    import json
+    r = _py(prog, "a" + _FORGE_TAIL + "B" * 500)
+    out, num, dct, cap = json.loads(r.stdout.decode("utf-8"))
+    for c in _BAD_CHARS + ["\n"]:
+        assert c not in out
+    for esc in ("\\u2028", "\\u2029", "\\x85", "\\x1c", "\\x1d", "\\x1e", "\\x0d", "\\x0a"):
+        assert esc in out, esc
+    assert out.count("B") < cap
+    assert num == "12345" and dct == "{'a': 1}"
+
+
 def test_client_message_id_cannot_forge_log_lines(tmp_path):
     import httpx
     from conftest import start_gateway, TOKEN
-    p, base, _ = start_gateway(tmp_path, {})
+    p, base, _ = start_gateway(tmp_path, {"PYTHONIOENCODING": "utf-8"})
     h = {"Authorization": f"Bearer {TOKEN}"}
-    forged = "m1\r\nFORGED-LINE level=ERROR\x1b[31m\u2028x" + "A" * 500
+    forged = "m1" + _FORGE_TAIL + "A" * 500
     r = httpx.post(base + "/", json=_rpc("hello", "forge1", message_id=forged), headers=h, timeout=30).json()
     assert r["result"]["status"]["state"] != "failed"
     p.terminate(); p.wait(10)
-    lines = (tmp_path / "gateway.log").read_text().splitlines()
-    inbound = [l for l in lines if "inbound task_id=forge1" in l]
-    assert len(inbound) == 1, lines
-    assert not any(l.startswith("FORGED-LINE") for l in lines)
-    assert "\x1b" not in inbound[0] and "\u2028" not in inbound[0] and "\r" not in inbound[0]
+    raw = (tmp_path / "gateway.log").read_text(encoding="utf-8")
+    inbound = [l for l in raw.split("\n") if "inbound task_id=forge1" in l]
+    assert len(inbound) == 1, raw
+    _assert_no_forgery(raw)
     assert "A" * 129 not in inbound[0]
+
+
+def test_client_task_id_cannot_forge_log_lines(tmp_path, mock):
+    """taskId is client-controlled and reaches inbound, agent-failed and notify (ok + failed) log lines."""
+    import httpx
+    from conftest import start_gateway, TOKEN
+    h = {"Authorization": f"Bearer {TOKEN}"}
+    forged = "t1" + _FORGE_TAIL + "B" * 500
+    for name, url, text in (("ok", f"http://127.0.0.1:{mock.port}/hook", "hello FAIL"),
+                            ("down", "http://127.0.0.1:9/hook", "hello FAIL")):
+        d = tmp_path / name; d.mkdir()
+        p, base, _ = start_gateway(d, {"PYTHONIOENCODING": "utf-8", "GATEWAY_NOTIFY_URL": url})
+        httpx.post(base + "/", json=_rpc(text, forged), headers=h, timeout=30).json()
+        import time
+        for _ in range(50):
+            raw = (d / "gateway.log").read_text(encoding="utf-8")
+            if "notify task_failed" in raw:
+                break
+            time.sleep(0.1)
+        p.terminate(); p.wait(10)
+        raw = (d / "gateway.log").read_text(encoding="utf-8")
+        for needle in ("inbound task_id=t1", "agent run failed task=t1", "notify task_failed task=t1"):
+            hits = [l for l in raw.split("\n") if needle in l]
+            assert len(hits) == 1, (name, needle, raw)
+            assert "B" * 129 not in hits[0]
+        _assert_no_forgery(raw)
+
+
+def test_sse_req_id_cannot_forge_log_lines():
+    """reqId (JSON-RPC id) is client-controlled and is logged on SSE stream errors."""
+    import subprocess, sys
+    prog = (
+        "import asyncio, sys\n"
+        "from gateway.controllers.rpc import sse_events\n"
+        "class Q:\n"
+        "    async def get(self): raise RuntimeError('boom')\n"
+        "async def main():\n"
+        "    async for _ in sse_events(sys.argv[1], Q()): pass\n"
+        "asyncio.run(main())\n"
+    )
+    forged = "r1" + _FORGE_TAIL + "C" * 500
+    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "PYTHONIOENCODING": "utf-8"}
+    r = subprocess.run([sys.executable, "-c", prog, forged], cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       env=env, capture_output=True, timeout=30)
+    raw = r.stderr.decode("utf-8")
+    assert "sse error req_id=r1" in raw, (r.returncode, raw)
+    _assert_no_forgery(raw)
+    assert "C" * 129 not in raw
 
 
 def test_notify_failure_logs_type_and_host_only(tmp_path):
