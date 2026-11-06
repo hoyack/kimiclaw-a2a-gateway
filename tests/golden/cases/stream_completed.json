@@ -1,0 +1,139 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": "bearer",
+        "json": {
+          "jsonrpc": "2.0",
+          "id": 9,
+          "method": "message/stream",
+          "params": {
+            "message": {
+              "role": "user",
+              "messageId": "m1",
+              "parts": [
+                {
+                  "kind": "text",
+                  "text": "hi"
+                }
+              ],
+              "taskId": "t-s",
+              "contextId": "c-s"
+            }
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-cache",
+          "content-type": "text/event-stream; charset=utf-8"
+        },
+        "sse_frames": [
+          {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": {
+              "kind": "status-update",
+              "taskId": "t-s",
+              "contextId": "c-s",
+              "final": false,
+              "status": {
+                "state": "working",
+                "timestamp": "<ts>"
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": {
+              "kind": "artifact-update",
+              "taskId": "t-s",
+              "contextId": "c-s",
+              "final": false,
+              "artifact": {
+                "artifactId": "<uuid>",
+                "name": "reply",
+                "index": 0,
+                "parts": [
+                  {
+                    "kind": "text",
+                    "text": "echo: hi"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "result": {
+              "kind": "status-update",
+              "taskId": "t-s",
+              "contextId": "c-s",
+              "final": true,
+              "status": {
+                "state": "completed",
+                "message": {
+                  "role": "agent",
+                  "parts": [
+                    {
+                      "kind": "text",
+                      "text": "echo: hi"
+                    }
+                  ],
+                  "messageId": "<uuid>"
+                },
+                "timestamp": "<ts>"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": [
+    {
+      "method": "POST",
+      "path": "/webhook/firewall",
+      "headers": {
+        "user-agent": "Python-urllib/3.13",
+        "content-type": "application/json",
+        "authorization": "dummy-test-token"
+      },
+      "header_names": [
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "user-agent"
+      ],
+      "json": {
+        "event": "task_completed",
+        "source": "kimiclaw-a2a-gateway",
+        "taskId": "t-s",
+        "contextId": "c-s",
+        "timestamp": "<ts>",
+        "state": "completed",
+        "reply": "echo: hi",
+        "durationMs": "<int>"
+      },
+      "key_order": [
+        "event",
+        "source",
+        "taskId",
+        "contextId",
+        "timestamp",
+        "state",
+        "reply",
+        "durationMs"
+      ],
+      "default_separators": true
+    }
+  ]
+}

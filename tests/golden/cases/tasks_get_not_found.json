@@ -1,0 +1,39 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": "bearer",
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "method": "tasks/get",
+          "params": {
+            "id": "nope"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "error": {
+            "code": -32001,
+            "message": "task not found"
+          }
+        },
+        "raw_key_order": [
+          "jsonrpc",
+          "id",
+          "error"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": []
+}

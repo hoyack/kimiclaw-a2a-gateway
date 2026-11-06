@@ -1,0 +1,37 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": "bearer",
+        "json": {
+          "jsonrpc": "2.0",
+          "id": 7,
+          "method": "foo/bar",
+          "params": {}
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "jsonrpc": "2.0",
+          "id": 7,
+          "error": {
+            "code": -32601,
+            "message": "method not found: foo/bar"
+          }
+        },
+        "raw_key_order": [
+          "jsonrpc",
+          "id",
+          "error"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": []
+}

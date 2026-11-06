@@ -1,0 +1,118 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": "bearer",
+        "json": {
+          "jsonrpc": "2.0",
+          "id": 10,
+          "method": "message/stream",
+          "params": {
+            "message": {
+              "role": "user",
+              "messageId": "m1",
+              "parts": [
+                {
+                  "kind": "text",
+                  "text": "FAIL"
+                }
+              ],
+              "taskId": "t-sf",
+              "contextId": "c-sf"
+            }
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "cache-control": "no-cache",
+          "content-type": "text/event-stream; charset=utf-8"
+        },
+        "sse_frames": [
+          {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "result": {
+              "kind": "status-update",
+              "taskId": "t-sf",
+              "contextId": "c-sf",
+              "final": false,
+              "status": {
+                "state": "working",
+                "timestamp": "<ts>"
+              }
+            }
+          },
+          {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "result": {
+              "kind": "status-update",
+              "taskId": "t-sf",
+              "contextId": "c-sf",
+              "final": true,
+              "status": {
+                "state": "failed",
+                "message": {
+                  "role": "agent",
+                  "parts": [
+                    {
+                      "kind": "text",
+                      "text": "agent error: agent exited 3: boom\n"
+                    }
+                  ],
+                  "messageId": "<uuid>"
+                },
+                "timestamp": "<ts>"
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": [
+    {
+      "method": "POST",
+      "path": "/webhook/firewall",
+      "headers": {
+        "user-agent": "Python-urllib/3.13",
+        "content-type": "application/json",
+        "authorization": "dummy-test-token"
+      },
+      "header_names": [
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "user-agent"
+      ],
+      "json": {
+        "event": "task_failed",
+        "source": "kimiclaw-a2a-gateway",
+        "taskId": "t-sf",
+        "contextId": "c-sf",
+        "timestamp": "<ts>",
+        "state": "failed",
+        "reply": "agent error: agent exited 3: boom\n",
+        "durationMs": "<int>"
+      },
+      "key_order": [
+        "event",
+        "source",
+        "taskId",
+        "contextId",
+        "timestamp",
+        "state",
+        "reply",
+        "durationMs"
+      ],
+      "default_separators": true
+    }
+  ]
+}

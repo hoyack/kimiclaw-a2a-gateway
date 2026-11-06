@@ -1,0 +1,32 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": null,
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "method": "tasks/get",
+          "params": {
+            "id": "x"
+          }
+        }
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "error": "unauthorized"
+        },
+        "raw_key_order": [
+          "error"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": []
+}

@@ -1,0 +1,78 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/.well-known/agent.json",
+        "auth": null
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "protocolVersion": "1.0",
+          "name": "Kimiclaw",
+          "description": "A2A gateway into the OpenClaw agent (kimi-claw). Research, code, ops, writing, automation.",
+          "url": "https://kimiclaw.hoyack.ai/",
+          "provider": {
+            "organization": "hoyack"
+          },
+          "version": "0.1.0",
+          "capabilities": {
+            "streaming": true,
+            "pushNotifications": false,
+            "stateTransitionHistory": false
+          },
+          "securitySchemes": {
+            "bearerAuth": {
+              "type": "http",
+              "scheme": "bearer"
+            }
+          },
+          "security": [
+            {
+              "bearerAuth": []
+            }
+          ],
+          "defaultInputModes": [
+            "text"
+          ],
+          "defaultOutputModes": [
+            "text"
+          ],
+          "skills": [
+            {
+              "id": "general-agent",
+              "name": "General agent",
+              "description": "General-purpose agent: research, coding, shell ops, writing, planning, automation.",
+              "tags": [
+                "general-purpose",
+                "agent",
+                "openclaw"
+              ]
+            }
+          ],
+          "supportsAuthenticatedExtendedCard": false
+        },
+        "raw_key_order": [
+          "protocolVersion",
+          "name",
+          "description",
+          "url",
+          "provider",
+          "version",
+          "capabilities",
+          "securitySchemes",
+          "security",
+          "defaultInputModes",
+          "defaultOutputModes",
+          "skills",
+          "supportsAuthenticatedExtendedCard"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": []
+}

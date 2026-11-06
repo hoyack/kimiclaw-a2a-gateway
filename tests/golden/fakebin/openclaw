@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Fake openclaw CLI: records argv, emits a result envelope like the real one."""
+import json, os, sys, time
+rec = os.environ["FAKE_OPENCLAW_RECORD"]
+with open(rec, "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\n")
+msg = sys.argv[sys.argv.index("--message") + 1]
+if "FAIL" in msg:
+    sys.stderr.write("boom\n"); sys.exit(3)
+if "SLOW" in msg:
+    time.sleep(2)
+sys.stderr.write("[log] noise line\n{not json\n")
+sys.stderr.write(json.dumps({"payloads": [{"text": "echo: " + msg}], "meta": {}}) + "\n")
