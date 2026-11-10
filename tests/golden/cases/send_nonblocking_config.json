@@ -1,0 +1,100 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": "bearer",
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "method": "message/send",
+          "params": {
+            "message": {
+              "role": "user",
+              "messageId": "m1",
+              "parts": [
+                {
+                  "kind": "text",
+                  "text": "SLOW"
+                }
+              ],
+              "taskId": "t-nb2"
+            },
+            "configuration": {
+              "blocking": false
+            }
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "result": {
+            "id": "t-nb2",
+            "contextId": "<uuid>",
+            "kind": "task",
+            "status": {
+              "state": "submitted",
+              "timestamp": "<ts>"
+            },
+            "artifacts": [],
+            "history": [],
+            "final": false
+          }
+        },
+        "raw_key_order": [
+          "jsonrpc",
+          "id",
+          "result"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": [
+    {
+      "method": "POST",
+      "path": "/webhook/firewall",
+      "headers": {
+        "user-agent": "Python-urllib/3.13",
+        "content-type": "application/json",
+        "authorization": "dummy-test-token"
+      },
+      "header_names": [
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "user-agent"
+      ],
+      "json": {
+        "event": "task_completed",
+        "source": "kimiclaw-a2a-gateway",
+        "taskId": "t-nb2",
+        "contextId": "<uuid>",
+        "timestamp": "<ts>",
+        "state": "completed",
+        "reply": "echo: SLOW",
+        "durationMs": "<int>"
+      },
+      "key_order": [
+        "event",
+        "source",
+        "taskId",
+        "contextId",
+        "timestamp",
+        "state",
+        "reply",
+        "durationMs"
+      ],
+      "default_separators": true
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": "bearer"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "error": {
+            "code": -32602,
+            "message": "message too large"
+          }
+        },
+        "raw_key_order": [
+          "jsonrpc",
+          "id",
+          "error"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": []
+}

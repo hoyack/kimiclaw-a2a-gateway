@@ -1,0 +1,280 @@
+openapi: 3.1.0
+info:
+  title: Kimiclaw A2A Gateway
+  version: 0.1.0
+paths:
+  /:
+    get:
+      summary: Root
+      operationId: root__get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+    post:
+      summary: A2A JSON-RPC 2.0
+      operationId: rpc__post
+      responses:
+        '200':
+          description: JSON-RPC response, or text/event-stream for message/stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JsonRpcResponse'
+            text/event-stream:
+              schema:
+                type: string
+        '400':
+          description: parse error (-32700)
+        '401':
+          description: unauthorized
+      description: Validation errors (-32602), unknown method (-32601), not found
+        (-32001) and gateway timeout (-32000) return HTTP 200 with a JSON-RPC error.
+        Parse error returns 400.
+      parameters:
+      - name: wait
+        in: query
+        required: false
+        schema:
+          type: string
+          default: 'true'
+        description: 'message/send only: ''false'' returns the task immediately'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JsonRpcRequest'
+  /.well-known/agent.json:
+    get:
+      summary: Agent Card
+      operationId: agent_card__well_known_agent_json_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+  /healthz:
+    get:
+      summary: Healthz
+      operationId: healthz_healthz_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+      security: []
+  /readyz:
+    get:
+      summary: Readyz
+      operationId: readyz_readyz_get
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema: {}
+components:
+  schemas:
+    Message:
+      properties:
+        role:
+          anyOf:
+          - const: user
+            type: string
+          - type: 'null'
+          default: null
+          description: Only 'user' (or omitted) is accepted
+          title: Role
+        messageId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+          title: Messageid
+        parts:
+          items:
+            $ref: '#/components/schemas/Part'
+          title: Parts
+          type: array
+        taskId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+          description: Reuse or set the task id; generated if absent
+          title: Taskid
+        contextId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+          description: Maps to OpenClaw session a2a-<contextId>
+          title: Contextid
+      required:
+      - parts
+      title: Message
+      type: object
+    Part:
+      properties:
+        kind:
+          enum:
+          - text
+          - data
+          - file
+          title: Kind
+          type: string
+        text:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+          title: Text
+        data:
+          anyOf:
+          - {}
+          - type: 'null'
+          default: null
+          title: Data
+        file:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          default: null
+          title: File
+      required:
+      - kind
+      title: Part
+      type: object
+    RpcParams:
+      properties:
+        message:
+          anyOf:
+          - $ref: '#/components/schemas/Message'
+          - type: 'null'
+          default: null
+          description: message/send, message/stream
+        configuration:
+          anyOf:
+          - $ref: '#/components/schemas/SendConfiguration'
+          - type: 'null'
+          default: null
+        id:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+          description: tasks/get, tasks/cancel
+          title: Id
+        taskId:
+          anyOf:
+          - type: string
+          - type: 'null'
+          default: null
+          description: alias of id for tasks/get, tasks/cancel
+          title: Taskid
+      title: RpcParams
+      type: object
+    SendConfiguration:
+      properties:
+        blocking:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          default: null
+          description: false returns the task immediately (submitted)
+          title: Blocking
+      title: SendConfiguration
+      type: object
+    JsonRpcRequest:
+      properties:
+        jsonrpc:
+          const: '2.0'
+          default: '2.0'
+          title: Jsonrpc
+          type: string
+        id:
+          anyOf:
+          - type: string
+          - type: integer
+          - type: 'null'
+          default: null
+          title: Id
+        method:
+          enum:
+          - message/send
+          - message/stream
+          - tasks/get
+          - tasks/cancel
+          title: Method
+          type: string
+        params:
+          $ref: '#/components/schemas/RpcParams'
+          default:
+            message: null
+            configuration: null
+            id: null
+            taskId: null
+      required:
+      - method
+      title: JsonRpcRequest
+      type: object
+    RpcError:
+      properties:
+        code:
+          title: Code
+          type: integer
+        message:
+          title: Message
+          type: string
+        data:
+          anyOf:
+          - {}
+          - type: 'null'
+          default: null
+          title: Data
+      required:
+      - code
+      - message
+      title: RpcError
+      type: object
+    JsonRpcResponse:
+      properties:
+        jsonrpc:
+          const: '2.0'
+          default: '2.0'
+          title: Jsonrpc
+          type: string
+        id:
+          anyOf:
+          - type: string
+          - type: integer
+          - type: 'null'
+          default: null
+          title: Id
+        result:
+          anyOf:
+          - additionalProperties: true
+            type: object
+          - type: 'null'
+          default: null
+          description: Task, or SSE event when streaming
+          title: Result
+        error:
+          anyOf:
+          - $ref: '#/components/schemas/RpcError'
+          - type: 'null'
+          default: null
+      title: JsonRpcResponse
+      type: object
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+security:
+- bearerAuth: []

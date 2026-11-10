@@ -1,0 +1,30 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/",
+        "auth": "bearer"
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "service": "kimiclaw-a2a-gateway",
+          "protocol": "A2A 1.0",
+          "agent_card": "/.well-known/agent.json",
+          "rpc": "POST / (JSON-RPC 2.0)"
+        },
+        "raw_key_order": [
+          "service",
+          "protocol",
+          "agent_card",
+          "rpc"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": []
+}

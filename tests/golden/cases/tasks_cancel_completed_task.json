@@ -1,0 +1,205 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": "bearer",
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "method": "message/send",
+          "params": {
+            "message": {
+              "role": "user",
+              "messageId": "m1",
+              "parts": [
+                {
+                  "kind": "text",
+                  "text": "hello"
+                }
+              ],
+              "taskId": "t-cc"
+            }
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "result": {
+            "id": "t-cc",
+            "contextId": "<uuid>",
+            "kind": "task",
+            "status": {
+              "state": "completed",
+              "message": {
+                "role": "agent",
+                "parts": [
+                  {
+                    "kind": "text",
+                    "text": "echo: hello"
+                  }
+                ],
+                "messageId": "<uuid>"
+              },
+              "timestamp": "<ts>"
+            },
+            "artifacts": [
+              {
+                "artifactId": "<uuid>",
+                "name": "reply",
+                "index": 0,
+                "parts": [
+                  {
+                    "kind": "text",
+                    "text": "echo: hello"
+                  }
+                ]
+              }
+            ],
+            "history": [
+              {
+                "role": "agent",
+                "parts": [
+                  {
+                    "kind": "text",
+                    "text": "echo: hello"
+                  }
+                ],
+                "messageId": "<uuid>"
+              }
+            ],
+            "final": true
+          }
+        },
+        "raw_key_order": [
+          "jsonrpc",
+          "id",
+          "result"
+        ]
+      }
+    },
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": "bearer",
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "method": "tasks/cancel",
+          "params": {
+            "id": "t-cc"
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "result": {
+            "id": "t-cc",
+            "contextId": "<uuid>",
+            "kind": "task",
+            "status": {
+              "state": "completed",
+              "message": {
+                "role": "agent",
+                "parts": [
+                  {
+                    "kind": "text",
+                    "text": "echo: hello"
+                  }
+                ],
+                "messageId": "<uuid>"
+              },
+              "timestamp": "<ts>"
+            },
+            "artifacts": [
+              {
+                "artifactId": "<uuid>",
+                "name": "reply",
+                "index": 0,
+                "parts": [
+                  {
+                    "kind": "text",
+                    "text": "echo: hello"
+                  }
+                ]
+              }
+            ],
+            "history": [
+              {
+                "role": "agent",
+                "parts": [
+                  {
+                    "kind": "text",
+                    "text": "echo: hello"
+                  }
+                ],
+                "messageId": "<uuid>"
+              }
+            ],
+            "final": true
+          }
+        },
+        "raw_key_order": [
+          "jsonrpc",
+          "id",
+          "result"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": [
+    {
+      "method": "POST",
+      "path": "/webhook/firewall",
+      "headers": {
+        "user-agent": "Python-urllib/3.13",
+        "content-type": "application/json",
+        "authorization": "dummy-test-token"
+      },
+      "header_names": [
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "user-agent"
+      ],
+      "json": {
+        "event": "task_completed",
+        "source": "kimiclaw-a2a-gateway",
+        "taskId": "t-cc",
+        "contextId": "<uuid>",
+        "timestamp": "<ts>",
+        "state": "completed",
+        "reply": "echo: hello",
+        "durationMs": "<int>"
+      },
+      "key_order": [
+        "event",
+        "source",
+        "taskId",
+        "contextId",
+        "timestamp",
+        "state",
+        "reply",
+        "durationMs"
+      ],
+      "default_separators": true
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+.env
+.venv/
+venv/
+telemetry/
+__pycache__/
+.git/

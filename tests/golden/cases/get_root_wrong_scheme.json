@@ -1,0 +1,24 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "GET",
+        "path": "/",
+        "auth": "raw-token"
+      },
+      "response": {
+        "status": 401,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "error": "unauthorized"
+        },
+        "raw_key_order": [
+          "error"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": []
+}

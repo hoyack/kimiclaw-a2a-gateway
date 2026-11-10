@@ -1,0 +1,47 @@
+{
+  "steps": [
+    {
+      "request": {
+        "method": "POST",
+        "path": "/",
+        "auth": "bearer",
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "method": "message/send",
+          "params": {
+            "message": {
+              "role": "agent",
+              "parts": [
+                {
+                  "kind": "text",
+                  "text": "x"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "response": {
+        "status": 200,
+        "headers": {
+          "content-type": "application/json"
+        },
+        "json": {
+          "jsonrpc": "2.0",
+          "id": "1",
+          "error": {
+            "code": -32602,
+            "message": "only user-role messages accepted"
+          }
+        },
+        "raw_key_order": [
+          "jsonrpc",
+          "id",
+          "error"
+        ]
+      }
+    }
+  ],
+  "n8n_outbound": []
+}
