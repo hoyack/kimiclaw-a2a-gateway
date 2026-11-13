@@ -14,7 +14,7 @@ gitleaks detect --source "${root}" --redact --log-opts="--all" \
   --exit-code 1 \
   > "${work}/gitleaks.stdout" 2> "${work}/gitleaks.stderr"
 gl_rc=$?
-trufflehog git "file://${root}" --no-update --json --no-verification --results=unverified \
+trufflehog git "file://${root}" --no-update --json --results=verified,unknown,unverified \
   > "${work}/trufflehog.jsonl" 2> "${work}/trufflehog.stderr"
 th_rc=$?
 set -e

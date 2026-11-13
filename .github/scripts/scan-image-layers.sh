@@ -14,7 +14,10 @@ docker save "${image}" -o "${work}/image.tar"
 tar -xf "${work}/image.tar" -C "${work}/raw"
 python3 "${root}/.github/scripts/extract-image-layers.py" "${work}/raw" "${work}/layers"
 set +e
-trufflehog filesystem "${work}/layers" --fail --no-update --json --no-verification --results=unverified \
+# Default verification is on. The summarizer fails only on verified or unknown
+# results so unverified noise in OS/language layers (URI, dpkg metadata) is
+# reported but does not block the job.
+trufflehog filesystem "${work}/layers" --no-update --json --results=verified,unknown,unverified \
   > "${work}/reports/trufflehog.jsonl" 2> "${work}/reports/trufflehog.stderr"
 th_rc=$?
 gitleaks detect --source "${work}/layers" --no-git --redact \
