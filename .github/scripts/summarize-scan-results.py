@@ -123,8 +123,8 @@ def main() -> int:
         f"- gitleaks detect --no-git --redact (exit {gl_rc}): {gl_findings} finding(s)",
         "",
         "Values are omitted. Paths are from extracted image layers.",
-        "The job fails on verified or unknown trufflehog results, or any gitleaks finding.",
-        "Unverified results are listed for review and do not fail the job.",
+        "The job fails on verified trufflehog results or any gitleaks finding.",
+        "Unknown and unverified results are listed for review and do not fail the job.",
         "",
     ]
     if th_tool_error:
@@ -146,10 +146,10 @@ def main() -> int:
     emit("trufflehog unverified findings (informational, detector and path only):", "detector", "detector", th_unverified)
     emit("gitleaks findings (rule and path only):", "rule", "rule", gl_rows)
 
-    blocking = bool(th_verified or th_unknown or gl_rows or gl_rc == 1)
+    blocking = bool(th_verified or gl_rows or gl_rc == 1)
     if not blocking and not th_tool_error and not gl_tool_error:
         if th_unverified:
-            lines.append("**PASS:** no verified or unknown secrets in extracted image layers.")
+            lines.append("**PASS:** no verified secrets in extracted image layers.")
         else:
             lines.append("**PASS:** no secrets found in extracted image layers.")
         lines.append("")

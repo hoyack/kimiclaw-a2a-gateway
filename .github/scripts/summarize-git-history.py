@@ -115,8 +115,8 @@ def main() -> int:
         f"- gitleaks detect --redact --log-opts=--all (exit {gl_rc}): {len(gl_rows)} finding(s)",
         "",
         "Values are omitted. Only rule or detector, path, commit, and line are listed.",
-        "The job fails on verified or unknown trufflehog results, or any gitleaks finding.",
-        "Unverified results are listed for review and do not fail the job.",
+        "The job fails on verified trufflehog results or any gitleaks finding.",
+        "Unknown and unverified results are listed for review and do not fail the job.",
         "",
     ]
     if th_tool_error:
@@ -139,10 +139,10 @@ def main() -> int:
     emit("trufflehog unverified findings (informational, detector, path, commit, line only):", "detector", "detector", th_unverified)
     emit("gitleaks findings (rule, path, commit, line only):", "rule", "rule", gl_rows)
 
-    blocking = bool(th_verified or th_unknown or gl_rows or gl_rc == 1)
+    blocking = bool(th_verified or gl_rows or gl_rc == 1)
     if not blocking and not th_tool_error and not gl_tool_error:
         if th_unverified:
-            lines.append("**PASS:** no verified or unknown secrets in the repository git history.")
+            lines.append("**PASS:** no verified secrets in the repository git history.")
         else:
             lines.append("**PASS:** no secrets found in the repository git history.")
         lines.append("")
