@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Extract docker-save layer archives into a flat directory tree for scanners."""
+"""Extract docker-save layer archives into a flat directory tree for scanners.
+
+Debian base images contain absolute symlinks (for example /etc/alternatives).
+Python's tarfile data filter refuses those; skip rejected members instead of
+failing the scan. Regular files are still extracted.
+"""
 from __future__ import annotations
 
 import json
@@ -8,13 +13,21 @@ import tarfile
 from pathlib import Path
 
 
+def _scan_filter(member: tarfile.TarInfo, dest_path: str) -> tarfile.TarInfo | None:
+    # data_filter blocks path traversal and special files. Absolute symlinks
+    # such as /etc/alternatives/awk are common in OS layers and are skipped.
+    try:
+        return tarfile.data_filter(member, dest_path)
+    except tarfile.FilterError:
+        return None
+
+
 def extract_tar(archive: Path, dest: Path) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, mode="r:*") as tf:
-        # Python 3.13 supports filter=; use it when available.
         kwargs = {}
         if hasattr(tarfile, "data_filter"):
-            kwargs["filter"] = "data"
+            kwargs["filter"] = _scan_filter
         tf.extractall(dest, **kwargs)
 
 
