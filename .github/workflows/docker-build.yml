@@ -4,9 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
+  packages: write
 
 concurrency:
   group: docker-build-${{ github.ref }}
@@ -16,16 +18,74 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      IMAGE: ghcr.io/hoyack/kimiclaw-a2a-gateway
+      # Push only from main (a push or a manual dispatch). Pull requests never push.
+      PUSH: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        if: env.PUSH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=sha,format=long,prefix=
+            type=sha,format=short,prefix=
+
       - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        id: build
         with:
           context: .
           file: ./Dockerfile
-          push: false
+          push: ${{ env.PUSH }}
           load: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: ${{ env.PUSH }}
+          provenance: ${{ env.PUSH }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Record image digest
+        if: steps.build.outputs.digest != ''
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          ref="${IMAGE}@${DIGEST}"
+          printf '%s\n' "$ref" > image-digest.txt
+          {
+            echo "## Image digest"
+            echo
+            echo "\`${ref}\`"
+            echo
+            if [ "${PUSH}" = "true" ]; then
+              echo "Pushed to GHCR. Tags are the full commit SHA and the short SHA (never \`latest\`). Re-running this workflow for the same SHA re-pushes the same tags."
+              echo
+              echo "The digest is also uploaded as the \`image-digest\` artifact (\`image-digest.txt\`). Alamo should pull this reference by digest after a main run."
+            else
+              echo "This run did **not** push (pull requests never push; only a push or \`workflow_dispatch\` on \`main\` does). The digest above is from the local build and is not available on GHCR."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.build.outputs.digest != ''
+        with:
+          name: image-digest
+          path: image-digest.txt
+          if-no-files-found: error
+          retention-days: 90
