@@ -6,7 +6,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from gateway.auth import rate_limited, retry_after
-from gateway.config import AGENT_TIMEOUT, LOG, MAX_BODY, log_safe
+from gateway.config import AGENT_TIMEOUT, LOG, log_safe
 from gateway.models import now, rpc_error
 from gateway.services.task_store import BUSY, owned_task, start_task, tasks
 
@@ -37,25 +37,9 @@ async def sse_events(req_id, queue: asyncio.Queue):
         yield f"data: {json.dumps(rpc_error(req_id, -32000, f'stream error: {e}'))}\n\n"
 
 
-async def read_body(request: Request) -> bytes | None:
-    """The request body, or None if Content-Length or the bytes read pass MAX_BODY."""
-    length = request.headers.get("content-length", "")
-    if length.isdigit() and int(length) > MAX_BODY:
-        return None
-    body = b""
-    async for chunk in request.stream():
-        body += chunk
-        if len(body) > MAX_BODY:
-            return None
-    return body
-
-
 async def handle_rpc(request: Request):
-    raw = await read_body(request)
-    if raw is None:
-        return JSONResponse({"error": "request body too large"}, status_code=413)
     try:
-        body = json.loads(raw)
+        body = json.loads(request.state.body)
     except Exception:
         return JSONResponse(rpc_error(None, -32700, "parse error"), status_code=400)
     if not isinstance(body, dict):

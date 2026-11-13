@@ -1,4 +1,4 @@
-"""New in this refactor: liveness and readiness probes (/healthz is public and returns only {"status":"ok"}; /readyz needs the bearer token)."""
+"""New in this refactor: liveness and readiness probes (/healthz is public and returns only {"status":"ok"}; /readyz needs a signed request)."""
 import shutil
 
 from fastapi import APIRouter

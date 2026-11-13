@@ -9,7 +9,7 @@ python -m pytest tests -q          # characterization + contract tests, ~35 s
 ```
 
 Contract check only: `python -m pytest tests/test_contract.py -q`
-If routes or schemas change on purpose: `GATEWAY_KEYS_FILE=tests/keys.test.txt python tools/freeze_openapi.py` and commit openapi.yaml.
+If routes or schemas change on purpose: run `tools/freeze_openapi.py` (its docstring shows how to make a throwaway keys file) and commit openapi.yaml. Tests mint fresh signing secrets in a temp dir each run; none are committed.
 
 Golden replay (parity against fixtures recorded from original main, vendored in tests/golden/):
 ```bash

@@ -6,8 +6,8 @@ from fastapi.openapi.utils import get_openapi
 
 from gateway import telemetry
 from gateway.config import LOG
-from gateway.auth import bearer_auth
-from gateway.models import SCHEMAS
+from gateway.auth import signed_auth
+from gateway.models import SCHEMAS, SECURITY_SCHEMES
 from gateway.routes import a2a, health
 
 
@@ -21,7 +21,7 @@ async def lifespan(app):
 def create_app() -> FastAPI:
     app = FastAPI(title="Kimiclaw A2A Gateway", version="0.1.0", lifespan=lifespan)
     telemetry.setup()
-    app.middleware("http")(bearer_auth)
+    app.middleware("http")(signed_auth)
     app.middleware("http")(telemetry.telemetry_middleware)  # added last = outermost, so 401s are recorded
     app.include_router(a2a.router)
     app.include_router(health.router)
@@ -34,8 +34,8 @@ def create_app() -> FastAPI:
                 schema = model.model_json_schema(ref_template="#/components/schemas/{model}")
                 comps.update(schema.pop("$defs", {}))
                 comps[model.__name__] = schema
-            spec["components"]["securitySchemes"] = {"bearerAuth": {"type": "http", "scheme": "bearer"}}
-            spec["security"] = [{"bearerAuth": []}]
+            spec["components"]["securitySchemes"] = SECURITY_SCHEMES
+            spec["security"] = [{"kcHmac": []}]
             app.openapi_schema = spec
         return app.openapi_schema
 

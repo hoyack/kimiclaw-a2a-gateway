@@ -1,7 +1,7 @@
 """Characterization tests: pin CURRENT behavior of app.py (bugs included)."""
 import base64, json, time
 import httpx, pytest
-from conftest import KEY, TOKEN
+from conftest import TOKEN
 
 
 def rpc(method, params=None, id_="1"):
@@ -22,13 +22,18 @@ def test_agent_card_public(gw_factory):
     card = r.json()
     assert card["name"] == "Kimiclaw" and card["url"] == "https://kimiclaw.hoyack.ai/"
     assert card["capabilities"] == {"streaming": True, "pushNotifications": False, "stateTransitionHistory": False}
-    assert card["securitySchemes"] == {"bearerAuth": {"type": "http", "scheme": "bearer"}}
+    assert list(card["securitySchemes"]) == ["kcHmac"] and card["security"] == [{"kcHmac": []}]
+    assert card["securitySchemes"]["kcHmac"]["name"] == "X-KC-Signature"
 
 
-@pytest.mark.parametrize("hdr", [None, "Bearer wrong", KEY, f"Basic {KEY}", f"Bearer {TOKEN}", f"Bearer {KEY}x"])
-def test_unauthorized(gw_factory, hdr):
+SIGNED_SHAPE = {"X-KC-Key-Id": "testkey01", "X-KC-Timestamp": str(int(time.time())), "X-KC-Nonce": "n" * 24,
+                "X-KC-Signature": "0" * 64}
+
+
+@pytest.mark.parametrize("h", [{}, {"Authorization": "Bearer wrong"}, {"Authorization": f"Bearer {TOKEN}"},
+                               {"Authorization": "Bearer kc_testkey01_" + "k" * 43}, SIGNED_SHAPE])
+def test_unauthorized(gw_factory, h):
     c = gw_factory()
-    h = {"Authorization": hdr} if hdr else {}
     for m, p in (("GET", "/"), ("POST", "/"), ("GET", "/docs"), ("GET", "/nope"),
                  ("GET", "/readyz"), ("GET", "/openapi.json")):
         r = httpx.request(m, str(c.base_url) + p, headers=h)

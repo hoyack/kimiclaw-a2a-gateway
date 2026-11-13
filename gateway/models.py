@@ -5,6 +5,14 @@ from datetime import datetime, timezone
 
 from gateway.config import PUBLIC_URL
 
+SECURITY_SCHEMES = {"kcHmac": {
+    "type": "apiKey", "in": "header", "name": "X-KC-Signature",
+    "description": "HMAC-SHA256 request signing. Send X-KC-Key-Id, X-KC-Timestamp (unix seconds), X-KC-Nonce and "
+                   "X-KC-Signature: hex HMAC-SHA256, keyed with your secret, over METHOD, path plus sorted query, "
+                   "timestamp, nonce and hex sha256(body), joined by newlines. Timestamps must be within 300 s; "
+                   "a nonce is accepted once.",
+}}
+
 AGENT_CARD = {
     "protocolVersion": "1.0",
     "name": "Kimiclaw",
@@ -17,8 +25,8 @@ AGENT_CARD = {
         "pushNotifications": False,
         "stateTransitionHistory": False,
     },
-    "securitySchemes": {"bearerAuth": {"type": "http", "scheme": "bearer"}},
-    "security": [{"bearerAuth": []}],
+    "securitySchemes": SECURITY_SCHEMES,
+    "security": [{"kcHmac": []}],
     "defaultInputModes": ["text"],
     "defaultOutputModes": ["text"],
     "skills": [

@@ -2,6 +2,7 @@
 import logging
 import os
 import re
+import stat
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -13,7 +14,7 @@ LOG = logging.getLogger("kimiclaw")
 
 MAX_LOG_ID = 128
 KEY_ID_RE = re.compile(r"[a-z0-9]{8,12}")
-SHA256_RE = re.compile(r"[0-9a-f]{64}")
+SECRET_RE = re.compile(r"[A-Za-z0-9_-]{43,128}")
 
 
 def log_safe(value) -> str:
@@ -43,32 +44,38 @@ def _load_token() -> str:
     return tok
 
 
-def load_keys(path: str) -> dict[str, tuple[str, str]]:
-    """Keys file: one `<key_id> <sha256-hex of the full key> <caller>` per line; blank lines and # comments skipped.
-    Missing, empty or malformed refuses startup. Errors name the line number, never its content."""
+def load_signing_keys(path: str) -> dict[str, tuple[str, bytes]]:
+    """Signing keys file: one `<key_id> <caller> <secret>` per line; blank lines and # comments skipped.
+    Missing, empty, malformed, or readable/writable by others (or group-writable) refuses startup.
+    Errors name the line number, never its content."""
     if not path:
-        raise RuntimeError("GATEWAY_KEYS_FILE not set (path to the hashed API keys file)")
+        raise RuntimeError("GATEWAY_SIGNING_KEYS_FILE not set (path to the per-caller signing secrets file)")
     try:
         with open(path) as f:
+            mode = os.fstat(f.fileno()).st_mode
             lines = f.read().splitlines()
     except OSError as e:
-        raise RuntimeError(f"GATEWAY_KEYS_FILE unreadable: {type(e).__name__}") from None
+        raise RuntimeError(f"GATEWAY_SIGNING_KEYS_FILE unreadable: {type(e).__name__}") from None
+    if mode & (stat.S_IWGRP | stat.S_IRWXO):
+        raise RuntimeError(f"GATEWAY_SIGNING_KEYS_FILE mode {stat.S_IMODE(mode):o} is too open (want 0400, 0440, 0600 or 0640)")
     keys = {}
     for n, line in enumerate(lines, 1):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split()
-        if len(parts) != 3 or not KEY_ID_RE.fullmatch(parts[0]) or not SHA256_RE.fullmatch(parts[1]) or parts[0] in keys:
-            raise RuntimeError(f"GATEWAY_KEYS_FILE line {n}: want unique `<key_id> <sha256-hex> <caller>`")
-        keys[parts[0]] = (parts[1], parts[2])
+        if len(parts) != 3 or not KEY_ID_RE.fullmatch(parts[0]) or not SECRET_RE.fullmatch(parts[2]) or parts[0] in keys:
+            raise RuntimeError(f"GATEWAY_SIGNING_KEYS_FILE line {n}: want unique `<key_id> <caller> <secret>`")
+        keys[parts[0]] = (parts[1], parts[2].encode())
     if not keys:
-        raise RuntimeError("GATEWAY_KEYS_FILE has no keys")
+        raise RuntimeError("GATEWAY_SIGNING_KEYS_FILE has no keys")
     return keys
 
 
 NOTIFY_URL = os.environ.get("GATEWAY_NOTIFY_URL", "").strip()
 TOKEN = _load_token() if NOTIFY_URL else ""  # outbound notify credential only; never accepted inbound
-API_KEYS = load_keys(os.environ.get("GATEWAY_KEYS_FILE", "").strip())
+SIGNING_KEYS = load_signing_keys(os.environ.get("GATEWAY_SIGNING_KEYS_FILE", "").strip())
+SIGNATURE_SKEW_S = 300
+MAX_NONCES = 100_000
 CREATE_PER_MIN = float(os.environ.get("GATEWAY_CREATE_PER_MIN", "10"))
 CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
 GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))

@@ -9,9 +9,10 @@ import httpx
 import pytest
 
 from conftest import KEY, KEYS_FILE, ROOT, start_gateway
+from sign_request import signed_headers
 
 ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_", "WEB_"))},
-       "GATEWAY_KEYS_FILE": KEYS_FILE}
+       "GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE}
 
 
 def py(prog, **env):
@@ -27,7 +28,7 @@ def base(tmp_path):
 
 
 def rpc(url, body, **kw):
-    return httpx.post(url + "/", json=body, headers={"Authorization": f"Bearer {KEY}"}, timeout=5, **kw)
+    return httpx.post(url + "/", json=body, auth=KEY, timeout=5, **kw)
 
 
 def test_send_with_contextid_5_and_stream_with_contextid_object_return_promptly(base):
@@ -93,15 +94,10 @@ def test_huge_id_and_junk_method_do_not_land_raw_in_logs(base, tmp_path):
     assert '"context_id": "c\\\\x0d\\\\x0aFORGED' in logs
 
 
-def test_bearer_scheme_is_case_insensitive(base):
-    for scheme in ("bearer", "BEARER", "Bearer"):
-        r = httpx.get(base + "/", headers={"Authorization": f"{scheme} {KEY}"})
-        assert r.status_code == 200
-
-
 def test_oversized_content_length_is_refused_before_the_body_is_read(base):
     host, port = base.removeprefix("http://").split(":")
     with socket.create_connection((host, int(port)), timeout=3) as s:
-        s.sendall((f"POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {KEY}\r\n"
+        signed = "".join(f"{k}: {v}\r\n" for k, v in signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", b"").items())
+        s.sendall((f"POST / HTTP/1.1\r\nHost: x\r\n{signed}"
                    "Content-Type: application/json\r\nContent-Length: 2000000\r\n\r\n").encode())
         assert s.recv(200).startswith(b"HTTP/1.1 413")

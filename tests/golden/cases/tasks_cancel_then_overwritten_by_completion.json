@@ -4,7 +4,7 @@
       "request": {
         "method": "POST",
         "path": "/?wait=false",
-        "auth": "bearer",
+        "auth": "signed",
         "json": {
           "jsonrpc": "2.0",
           "id": "1",
@@ -57,7 +57,7 @@
       "request": {
         "method": "POST",
         "path": "/",
-        "auth": "bearer",
+        "auth": "signed",
         "json": {
           "jsonrpc": "2.0",
           "id": "1",
@@ -99,7 +99,7 @@
       "request": {
         "method": "POST",
         "path": "/",
-        "auth": "bearer",
+        "auth": "signed",
         "json": {
           "jsonrpc": "2.0",
           "id": "1",

@@ -18,7 +18,7 @@ def gw(tmp_path):
         p, base, rec = start_gateway(tmp_path, env); procs.append(p)
         def rpc(key, method, params, query=""):
             body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-            return httpx.post(base + "/" + query, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=20)
+            return httpx.post(base + "/" + query, json=body, auth=key, timeout=20)
         rpc.calls = lambda: [json.loads(l) for l in rec.read_text().splitlines()] if rec.exists() else []
         return rpc
     yield make
@@ -100,7 +100,7 @@ def test_r4_message_over_128kb_goes_over_stdin(tmp_path):
     text = "y" * 140_000
     prog = ("import asyncio, sys\nfrom gateway.services.agent_runner import run_agent\n"
             "print(len(asyncio.run(run_agent('s1', sys.stdin.read()))))")
-    env = {**os.environ, "GATEWAY_KEYS_FILE": KEYS_FILE, "KIMICLAW_TOKEN": TOKEN, "HOME": str(tmp_path),
+    env = {**os.environ, "GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE, "KIMICLAW_TOKEN": TOKEN, "HOME": str(tmp_path),
            "GATEWAY_TELEMETRY_DIR": str(tmp_path / "tel"),
            "PATH": os.path.join(ROOT, "tests", "fakebin") + os.pathsep + os.environ["PATH"]}
     r = subprocess.run([sys.executable, "-c", prog], input=text, cwd=ROOT, env=env, capture_output=True, text=True,

@@ -4,7 +4,7 @@
       "request": {
         "method": "POST",
         "path": "/",
-        "auth": "bearer"
+        "auth": "signed"
       },
       "response": {
         "status": 200,
