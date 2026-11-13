@@ -125,3 +125,18 @@ def test_r8_telemetry_files_are_size_capped(gw, tmp_path):
     files = sorted(p.name for p in tdir.iterdir() if p.name.startswith("logs.jsonl"))
     assert files == ["logs.jsonl"] + [f"logs.jsonl.{i}" for i in range(1, 5)]
     assert all((tdir / f).stat().st_size < 4000 for f in files)
+
+
+def test_startup_warns_limits_are_single_replica(caplog):
+    import asyncio
+    import logging
+
+    from gateway.main import lifespan
+
+    async def run():
+        async with lifespan(None):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="kimiclaw"):
+        asyncio.run(run())
+    assert "one replica" in caplog.text

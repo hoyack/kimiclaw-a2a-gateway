@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 
 from gateway import telemetry
+from gateway.config import LOG
 from gateway.auth import bearer_auth
 from gateway.models import SCHEMAS
 from gateway.routes import a2a, health
@@ -12,6 +13,7 @@ from gateway.routes import a2a, health
 
 @asynccontextmanager
 async def lifespan(app):
+    LOG.warning("rate limits and task caps are per process; run exactly one replica and one worker")
     yield
     telemetry.shutdown()  # flush spans/metrics on graceful stop
 

@@ -78,7 +78,8 @@ instead of agent stderr.
 
 Give the key to the caller once; it is not stored anywhere. Revoke a key by deleting its line and restarting. A caller
 can hold two keys during rotation. Logs carry the `key_id`, never the key or its hash. Over a limit: 429 with
-`Retry-After`; `POST /` bodies over 1 MB: 413. Limits are in-process, per replica.
+`Retry-After`; `POST /` bodies over 1 MB: 413. Limits are in-process, per replica, so run exactly one replica with one worker (the gateway logs this at
+startup). More replicas or workers multiply every limit.
 
 ## Environment variables (names only)
 
