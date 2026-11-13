@@ -50,12 +50,12 @@ async def handle_rpc(request: Request):
     request.state.ids = {"rpc_method": method if isinstance(method, str) and method in METHODS else "unknown", "rpc_id": log_safe(req_id)}
     if not isinstance(params, dict):
         return JSONResponse(rpc_error(req_id, -32602, "params must be an object"))
-    retry = retry_after(request.state.key_id, method)
+    retry = retry_after(request.state.caller, method)
     if retry:
         return rate_limited(retry)
 
     if method == "message/send":
-        started = await start_task(req_id, params, None, request.state.key_id)
+        started = await start_task(req_id, params, None, request.state.caller)
         if started is BUSY:
             return rate_limited(BUSY_RETRY_S)
         if "error" in started:
@@ -81,7 +81,7 @@ async def handle_rpc(request: Request):
 
     if method == "message/stream":
         queue = asyncio.Queue()
-        started = await start_task(req_id, params, queue, request.state.key_id)
+        started = await start_task(req_id, params, queue, request.state.caller)
         if started is BUSY:
             return rate_limited(BUSY_RETRY_S)
         if "error" in started:
@@ -92,13 +92,13 @@ async def handle_rpc(request: Request):
         )
 
     if method == "tasks/get":
-        entry = owned_task(params.get("id") or params.get("taskId"), request.state.key_id)
+        entry = owned_task(params.get("id") or params.get("taskId"), request.state.caller)
         if not entry:
             return JSONResponse(rpc_error(req_id, -32001, "task not found"))
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": entry["task"]})
 
     if method == "tasks/cancel":
-        entry = owned_task(params.get("id") or params.get("taskId"), request.state.key_id)
+        entry = owned_task(params.get("id") or params.get("taskId"), request.state.caller)
         if not entry:
             return JSONResponse(rpc_error(req_id, -32001, "task not found"))
         task = entry["task"]

@@ -171,7 +171,7 @@ def start_app(app_dir, n8n_port, extra=None):
         f.write(f"{SIGNER.key_id} golden {SIGNER.secret}\n")
     env.update(KIMICLAW_TOKEN=TOKEN, GATEWAY_SIGNING_KEYS_FILE=keys,
                GATEWAY_CREATE_PER_MIN="100000", GATEWAY_CREATE_BURST="1000", GATEWAY_GET_PER_S="1000",
-               GATEWAY_CANCEL_PER_S="1000", PATH=os.path.join(HERE, "fakebin") + os.pathsep + env["PATH"],
+               GATEWAY_CANCEL_PER_S="1000", GATEWAY_REQUESTS_PER_S="100000", GATEWAY_REQUESTS_BURST="100000", PATH=os.path.join(HERE, "fakebin") + os.pathsep + env["PATH"],
                HOME=tempfile.mkdtemp(prefix="golden-"),
                GATEWAY_NOTIFY_URL=f"http://127.0.0.1:{n8n_port}/webhook/firewall", NO_PROXY="*")
     env.update(extra or {})

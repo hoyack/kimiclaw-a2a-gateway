@@ -1,4 +1,5 @@
 """Per-caller signing keys file, per-key rate limits, body cap, key_id audit logs, agent-card URL."""
+import base64
 import json
 import os
 import secrets
@@ -132,7 +133,8 @@ def test_new_api_key_tool_mints_a_working_key(start, tmp_path):
                        capture_output=True, text=True, check=True)
     line = r.stdout.strip()
     key_id, caller, secret = line.split()
-    assert len(key_id) == 10 and int(key_id, 16) >= 0 and caller == "acme" and len(secret) >= 43
+    assert len(key_id) == 10 and int(key_id, 16) >= 0 and caller == "acme"
+    assert len(base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))) >= 32
     assert key_id in r.stderr and secret not in r.stderr
     minted = tmp_path / "minted.txt"
     minted.write_text(line + "\n"); minted.chmod(0o600)
@@ -150,10 +152,41 @@ def test_key_id_and_reason_are_logged_never_the_secret_or_signature(start, tmp_p
     time.sleep(0.5)
     out = (tmp_path / "gateway.log").read_text()
     logs = (tdir / "logs.jsonl").read_text()
-    assert "key_id=testkey01 caller=caller-testkey01 POST /" in out
+    assert "key_id=testkey01 caller=alice POST /" in out
     assert "unauthorized reason=unknown_key key_id=testkey09" in out
     assert "unauthorized reason=bad_signature key_id=testkey01" in out
     assert '"key_id": "testkey01"' in logs and '"key_id": "invalid:testkey09"' in logs
     for text in (out, logs):
         assert all(sec not in text for sec in SECRETS.values())
         assert ok.request.headers["x-kc-signature"] not in text and bad.request.headers["x-kc-signature"] not in text
+
+
+def test_rotation_two_key_ids_for_one_caller_share_its_tasks(start, tmp_path):
+    base = start(GATEWAY_SIGNING_KEYS_FILE=write_keys_file(tmp_path / "k.txt", ("testkey01", "testkey02", "testkey03")))
+    new_key = Signer("testkey03", SECRETS["testkey03"])
+    tid = post(base, SEND, KEY).json()["result"]["id"]
+    for method in ("tasks/get", "tasks/cancel"):
+        body = {"jsonrpc": "2.0", "id": "1", "method": method, "params": {"id": tid}}
+        assert post(base, body, OTHER_KEY).json()["error"]["code"] == -32001
+        assert post(base, body, new_key).json()["result"]["id"] == tid
+    retired = start(GATEWAY_SIGNING_KEYS_FILE=write_keys_file(tmp_path / "k2.txt", ("testkey02", "testkey03")))
+    assert post(retired, GET, KEY).status_code == 401
+    assert post(retired, GET, new_key).status_code == 200
+
+
+@pytest.mark.parametrize("line", [
+    "testkey01 alice {s} extra", "bad!id alice {s}", "testkey01 al-ice {s}", "testkey01 alice {s}=",
+])
+def test_startup_error_names_the_line_never_the_secret(tmp_path, line):
+    secret = secrets.token_urlsafe(32)
+    r = boot(tmp_path, f"# header\n{line.format(s=secret)}\n")
+    assert r.returncode != 0 and "GATEWAY_SIGNING_KEYS_FILE line 2:" in r.stderr
+    assert secret not in r.stderr and secret[:8] not in r.stderr
+
+
+@pytest.mark.parametrize("nbytes,ok", [(16, False), (31, False), (32, True), (64, True)])
+def test_secrets_under_32_bytes_refuse_to_start(tmp_path, nbytes, ok):
+    secret = secrets.token_urlsafe(nbytes)
+    r = boot(tmp_path, f"testkey01 alice {secret}\n")
+    assert (r.returncode == 0) == ok, r.stderr
+    assert secret not in r.stderr

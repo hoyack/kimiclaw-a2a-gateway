@@ -74,55 +74,82 @@ Every request except `GET /.well-known/agent.json` and `GET /healthz` carries fo
 | `X-KC-Nonce` | 16 to 64 chars of `A-Z a-z 0-9 - _`, new for every request (e.g. 24 random bytes, base64url) |
 | `X-KC-Signature` | lowercase hex HMAC-SHA256 of the canonical string, keyed with the caller's secret (its ASCII bytes) |
 
-The canonical string is five lines joined by `\n` (no trailing newline):
+The canonical string is six lines joined by `\n` (no trailing newline), in this order:
 
 ```
 METHOD                  upper case, e.g. POST
-PATH[?SORTED_QUERY]     see below
+PATH[?QUERY]            see below
 TIMESTAMP               the X-KC-Timestamp value
 NONCE                   the X-KC-Nonce value
-BODY_SHA256             lowercase hex sha256 of the raw body bytes (sha256 of empty for GET)
+BODY_SHA256             lowercase hex sha256 of the body bytes exactly as sent (sha256 of empty for GET)
+KEY_ID                  the X-KC-Key-Id value
 ```
 
 `PATH` is the request path exactly as sent on the wire, still percent-encoded, without scheme, host or fragment.
-`SORTED_QUERY` is the raw query string as sent (the part after `?`), split on `&`, empty pieces dropped, the pieces
-sorted by byte value and joined with `&`. Nothing is decoded or re-encoded. With no query, or an empty one, the line is
-the path alone with no `?`. Example: `POST /?wait=false&b=2` signs the line `/?b=2&wait=false`. A proxy in front of the
-gateway must not rewrite the path or query.
+`QUERY` is the raw query string exactly as sent (the part after `?`, before any `#`): not sorted, decoded or
+re-encoded. With no query, or an empty one, the line is the path alone with no `?`. Example: `POST /?wait=false&b=2`
+signs the line `/?wait=false&b=2`, and sending `/?b=2&wait=false` with that signature fails. Signing the query as sent
+(not sorted) means the order of repeated keys such as `?wait=true&wait=false` is signed too, with no
+duplicate-key rule to get wrong. A proxy in front of the gateway must not rewrite the path, the query or the body.
 
-The gateway checks, in order: all four headers present and well formed, the key_id is in the keys file, the timestamp is
-within 300 s of its clock (either direction), the body is at most 1 MB (else 413), the signature matches (constant-time
-compare over the raw body, before any JSON parsing), and the nonce has not been used by that key_id within the window.
-Any failure is `401 {"error": "unauthorized"}`; the reason (`missing_header`, `malformed_header`, `unknown_key`,
-`stale_timestamp`, `bad_signature`, `replayed_nonce`, `nonce_cache_full`) goes to the log with the key_id, never the
-secret or the signature. Nonces are remembered in process memory (up to 100,000, each until its timestamp leaves the
-window), which is sound because the gateway runs one worker. A restart forgets them, but a request captured before a
-restart is still bound to its timestamp, so it can only be replayed inside the same 300 s. `Authorization: Bearer`
-keys are no longer accepted.
+The gateway checks, in order: all four headers present and well formed, the timestamp is within 300 s of its clock
+(either direction), the body is at most 1 MB (else 413), then the signature, compared in constant time over the bytes
+it received, before any JSON parsing. An unknown key_id is checked against a random dummy secret, so it costs the same
+as a wrong signature and gets the same response. Only a request whose signature verifies has its nonce checked and
+recorded. A nonce already used by the same caller within the window is rejected (401). Then every signed request,
+including `GET /`, `/docs` and unknown JSON-RPC methods, pays the caller's general token bucket
+(`GATEWAY_REQUESTS_PER_S`, default 5/s, burst `GATEWAY_REQUESTS_BURST` 10); when it is empty, the caller gets 429 and
+no nonce is kept. Only then is the nonce stored. The per-method limits below apply on top.
+
+Any rejection is `401 {"error": "unauthorized"}`. The reason (`missing_header`, `malformed_header`, `stale_timestamp`,
+`unknown_key`, `bad_signature`, `replayed_nonce`) goes to the log with the key_id. A header value that isn't shaped like
+a key_id is logged as `malformed`, never verbatim, and the secret and the signature are never logged.
+
+Nonces are kept in process memory per caller, each until its timestamp leaves the window, and at most
+`GATEWAY_MAX_NONCES_PER_CALLER` (default 20,000) per caller. The general bucket keeps a caller far below that
+(5/s × 600 s + 10 ≈ 3,010), so the cap is a backstop. A caller at its cap gets `429 {"error": "rate limited"}` with
+`Retry-After` set to when its oldest nonce expires. Only that caller is affected: other callers keep getting 200 and
+never 401. Memory is bounded by callers × cap. Per-process state is sound because the
+gateway runs one worker. A restart forgets the nonces, but every request is bound to its timestamp, so one captured
+before a restart can only be replayed within its own 300 s. `Authorization: Bearer` keys are no longer accepted.
 
 ### Caller keys
 
-The gateway keeps one `<key_id> <caller> <secret>` line per caller in `GATEWAY_SIGNING_KEYS_FILE` (`#` comments
-allowed). The secret has to be readable by the gateway to check signatures, so this file is the credential store: mount
-it from the secret store, read-only, mode `0400`/`0440` (or `0600`/`0640`). Startup is refused if it is missing, empty,
-malformed, writable by its group, or has any permission for others. Mint a caller with
+`GATEWAY_SIGNING_KEYS_FILE` holds one `<key_id> <caller> <secret>` line per key (`#` comments allowed). It is the only
+place a secret lives: the gateway never reads secrets from env vars or arguments, and never writes them to logs,
+telemetry, error messages or probe output. The secret has to be readable by the gateway to check signatures, so this
+file is the credential store. Mount it from the secret store, read-only, mode `0400`/`0440` (or `0600`/`0640`).
+
+Startup is refused, with an error that names only the line number, if the file is missing, empty or malformed, if a
+key_id repeats, if a caller name isn't 1 to 32 of `A-Z a-z 0-9 _`, if a secret isn't base64url of at least 32 bytes, or
+if the file is writable by its group or has any permission for others. Mint a key with
 
 ```bash
 python tools/new_api_key.py <caller> >> keys.txt   # stdout: the file line (holds the secret); stderr: the key_id
 ```
 
-and hand the caller its key_id and secret over a secure channel. Revoke a caller by deleting its line and restarting. A
-caller can hold two key_ids during rotation.
+It draws 32 bytes from Python's `secrets` module (the OS CSPRNG). **`tools/new_api_key.py` is the only supported way to
+make a secret.** The startup check can only confirm the secret is base64url of at least 32 bytes; it can't tell random
+bytes from a hand-typed or derived value. Hand the caller its key_id and secret over a secure channel.
 
-Tasks belong to the key_id that created them: task ids are minted by the gateway (a client `taskId` is ignored), other
-key_ids get "task not found" on `tasks/get`/`tasks/cancel`, and the agent session is `a2a-<key_id>-<contextId>`, so a
-caller can't join another caller's session. The agent runs with only `PATH`, `HOME`, `LANG`, `LC_ALL` and `TZ` from the
-gateway env, gets the message on stdin (`--message-file -`, no temp file), and callers see `agent error (task <id>)`
-instead of agent stderr.
+**Rotation.** A caller can have several key_ids at once:
+1. Run `new_api_key.py` with the same caller name and add the new line.
+2. Restart the gateway, then give the caller the new key_id and secret. Both keys work during the overlap.
+3. Once the caller has switched, delete the old line and restart.
 
-Logs carry the `key_id`, never the secret. Over a limit: 429 with `Retry-After`; `POST /` bodies over 1 MB: 413.
-Limits are in-process, per replica, so run exactly one replica with one worker (the gateway logs this at startup). More
-replicas or workers multiply every limit.
+To revoke a key immediately, delete its line and restart.
+
+**Everything is scoped per caller, not per key_id:** task ownership, the `a2a-<caller>-<contextId>` agent session,
+rate limits, the in-flight and stored-task caps, and nonces. A rotation therefore doesn't orphan tasks or split a
+conversation, and holding two keys doesn't double a caller's limits. The key_id still appears in every log line, so you
+can tell which key was used. Task ids are minted by the gateway (a client `taskId` is ignored). Other callers get "task
+not found" on `tasks/get`/`tasks/cancel` and can't join another caller's session. A caller name has no `-`, so a
+session id can't be ambiguous. The agent runs with only `PATH`, `HOME`, `LANG`, `LC_ALL` and `TZ` from the gateway env,
+gets the message on stdin (`--message-file -`, no temp file), and callers see `agent error (task <id>)` instead of agent
+stderr.
+
+Over a limit: 429 with `Retry-After`. `POST /` bodies over 1 MB: 413. Limits are in-process, per replica, so run
+exactly one replica with one worker (the gateway logs this at startup). More replicas or workers multiply every limit.
 
 ## Environment variables (names only)
 
@@ -134,13 +161,15 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 |---|---|---|
 | `KIMICLAW_TOKEN` | required only when `GATEWAY_NOTIFY_URL` is set (env or `.env`) | outbound notify credential; never accepted inbound |
 | `GATEWAY_SIGNING_KEYS_FILE` | required | path to the per-caller signing secrets file (mount it from the secret store, mode 0400/0440; see "Caller keys"). Missing, empty, malformed or open to others refuses startup |
-| `GATEWAY_CREATE_PER_MIN` / `GATEWAY_CREATE_BURST` | `10` / `5` | per key: `message/send` + `message/stream` token bucket |
-| `GATEWAY_GET_PER_S` | `2` | per key: `tasks/get` |
-| `GATEWAY_CANCEL_PER_S` | `1` | per key: `tasks/cancel` |
-| `GATEWAY_MAX_INFLIGHT_PER_KEY` | `2` | per key: running or queued tasks; more gets 429 (`Retry-After: 5`). Must stay below the 3 agent slots, or startup fails, so one key can't hold them all |
+| `GATEWAY_CREATE_PER_MIN` / `GATEWAY_CREATE_BURST` | `10` / `5` | per caller: `message/send` + `message/stream` token bucket |
+| `GATEWAY_GET_PER_S` | `2` | per caller: `tasks/get` |
+| `GATEWAY_CANCEL_PER_S` | `1` | per caller: `tasks/cancel` |
+| `GATEWAY_MAX_INFLIGHT_PER_KEY` | `2` | per caller (all its key_ids): running or queued tasks; more gets 429 (`Retry-After: 5`). Must stay below the 3 agent slots, or startup fails, so one caller can't hold them all |
 | `WEB_CONCURRENCY` | `1` | anything but 1 refuses startup (limits are per process) |
-| `GATEWAY_MAX_PENDING` | `50` | all keys: running or queued tasks; more gets 429 |
-| `GATEWAY_MAX_TASKS_PER_KEY` | `100` | per key: stored tasks; the oldest finished ones are dropped past this |
+| `GATEWAY_MAX_PENDING` | `50` | all callers: running or queued tasks; more gets 429 |
+| `GATEWAY_REQUESTS_PER_S` / `GATEWAY_REQUESTS_BURST` | `5` / `10` | per caller: every signed request (any path or method), checked before its nonce is stored; empty gets 429 |
+| `GATEWAY_MAX_NONCES_PER_CALLER` | `20000` | per caller: live nonces kept for replay checks; more gets 429 until the oldest expires |
+| `GATEWAY_MAX_TASKS_PER_KEY` | `100` | per caller: stored tasks; the oldest finished ones are dropped past this |
 | `GATEWAY_TELEMETRY_FILE_MB` | `10` | size of each telemetry file; 5 files each for traces, metrics and logs (150 MB total) |
 | `GATEWAY_PUBLIC_URL` | `https://kimiclaw.hoyack.ai/` | `url` published in `/.well-known/agent.json` (e.g. `https://a2a.hoyack.ai/`) |
 | `GATEWAY_NOTIFY_URL` | empty (disabled) | task-event webhook (n8n AI firewall) |

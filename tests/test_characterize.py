@@ -121,7 +121,7 @@ def test_send_blocking_roundtrip_and_openclaw_argv(gw_factory):
     a = t["artifacts"][0]
     assert a["name"] == "reply" and a["index"] == 0 and a["parts"] == [{"kind": "text", "text": "echo: hello"}]
     call = json.loads(c.argv_file.read_text().splitlines()[0])
-    assert call["argv"] == ["agent", "--local", "--session-id", "a2a-testkey01-ctx-1-x", "--message-file", "-",
+    assert call["argv"] == ["agent", "--local", "--session-id", "a2a-alice-ctx-1-x", "--message-file", "-",
                             "--json", "--timeout", "560"]
     assert call["message"] == "hello"
 

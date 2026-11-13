@@ -7,18 +7,20 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 from sign_request import Signer  # noqa: E402
 
 TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN: outbound notify credential only
-SECRETS = {key_id: secrets.token_urlsafe(32) for key_id in ("testkey01", "testkey02")}  # fresh every run, never committed
+CALLERS = {"testkey01": "alice", "testkey02": "bob", "testkey03": "alice"}  # testkey03: alice's rotation key
+SECRETS = {key_id: secrets.token_urlsafe(32) for key_id in CALLERS}  # fresh every run, never committed
 KEY = Signer("testkey01", SECRETS["testkey01"])
 OTHER_KEY = Signer("testkey02", SECRETS["testkey02"])
 LIMITS_OFF = {"GATEWAY_CREATE_PER_MIN": "100000", "GATEWAY_CREATE_BURST": "1000",
+              "GATEWAY_REQUESTS_PER_S": "100000", "GATEWAY_REQUESTS_BURST": "100000",
               "GATEWAY_GET_PER_S": "1000", "GATEWAY_CANCEL_PER_S": "1000"}
 
 
 
-def write_keys_file(path, key_ids=tuple(SECRETS), mode=0o600):
+def write_keys_file(path, key_ids=("testkey01", "testkey02"), mode=0o600):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "w") as f:
-        f.writelines(f"{k} caller-{k} {SECRETS[k]}\n" for k in key_ids)
+        f.writelines(f"{k} {CALLERS[k]} {SECRETS[k]}\n" for k in key_ids)
     os.chmod(path, mode)
     return str(path)
 

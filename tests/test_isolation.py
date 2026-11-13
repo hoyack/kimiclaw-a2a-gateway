@@ -8,7 +8,7 @@ import time
 import httpx
 import pytest
 
-from conftest import KEY, KEYS_FILE, OTHER_KEY, ROOT, TOKEN, start_gateway
+from conftest import KEY, KEYS_FILE, OTHER_KEY, ROOT, SECRETS, TOKEN, start_gateway
 
 
 @pytest.fixture
@@ -48,8 +48,8 @@ def test_r1_other_key_cannot_read_overwrite_join_or_cancel(gw):
 
     rpc(OTHER_KEY, "message/send", msg("B-joins-A-session", contextId="ctx-A"))  # repro R4
     sessions = {c["message"]: c["argv"][c["argv"].index("--session-id") + 1] for c in rpc.calls()}
-    assert sessions["A-SECRET-DATA"] == "a2a-testkey01-ctx-A"
-    assert sessions["B-joins-A-session"] == "a2a-testkey02-ctx-A"
+    assert sessions["A-SECRET-DATA"] == "a2a-alice-ctx-A"
+    assert sessions["B-joins-A-session"] == "a2a-bob-ctx-A"
 
     slow = rpc(KEY, "message/send", msg("SLOW job", taskId="t-A2"), "?wait=false").json()["result"]  # repro R6
     r = rpc(OTHER_KEY, "tasks/cancel", {"id": slow["id"]}).json()
@@ -91,6 +91,7 @@ def test_r4_agent_env_has_no_gateway_settings_or_key_material(gw):
     rpc(KEY, "message/send", msg("run env"))
     call = rpc.calls()[0]
     assert set(call["env"]) <= {"PATH", "HOME", "LANG", "LC_ALL", "TZ"}
+    assert not any(secret in json.dumps(call) for secret in SECRETS.values())
     assert "--message" not in call["argv"] and "run env" not in call["argv"]
 
 

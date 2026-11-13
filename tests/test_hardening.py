@@ -51,7 +51,7 @@ task_store.notify = boom
 
 async def main():
     q = asyncio.Queue()
-    started = await task_store.start_task("1", {"message": {"parts": [{"kind": "text", "text": "x"}]}}, q, "testkey01")
+    started = await task_store.start_task("1", {"message": {"parts": [{"kind": "text", "text": "x"}]}}, q, "alice")
     entry = task_store.tasks[started["taskId"]]
     await asyncio.wait_for(entry["done"].wait(), 2)
     events = [await asyncio.wait_for(q.get(), 1) for _ in range(2)]

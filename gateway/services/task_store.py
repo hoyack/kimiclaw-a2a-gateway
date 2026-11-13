@@ -19,10 +19,10 @@ BUSY = {"busy": True}
 MAX_CONTEXT_ID = 128
 
 
-def owned_task(task_id, key_id: str) -> dict | None:
-    """The task entry if key_id created it; anyone else gets the same None as a missing id."""
+def owned_task(task_id, caller: str) -> dict | None:
+    """The task entry if caller created it (with any of its key_ids); anyone else gets the same None as a missing id."""
     entry = tasks.get(task_id) if isinstance(task_id, str) else None
-    return entry if entry and entry["owner"] == key_id else None
+    return entry if entry and entry["owner"] == caller else None
 
 
 def prune_tasks():
@@ -109,10 +109,10 @@ async def _execute_task(entry: dict, task_id: str, ctx_id: str, text: str, queue
     })
 
 
-async def start_task(req_id, params, queue: asyncio.Queue | None, key_id: str):
-    """Task ids are always minted here (a client taskId is ignored), and the task belongs to key_id.
-    Returns BUSY when the key or the gateway has too many tasks running or queued. Past MAX_TASKS_PER_KEY stored
-    tasks, the key's oldest finished ones are dropped."""
+async def start_task(req_id, params, queue: asyncio.Queue | None, caller: str):
+    """Task ids are always minted here (a client taskId is ignored), and the task belongs to caller.
+    Returns BUSY when the caller or the gateway has too many tasks running or queued. Past MAX_TASKS_PER_KEY stored
+    tasks, the caller's oldest finished ones are dropped."""
     msg = params.get("message") or {}
     if not isinstance(msg, dict):
         return rpc_error(req_id, -32602, "message must be an object")
@@ -142,14 +142,14 @@ async def start_task(req_id, params, queue: asyncio.Queue | None, key_id: str):
     async with store_lock:
         prune_tasks()
         running = [e["owner"] for e in tasks.values() if e["running"]]
-        if len(running) >= MAX_PENDING or running.count(key_id) >= MAX_INFLIGHT_PER_KEY:
-            LOG.warning("busy key_id=%s running_for_key=%d running=%d", key_id, running.count(key_id), len(running))
+        if len(running) >= MAX_PENDING or running.count(caller) >= MAX_INFLIGHT_PER_KEY:
+            LOG.warning("busy caller=%s running_for_caller=%d running=%d", caller, running.count(caller), len(running))
             return BUSY
-        mine = [k for k, e in tasks.items() if e["owner"] == key_id and not e["running"]]
+        mine = [k for k, e in tasks.items() if e["owner"] == caller and not e["running"]]
         for k in mine[:max(0, len(mine) + 1 - MAX_TASKS_PER_KEY)]:
             tasks.pop(k)
         entry = tasks[task_id] = {
-            "owner": key_id,
+            "owner": caller,
             "running": True,
             "task": {
                 "id": task_id, "contextId": ctx_id, "kind": "task",

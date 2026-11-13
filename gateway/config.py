@@ -1,4 +1,6 @@
 """Env-based settings. Names, defaults and the .env fallback match the original app.py."""
+import base64
+import binascii
 import logging
 import os
 import re
@@ -14,7 +16,9 @@ LOG = logging.getLogger("kimiclaw")
 
 MAX_LOG_ID = 128
 KEY_ID_RE = re.compile(r"[a-z0-9]{8,12}")
-SECRET_RE = re.compile(r"[A-Za-z0-9_-]{43,128}")
+CALLER_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
+SECRET_RE = re.compile(r"[A-Za-z0-9_-]{43,256}")
+MIN_SECRET_BYTES = 32
 
 
 def log_safe(value) -> str:
@@ -44,10 +48,20 @@ def _load_token() -> str:
     return tok
 
 
+def secret_ok(secret: str) -> bool:
+    """base64url (unpadded) of at least MIN_SECRET_BYTES bytes."""
+    if not SECRET_RE.fullmatch(secret):
+        return False
+    try:
+        return len(base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))) >= MIN_SECRET_BYTES
+    except (binascii.Error, ValueError):
+        return False
+
+
 def load_signing_keys(path: str) -> dict[str, tuple[str, bytes]]:
-    """Signing keys file: one `<key_id> <caller> <secret>` per line; blank lines and # comments skipped.
-    Missing, empty, malformed, or readable/writable by others (or group-writable) refuses startup.
-    Errors name the line number, never its content."""
+    """Signing keys file: one `<key_id> <caller> <secret>` per line; blank lines and # comments skipped. A caller may
+    have several key_ids (rotation). Missing, empty, malformed, a secret under 32 bytes, or readable/writable by others
+    (or group-writable) refuses startup. Errors name the line number, never its content."""
     if not path:
         raise RuntimeError("GATEWAY_SIGNING_KEYS_FILE not set (path to the per-caller signing secrets file)")
     try:
@@ -63,8 +77,10 @@ def load_signing_keys(path: str) -> dict[str, tuple[str, bytes]]:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split()
-        if len(parts) != 3 or not KEY_ID_RE.fullmatch(parts[0]) or not SECRET_RE.fullmatch(parts[2]) or parts[0] in keys:
-            raise RuntimeError(f"GATEWAY_SIGNING_KEYS_FILE line {n}: want unique `<key_id> <caller> <secret>`")
+        if (len(parts) != 3 or not KEY_ID_RE.fullmatch(parts[0]) or not CALLER_RE.fullmatch(parts[1])
+                or not secret_ok(parts[2]) or parts[0] in keys):
+            raise RuntimeError(f"GATEWAY_SIGNING_KEYS_FILE line {n}: want unique `<key_id> <caller> <secret>` "
+                               f"(caller: up to 32 of A-Z a-z 0-9 _; secret: base64url of at least {MIN_SECRET_BYTES} random bytes)")
         keys[parts[0]] = (parts[1], parts[2].encode())
     if not keys:
         raise RuntimeError("GATEWAY_SIGNING_KEYS_FILE has no keys")
@@ -75,7 +91,9 @@ NOTIFY_URL = os.environ.get("GATEWAY_NOTIFY_URL", "").strip()
 TOKEN = _load_token() if NOTIFY_URL else ""  # outbound notify credential only; never accepted inbound
 SIGNING_KEYS = load_signing_keys(os.environ.get("GATEWAY_SIGNING_KEYS_FILE", "").strip())
 SIGNATURE_SKEW_S = 300
-MAX_NONCES = 100_000
+MAX_NONCES_PER_CALLER = int(os.environ.get("GATEWAY_MAX_NONCES_PER_CALLER", "20000"))
+REQUESTS_PER_S = float(os.environ.get("GATEWAY_REQUESTS_PER_S", "5"))
+REQUESTS_BURST = int(os.environ.get("GATEWAY_REQUESTS_BURST", "10"))
 CREATE_PER_MIN = float(os.environ.get("GATEWAY_CREATE_PER_MIN", "10"))
 CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
 GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))

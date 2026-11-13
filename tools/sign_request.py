@@ -16,17 +16,17 @@ import time
 import httpx
 
 
-def canonical(method: str, raw_path: bytes, query: bytes, timestamp: str, nonce: str, body: bytes) -> bytes:
-    sorted_query = b"&".join(sorted(p for p in query.split(b"&") if p))
-    target = raw_path + (b"?" + sorted_query if sorted_query else b"")
-    return b"\n".join([method.encode(), target, timestamp.encode(), nonce.encode(), hashlib.sha256(body).hexdigest().encode()])
+def canonical(method: str, raw_path: bytes, query: bytes, timestamp: str, nonce: str, body: bytes, key_id: str) -> bytes:
+    target = raw_path + (b"?" + query if query else b"")
+    return b"\n".join([method.encode(), target, timestamp.encode(), nonce.encode(),
+                       hashlib.sha256(body).hexdigest().encode(), key_id.encode()])
 
 
 def signed_headers(key_id: str, secret: str, method: str, raw_path: bytes, query: bytes, body: bytes,
                    timestamp: str | None = None, nonce: str | None = None) -> dict[str, str]:
     timestamp = timestamp or str(int(time.time()))
     nonce = nonce or secrets.token_urlsafe(24)
-    message = canonical(method.upper(), raw_path, query, timestamp, nonce, body)
+    message = canonical(method.upper(), raw_path, query, timestamp, nonce, body, key_id)
     return {"X-KC-Key-Id": key_id, "X-KC-Timestamp": timestamp, "X-KC-Nonce": nonce,
             "X-KC-Signature": hmac.new(secret.encode(), message, hashlib.sha256).hexdigest()}
 
