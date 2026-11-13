@@ -6,7 +6,7 @@ replay:  python golden.py replay --base-url URL --n8n-port PORT [--profile defau
    n8n_basic profile: target also needs GATEWAY_NOTIFY_AUTH_MODE=basic GATEWAY_NOTIFY_AUTH_USER=n8n-dummy-user.
    Target must run with: KIMICLAW_TOKEN=dummy-test-token, GATEWAY_KEYS_FILE=tests/keys.test.txt, rate limits raised
    (see start_app), fakebin/ first on PATH,
-   FAKE_OPENCLAW_RECORD=<any file>, GATEWAY_NOTIFY_URL=http://127.0.0.1:PORT/webhook/firewall.
+   HOME=<writable dir>, GATEWAY_NOTIFY_URL=http://127.0.0.1:PORT/webhook/firewall.
 replay-local: python golden.py replay-local --app-dir DIR   (starts DIR's app with stubs, then replays)
 Normalized: timestamps, UUIDs, durationMs, Content-Length/Date/server headers.
 """
@@ -122,18 +122,28 @@ def profile_of(name):
     return "n8n_basic" if name.startswith("n8n_basic_") else "default"
 
 
+def with_server_ids(body, ids):
+    """Task ids are minted by the server; later steps refer to a task by the taskId the case sent, mapped here."""
+    p = body.get("params") or {}
+    key = "id" if "id" in p else "taskId" if "taskId" in p else None
+    return {**body, "params": {**p, key: ids[p[key]]}} if key and p[key] in ids else body
+
+
 def run_case(base, n8n, steps):
-    n8n.reqs.clear(); out = []
+    n8n.reqs.clear(); out = []; ids = {}
     with httpx.Client(base_url=base, timeout=30) as c:
         for s in steps:
             if "sleep" in s:
                 time.sleep(s["sleep"]); continue
             h = dict(AUTH if s.get("auth", AUTH) is AUTH else (s["auth"] or {}))
             kw = {"headers": h}
-            if "json" in s: kw["json"] = s["json"]
+            if "json" in s: kw["json"] = with_server_ids(s["json"], ids)
             if "raw" in s: kw["content"] = s["raw"].encode(); h["Content-Type"] = "application/json"
             r = c.request(s["m"], s["p"], **kw)
             ct = r.headers.get("content-type", "")
+            sent = ((s.get("json") or {}).get("params") or {}).get("message", {}).get("taskId")
+            if sent and ct.startswith("application/json") and isinstance(r.json().get("result"), dict):
+                ids[sent] = r.json()["result"]["id"]
             out.append({"request": {"method": s["m"], "path": s["p"], "auth": "bearer" if h.get("Authorization", "").startswith("Bearer ") else ("raw-token" if h.get("Authorization") else None),
                                     **({"json": s["json"]} if "json" in s and len(json.dumps(s["json"])) < 5000 else {}),
                                     **({"raw": s["raw"]} if "raw" in s else {})},
@@ -154,7 +164,7 @@ def start_app(app_dir, n8n_port, extra=None):
     env.update(KIMICLAW_TOKEN=TOKEN, GATEWAY_KEYS_FILE=os.path.join(os.path.dirname(HERE), "keys.test.txt"),
                GATEWAY_CREATE_PER_MIN="100000", GATEWAY_CREATE_BURST="1000", GATEWAY_GET_PER_S="1000",
                GATEWAY_CANCEL_PER_S="1000", PATH=os.path.join(HERE, "fakebin") + os.pathsep + env["PATH"],
-               FAKE_OPENCLAW_RECORD=os.path.join(tempfile.mkdtemp(prefix="golden-"), "openclaw-argv.jsonl"),
+               HOME=tempfile.mkdtemp(prefix="golden-"),
                GATEWAY_NOTIFY_URL=f"http://127.0.0.1:{n8n_port}/webhook/firewall", NO_PROXY="*")
     env.update(extra or {})
     p = subprocess.Popen([sys.executable, "-m", "uvicorn", "app:app", "--port", str(port), "--log-level", "warning"], cwd=app_dir, env=env)

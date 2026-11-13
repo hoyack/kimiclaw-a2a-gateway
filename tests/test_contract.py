@@ -47,10 +47,11 @@ def test_readyz_without_openclaw(gw_factory):
 def test_telemetry_files_written_without_message_text(gw_factory, tmp_path):
     tdir = tmp_path / "telemetry"
     c = gw_factory(GATEWAY_TELEMETRY_DIR=str(tdir))
-    c.post("/", json={"jsonrpc": "2.0", "id": "1", "method": "message/send",
-                      "params": {"message": {"parts": [{"kind": "text", "text": "SECRET-TEXT-42"}], "taskId": "tt"}}})
+    tid = c.post("/", json={"jsonrpc": "2.0", "id": "1", "method": "message/send",
+                            "params": {"message": {"parts": [{"kind": "text", "text": "SECRET-TEXT-42"}], "taskId": "tt"}}}
+                 ).json()["result"]["id"]
     logs = (tdir / "logs.jsonl").read_text()
-    assert '"task_id": "tt"' in logs and '"status": 200' in logs and '"rpc_method": "message/send"' in logs
+    assert f'"task_id": "{tid}"' in logs and '"status": 200' in logs and '"rpc_method": "message/send"' in logs
     assert "SECRET-TEXT-42" not in logs and "echo:" not in logs
 
 
@@ -108,7 +109,7 @@ def test_no_message_text_in_logs_or_traces_including_agent_error(tmp_path):
     p.terminate(); p.wait(10)
     for name in ("logs.jsonl", "traces.jsonl"):
         text = (tdir / name).read_text()
-        assert ("bad1" in text) if name == "logs.jsonl" else (text.count('"name": "agent.run"') == 2), name
+        assert (bad["result"]["id"] in text) if name == "logs.jsonl" else (text.count('"name": "agent.run"') == 2), name
         for needle in ("SECRET-OK-77", "SECRET-FAIL-88", "echo:", "boom"):
             assert needle not in text, (name, needle)
 
@@ -147,7 +148,7 @@ def test_setup_is_idempotent(tmp_path, monkeypatch):
     assert len(telemetry.EVENTS.handlers) == n_handlers == 1
     assert trace.get_tracer_provider() is tp
     h = telemetry.EVENTS.handlers[0]
-    assert isinstance(h, logging.handlers.TimedRotatingFileHandler) and h.backupCount == 7 and h.when == "MIDNIGHT"
+    assert isinstance(h, logging.handlers.RotatingFileHandler) and h.backupCount == 4 and h.maxBytes == 10_000_000
 
 
 def _boot_fails(tmp_path, token_env):
@@ -160,13 +161,18 @@ def _boot_fails(tmp_path, token_env):
     return r
 
 
-def test_missing_token_and_no_dotenv_fails_clearly(tmp_path):
+def test_starts_without_token_when_notify_is_off(tmp_path):
     r = _boot_fails(tmp_path, {})
+    assert r.returncode == 0, r.stderr
+
+
+def test_missing_token_and_no_dotenv_fails_clearly(tmp_path):
+    r = _boot_fails(tmp_path, {"GATEWAY_NOTIFY_URL": "http://127.0.0.1:9/hook"})
     assert r.returncode != 0 and "KIMICLAW_TOKEN not set" in r.stderr and "FileNotFoundError" not in r.stderr
 
 
 def test_empty_token_refused(tmp_path):
-    r = _boot_fails(tmp_path, {"KIMICLAW_TOKEN": "   "})
+    r = _boot_fails(tmp_path, {"KIMICLAW_TOKEN": "   ", "GATEWAY_NOTIFY_URL": "http://127.0.0.1:9/hook"})
     assert r.returncode != 0 and "KIMICLAW_TOKEN not set" in r.stderr
 
 
@@ -207,20 +213,20 @@ def _run_success(tmp_path, env):
     r = httpx.post(base + "/", json=_rpc("PROMPT-OK-77 hello", "ok77", message_id="mid-77"), headers=h, timeout=30).json()
     assert r["result"]["status"]["state"] != "failed"
     p.terminate(); p.wait(10)
-    return (tmp_path / "gateway.log").read_text(), (tdir / "logs.jsonl").read_text()
+    return (tmp_path / "gateway.log").read_text(), (tdir / "logs.jsonl").read_text(), r["result"]["id"]
 
 
 def test_success_prompt_not_in_stdout_or_logs_by_default(tmp_path):
-    out, logs = _run_success(tmp_path, {})
-    assert "inbound task_id=ok77 message_id=mid-77 len=18" in out
+    out, logs, tid = _run_success(tmp_path, {})
+    assert f"inbound task_id={tid} message_id=mid-77 len=18" in out
     for text in (out, logs):
         assert "PROMPT-OK-77" not in text
 
 
 def test_success_prompt_never_logged_even_with_legacy_payload_flag(tmp_path):
     # F26: GATEWAY_LOG_PAYLOADS was removed; setting it must not log bodies.
-    out, logs = _run_success(tmp_path, {"GATEWAY_LOG_PAYLOADS": "1"})
-    assert "inbound task_id=ok77 message_id=mid-77 len=18" in out
+    out, logs, tid = _run_success(tmp_path, {"GATEWAY_LOG_PAYLOADS": "1"})
+    assert f"inbound task_id={tid} message_id=mid-77 len=18" in out
     for text in (out, logs):
         assert "PROMPT-OK-77" not in text
 
@@ -269,14 +275,14 @@ def test_client_message_id_cannot_forge_log_lines(tmp_path):
     assert r["result"]["status"]["state"] != "failed"
     p.terminate(); p.wait(10)
     raw = (tmp_path / "gateway.log").read_text(encoding="utf-8")
-    inbound = [l for l in raw.split("\n") if "inbound task_id=forge1" in l]
+    inbound = [l for l in raw.split("\n") if f"inbound task_id={r['result']['id']}" in l]
     assert len(inbound) == 1, raw
     _assert_no_forgery(raw)
     assert "A" * 129 not in inbound[0]
 
 
-def test_client_task_id_cannot_forge_log_lines(tmp_path, mock):
-    """taskId is client-controlled and reaches inbound, agent-failed and notify (ok + failed) log lines."""
+def test_client_task_id_never_reaches_logs(tmp_path, mock):
+    """A client taskId is ignored (R1): inbound, agent-failed and notify log lines carry the server-minted id."""
     import httpx
     from conftest import start_gateway, KEY
     h = {"Authorization": f"Bearer {KEY}"}
@@ -285,7 +291,7 @@ def test_client_task_id_cannot_forge_log_lines(tmp_path, mock):
                             ("down", "http://127.0.0.1:9/hook", "hello FAIL")):
         d = tmp_path / name; d.mkdir()
         p, base, _ = start_gateway(d, {"PYTHONIOENCODING": "utf-8", "GATEWAY_NOTIFY_URL": url})
-        httpx.post(base + "/", json=_rpc(text, forged), headers=h, timeout=30).json()
+        tid = httpx.post(base + "/", json=_rpc(text, forged), headers=h, timeout=30).json()["result"]["id"]
         import time
         for _ in range(50):
             raw = (d / "gateway.log").read_text(encoding="utf-8")
@@ -294,10 +300,9 @@ def test_client_task_id_cannot_forge_log_lines(tmp_path, mock):
             time.sleep(0.1)
         p.terminate(); p.wait(10)
         raw = (d / "gateway.log").read_text(encoding="utf-8")
-        for needle in ("inbound task_id=t1", "agent run failed task=t1", "notify task_failed task=t1"):
-            hits = [l for l in raw.split("\n") if needle in l]
-            assert len(hits) == 1, (name, needle, raw)
-            assert "B" * 129 not in hits[0]
+        for needle in (f"inbound task_id={tid}", f"agent run failed task={tid}", f"notify task_failed task={tid}"):
+            assert len([l for l in raw.split("\n") if needle in l]) == 1, (name, needle, raw)
+        assert "task_id=t1" not in raw and "task=t1" not in raw and "B" * 20 not in raw
         _assert_no_forgery(raw)
 
 

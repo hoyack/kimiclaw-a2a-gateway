@@ -46,7 +46,7 @@ def start_gateway(tmp_path, extra_env):
         "GATEWAY_KEYS_FILE": KEYS_FILE,
         **LIMITS_OFF,
         "PATH": os.path.join(ROOT, "tests", "fakebin") + os.pathsep + env["PATH"],
-        "FAKE_OPENCLAW_RECORD": str(rec),
+        "HOME": str(tmp_path),
         "NO_PROXY": "*",
     })
     env.update(extra_env)

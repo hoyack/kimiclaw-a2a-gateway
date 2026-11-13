@@ -8,7 +8,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from gateway.auth import rate_limited, retry_after
 from gateway.config import AGENT_TIMEOUT, LOG, MAX_BODY, log_safe
 from gateway.models import now, rpc_error
-from gateway.services.task_store import start_task, tasks
+from gateway.services.task_store import BUSY, owned_task, start_task, tasks
+
+
+BUSY_RETRY_S = 5
 
 
 async def sse_events(req_id, queue: asyncio.Queue):
@@ -60,7 +63,9 @@ async def handle_rpc(request: Request):
         return rate_limited(retry)
 
     if method == "message/send":
-        started = await start_task(req_id, params, None)
+        started = await start_task(req_id, params, None, request.state.key_id)
+        if started is BUSY:
+            return rate_limited(BUSY_RETRY_S)
         if "error" in started:
             return JSONResponse(started)
         task_id = started["taskId"]
@@ -82,7 +87,9 @@ async def handle_rpc(request: Request):
 
     if method == "message/stream":
         queue = asyncio.Queue()
-        started = await start_task(req_id, params, queue)
+        started = await start_task(req_id, params, queue, request.state.key_id)
+        if started is BUSY:
+            return rate_limited(BUSY_RETRY_S)
         if "error" in started:
             return JSONResponse(started)
         return StreamingResponse(
@@ -91,15 +98,13 @@ async def handle_rpc(request: Request):
         )
 
     if method == "tasks/get":
-        task_id = params.get("id") or params.get("taskId")
-        entry = tasks.get(task_id)
+        entry = owned_task(params.get("id") or params.get("taskId"), request.state.key_id)
         if not entry:
             return JSONResponse(rpc_error(req_id, -32001, "task not found"))
         return JSONResponse({"jsonrpc": "2.0", "id": req_id, "result": entry["task"]})
 
     if method == "tasks/cancel":
-        task_id = params.get("id") or params.get("taskId")
-        entry = tasks.get(task_id)
+        entry = owned_task(params.get("id") or params.get("taskId"), request.state.key_id)
         if not entry:
             return JSONResponse(rpc_error(req_id, -32001, "task not found"))
         task = entry["task"]

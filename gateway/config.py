@@ -27,7 +27,8 @@ def log_safe(value) -> str:
 
 
 def _load_token() -> str:
-    """Env var first, then .env. Missing or empty fails at startup with a clear message (never the value)."""
+    """Env var first, then .env. Needed only when GATEWAY_NOTIFY_URL is set; then missing or empty fails at startup
+    with a clear message (never the value)."""
     tok = (os.environ.get("KIMICLAW_TOKEN") or "").strip()
     if not tok:
         env_path = os.path.join(BASE_DIR, ".env")
@@ -38,7 +39,7 @@ def _load_token() -> str:
                         tok = line.split("=", 1)[1].strip()
                         break
     if not tok:
-        raise RuntimeError("KIMICLAW_TOKEN not set (set the env var or add KIMICLAW_TOKEN=... to .env; empty is refused)")
+        raise RuntimeError("KIMICLAW_TOKEN not set but GATEWAY_NOTIFY_URL is (set the env var or add KIMICLAW_TOKEN=... to .env; empty is refused)")
     return tok
 
 
@@ -65,15 +66,18 @@ def load_keys(path: str) -> dict[str, tuple[str, str]]:
     return keys
 
 
-TOKEN = _load_token()
+NOTIFY_URL = os.environ.get("GATEWAY_NOTIFY_URL", "").strip()
+TOKEN = _load_token() if NOTIFY_URL else ""  # outbound notify credential only; never accepted inbound
 API_KEYS = load_keys(os.environ.get("GATEWAY_KEYS_FILE", "").strip())
 CREATE_PER_MIN = float(os.environ.get("GATEWAY_CREATE_PER_MIN", "10"))
 CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
 GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))
 CANCEL_PER_S = float(os.environ.get("GATEWAY_CANCEL_PER_S", "1"))
 MAX_BODY = 1_000_000
+MAX_INFLIGHT_PER_KEY = int(os.environ.get("GATEWAY_MAX_INFLIGHT_PER_KEY", "3"))
+MAX_PENDING = int(os.environ.get("GATEWAY_MAX_PENDING", "50"))
+MAX_TASKS_PER_KEY = int(os.environ.get("GATEWAY_MAX_TASKS_PER_KEY", "100"))
 PUBLIC_URL = os.environ.get("GATEWAY_PUBLIC_URL", "").strip() or "https://kimiclaw.hoyack.ai/"
-NOTIFY_URL = os.environ.get("GATEWAY_NOTIFY_URL", "").strip()
 NOTIFY_AUTH_MODE = os.environ.get("GATEWAY_NOTIFY_AUTH_MODE", "raw").lower()
 NOTIFY_AUTH_USER = os.environ.get("GATEWAY_NOTIFY_AUTH_USER", "agent")
 NOTIFY_EVENTS = {e.strip() for e in os.environ.get(
@@ -81,7 +85,7 @@ NOTIFY_EVENTS = {e.strip() for e in os.environ.get(
 NOTIFY_TIMEOUT = 10
 NOTIFY_FAIL_LIMIT = int(os.environ.get("GATEWAY_NOTIFY_FAIL_LIMIT", "5"))
 NOTIFY_COOLDOWN_S = int(os.environ.get("GATEWAY_NOTIFY_COOLDOWN_S", "900"))
-MAX_TEXT = 200_000
+MAX_TEXT = 100_000
 AGENT_TIMEOUT = 560           # seconds, passed to openclaw
 AGENT_CONCURRENCY = 3         # concurrent agent turns
 TASK_TTL = 24 * 3600          # task retention

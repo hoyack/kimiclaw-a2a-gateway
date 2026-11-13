@@ -1,12 +1,16 @@
 """Runs one OpenClaw turn as a subprocess and extracts the reply."""
 import asyncio
 import json
+import os
 import time
 
 from gateway.config import AGENT_TIMEOUT, LOG
 from opentelemetry.trace import Status, StatusCode
 
 from gateway.telemetry import agent_ms, tracer
+
+
+AGENT_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TZ")
 
 
 def _last_json_block(raw: str):
@@ -56,27 +60,35 @@ async def run_agent(session_id: str, text: str) -> str:
             agent_ms.record((time.perf_counter() - started) * 1000)
 
 
+def agent_env() -> dict:
+    """Only what the agent needs to run: never the gateway's own settings, keys file path or notify credential."""
+    return {k: os.environ[k] for k in AGENT_ENV_KEYS if k in os.environ}
+
+
 async def _run_agent(session_id: str, text: str) -> str:
     cmd = [
         "openclaw", "agent",
         "--local",
         "--session-id", session_id,
-        "--message", text,
+        "--message-file", "-",
         "--json",
         "--timeout", str(AGENT_TIMEOUT),
     ]
     LOG.info("agent run start session=%s len=%d", session_id, len(text))
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env=agent_env(),
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=AGENT_TIMEOUT + 30)
+        out, err = await asyncio.wait_for(proc.communicate(text.encode()), timeout=AGENT_TIMEOUT + 30)
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
         raise RuntimeError("agent timeout")
     if proc.returncode != 0:
-        raise RuntimeError(f"agent exited {proc.returncode}: {err.decode(errors='replace')[-500:]}")
+        # F26: agent stderr can echo the prompt, so only its size is logged.
+        LOG.error("agent exited code=%d session=%s stderr_bytes=%d", proc.returncode, session_id, len(err))
+        raise RuntimeError(f"agent exited {proc.returncode}")
     # openclaw --json emits the result envelope on stderr after log noise
     raw_out = out.decode(errors="replace").strip()
     raw_err = err.decode(errors="replace").strip()

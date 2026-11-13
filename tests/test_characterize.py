@@ -87,7 +87,8 @@ def test_send_blocking_roundtrip_and_openclaw_argv(gw_factory):
     body = r.json()
     assert body["jsonrpc"] == "2.0" and body["id"] == "1"
     t = body["result"]
-    assert t["id"] == "t1" and t["contextId"] == "ctx/1 x" and t["kind"] == "task" and t["final"] is True
+    assert t["id"] != "t1" and len(t["id"]) == 36  # server-minted; client taskId ignored (R1)
+    assert t["contextId"] == "ctx/1 x" and t["kind"] == "task" and t["final"] is True
     assert t["status"]["state"] == "completed"
     assert t["status"]["message"]["role"] == "agent"
     assert t["status"]["message"]["parts"] == [{"kind": "text", "text": "echo: hello"}]
@@ -95,8 +96,10 @@ def test_send_blocking_roundtrip_and_openclaw_argv(gw_factory):
     assert len(t["artifacts"]) == 1
     a = t["artifacts"][0]
     assert a["name"] == "reply" and a["index"] == 0 and a["parts"] == [{"kind": "text", "text": "echo: hello"}]
-    argv = json.loads(c.argv_file.read_text().splitlines()[0])
-    assert argv == ["agent", "--local", "--session-id", "a2a-ctx-1-x", "--message", "hello", "--json", "--timeout", "560"]
+    call = json.loads(c.argv_file.read_text().splitlines()[0])
+    assert call["argv"] == ["agent", "--local", "--session-id", "a2a-testkey01-ctx-1-x", "--message-file", "-",
+                            "--json", "--timeout", "560"]
+    assert call["message"] == "hello"
 
 
 def test_extract_text_part_kinds(gw_factory):
@@ -104,14 +107,14 @@ def test_extract_text_part_kinds(gw_factory):
     parts = [{"kind": "text", "text": "a"}, {"kind": "data", "data": {"k": 1}},
              {"kind": "file", "file": {"name": "f.txt"}}, {"kind": "file"}, {"kind": "weird"}]
     c.post("/", json=rpc("message/send", {"message": {"parts": parts}}))
-    argv = json.loads(c.argv_file.read_text().splitlines()[0])
-    assert argv[5] == 'a\n{"k": 1}\n[file: f.txt]\n[file: ?]'
+    call = json.loads(c.argv_file.read_text().splitlines()[0])
+    assert call["message"] == 'a\n{"k": 1}\n[file: f.txt]\n[file: ?]'
 
 
 def test_send_failure(gw_factory):
     t = gw_factory().post("/", json=rpc("message/send", user_msg("FAIL"))).json()["result"]
     assert t["status"]["state"] == "failed"
-    assert t["status"]["message"]["parts"][0]["text"] == "agent error: agent exited 3: boom\n"
+    assert t["status"]["message"]["parts"][0]["text"] == f"agent error (task {t['id']})"  # no agent stderr (S3)
     assert t["artifacts"] == []
 
 
@@ -191,7 +194,7 @@ def test_no_outbound_when_unset(gw_factory, mock):
 
 def test_notify_completed_exact_request(gw_factory, mock):
     c = gw_factory(**_notify_env(mock))
-    c.post("/", json=rpc("message/send", user_msg("hello", taskId="t9", contextId="c9")))
+    tid = c.post("/", json=rpc("message/send", user_msg("hello", taskId="t9", contextId="c9"))).json()["result"]["id"]
     reqs = mock.wait(1); time.sleep(0.3)
     assert len(mock.requests) == 1  # task_started excluded by default
     q = reqs[0]
@@ -204,7 +207,7 @@ def test_notify_completed_exact_request(gw_factory, mock):
     body = json.loads(q["body"])
     assert list(body) == ["event", "source", "taskId", "contextId", "timestamp", "state", "reply", "durationMs"]
     assert body["event"] == "task_completed" and body["source"] == "kimiclaw-a2a-gateway"
-    assert body["taskId"] == "t9" and body["contextId"] == "c9"
+    assert body["taskId"] == tid and body["contextId"] == "c9"
     assert body["state"] == "completed" and body["reply"] == "echo: hello"
     assert isinstance(body["durationMs"], int) and body["timestamp"].endswith("+00:00")
     # serialization: json.dumps default separators (", " and ": ")
@@ -216,7 +219,7 @@ def test_notify_failed_and_reply_truncated(gw_factory, mock):
     c.post("/", json=rpc("message/send", user_msg("FAIL " + "z" * 5000)))
     body = json.loads(mock.wait(1)[0]["body"])
     assert body["event"] == "task_failed" and body["state"] == "failed"
-    assert body["reply"].startswith("agent error: agent exited 3")
+    assert body["reply"].startswith("agent error (task ")
 
 
 @pytest.mark.parametrize("mode,expect", [
@@ -241,10 +244,10 @@ def test_notify_basic_custom_user(gw_factory, mock):
 
 def test_notify_started_event_when_enabled(gw_factory, mock):
     c = gw_factory(**_notify_env(mock, GATEWAY_NOTIFY_EVENTS="task_started, task_completed"))
-    c.post("/", json=rpc("message/send", user_msg("hi", taskId="a", contextId="b")))
+    tid = c.post("/", json=rpc("message/send", user_msg("hi", taskId="a", contextId="b"))).json()["result"]["id"]
     reqs = mock.wait(2)
     b0, b1 = json.loads(reqs[0]["body"]), json.loads(reqs[1]["body"])
-    assert b0 == {"event": "task_started", "source": "kimiclaw-a2a-gateway", "taskId": "a",
+    assert b0 == {"event": "task_started", "source": "kimiclaw-a2a-gateway", "taskId": tid,
                   "contextId": "b", "timestamp": b0["timestamp"]}
     assert b1["event"] == "task_completed"
 
