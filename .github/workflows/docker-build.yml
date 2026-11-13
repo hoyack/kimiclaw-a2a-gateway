@@ -6,35 +6,36 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Job-level permissions override this. packages: write lives only on the push job.
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: docker-build-${{ github.ref }}
-  cancel-in-progress: true
+  # Do not cancel a main push already in flight when another merge lands.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/hoyack/kimiclaw-a2a-gateway
+  SCAN_TAG: ghcr.io/hoyack/kimiclaw-a2a-gateway:${{ github.sha }}
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  TRUFFLEHOG_VERSION: "3.99.9"
+  TRUFFLEHOG_SHA256: 12050095c8063bf4d34f9f6cbce6ba9fa8d0deea9d503d0570364feba093658e
 
 jobs:
-  build:
+  build-and-scan:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    env:
-      IMAGE: ghcr.io/hoyack/kimiclaw-a2a-gateway
-      # Push only from main (a push or a manual dispatch). Pull requests never push.
-      PUSH: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
-
-      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        if: env.PUSH == 'true'
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         id: meta
@@ -46,44 +47,132 @@ jobs:
             type=sha,format=long,prefix=
             type=sha,format=short,prefix=
 
+      # Build is loaded into the local daemon and scanned. It is never pushed from this job.
       - uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         id: build
         with:
           context: .
           file: ./Dockerfile
-          push: ${{ env.PUSH }}
-          load: false
+          push: false
+          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          sbom: ${{ env.PUSH }}
-          provenance: ${{ env.PUSH }}
+          sbom: false
+          provenance: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Record image digest
-        if: steps.build.outputs.digest != ''
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
+      - name: Install gitleaks and trufflehog
+        run: bash .github/scripts/install-scanners.sh
+
+      - name: Check docker history for secret-like ENV/ARG
         run: |
           set -euo pipefail
-          ref="${IMAGE}@${DIGEST}"
-          printf '%s\n' "$ref" > image-digest.txt
+          docker image inspect "${SCAN_TAG}" >/dev/null
+          python3 .github/scripts/check-docker-history.py "${SCAN_TAG}"
+
+      - name: Scan image layers for secrets
+        run: bash .github/scripts/scan-image-layers.sh "${SCAN_TAG}"
+
+      - name: Scan full git history for secrets
+        run: bash .github/scripts/scan-git-history.sh
+
+      - name: Stage scanned image for the push job
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/scanned-image"
+          mkdir -p "${dest}"
+          docker save "${SCAN_TAG}" -o "${dest}/image.tar"
+          docker inspect --format='{{.Id}}' "${SCAN_TAG}" > "${dest}/image-id.txt"
+          printf '%s\n' "${{ steps.meta.outputs.tags }}" > "${dest}/tags.txt"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        with:
+          name: scanned-image
+          path: ${{ runner.temp }}/scanned-image/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
+
+  push:
+    needs: [build-and-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: scanned-image
+          path: ${{ runner.temp }}/scanned-image
+
+      # Load the exact image built and scanned in build-and-scan (docker save/load
+      # of that tarball; not a second rebuild). Re-run the layer scan and docker
+      # history check on that image. Login and push happen only after this passes.
+      - name: Load scanned image and re-run secret checks
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/scanned-image"
+          docker load -i "${dest}/image.tar"
+          expected_id="$(tr -d '[:space:]' < "${dest}/image-id.txt")"
+          loaded_id="$(docker inspect --format='{{.Id}}' "${SCAN_TAG}")"
+          if [ "${loaded_id}" != "${expected_id}" ]; then
+            echo "Loaded image id does not match the scanned image id."
+            exit 1
+          fi
+          bash .github/scripts/install-scanners.sh
+          python3 .github/scripts/check-docker-history.py "${SCAN_TAG}"
+          bash .github/scripts/scan-image-layers.sh "${SCAN_TAG}"
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push scanned image
+        run: |
+          set -euo pipefail
+          dest="${RUNNER_TEMP}/scanned-image"
+          loaded_id="$(docker inspect --format='{{.Id}}' "${SCAN_TAG}")"
+          expected_id="$(tr -d '[:space:]' < "${dest}/image-id.txt")"
+          if [ "${loaded_id}" != "${expected_id}" ]; then
+            echo "Image id changed after the re-scan; refusing to push."
+            exit 1
+          fi
+          while IFS= read -r tag; do
+            tag="$(printf %s "${tag}" | tr -d '\r')"
+            [ -n "${tag}" ] || continue
+            docker push "${tag}"
+          done < "${dest}/tags.txt"
+          ref="$(docker inspect --format='{{index .RepoDigests 0}}' "${SCAN_TAG}")"
+          if [ -z "${ref}" ] || [ "${ref}" = "<no value>" ]; then
+            echo "Pushed image has no RepoDigest; refusing to record an empty digest."
+            exit 1
+          fi
+          printf '%s\n' "${ref}" > image-digest.txt
           {
             echo "## Image digest"
             echo
             echo "\`${ref}\`"
             echo
-            if [ "${PUSH}" = "true" ]; then
-              echo "Pushed to GHCR. Tags are the full commit SHA and the short SHA (never \`latest\`). Re-running this workflow for the same SHA re-pushes the same tags."
-              echo
-              echo "The digest is also uploaded as the \`image-digest\` artifact (\`image-digest.txt\`). Alamo should pull this reference by digest after a main run."
-            else
-              echo "This run did **not** push (pull requests never push; only a push or \`workflow_dispatch\` on \`main\` does). The digest above is from the local build and is not available on GHCR."
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "Pushed the scanned image tarball (same image id ${loaded_id}) after a second history and layer scan in this job."
+            echo "Tags are the full commit SHA and the short SHA (never \`latest\`)."
+            echo "Re-running this workflow for the same SHA re-pushes the same tags."
+            echo
+            echo "The digest is also uploaded as the \`image-digest\` artifact (\`image-digest.txt\`)."
+            echo "Alamo should pull this reference by digest after a main run."
+          } >> "${GITHUB_STEP_SUMMARY}"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: steps.build.outputs.digest != ''
         with:
           name: image-digest
           path: image-digest.txt
