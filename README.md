@@ -94,7 +94,8 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | `GATEWAY_CREATE_PER_MIN` / `GATEWAY_CREATE_BURST` | `10` / `5` | per key: `message/send` + `message/stream` token bucket |
 | `GATEWAY_GET_PER_S` | `2` | per key: `tasks/get` |
 | `GATEWAY_CANCEL_PER_S` | `1` | per key: `tasks/cancel` |
-| `GATEWAY_MAX_INFLIGHT_PER_KEY` | `3` | per key: running or queued tasks; more gets 429 (`Retry-After: 5`) |
+| `GATEWAY_MAX_INFLIGHT_PER_KEY` | `2` | per key: running or queued tasks; more gets 429 (`Retry-After: 5`). Must stay below the 3 agent slots, or startup fails, so one key can't hold them all |
+| `WEB_CONCURRENCY` | `1` | anything but 1 refuses startup (limits are per process) |
 | `GATEWAY_MAX_PENDING` | `50` | all keys: running or queued tasks; more gets 429 |
 | `GATEWAY_MAX_TASKS_PER_KEY` | `100` | per key: stored tasks; the oldest finished ones are dropped past this |
 | `GATEWAY_TELEMETRY_FILE_MB` | `10` | size of each telemetry file; 5 files each for traces, metrics and logs (150 MB total) |
@@ -128,7 +129,7 @@ fans out exponentially. The n8n side MUST filter on `event`.
 
 ## Known issues (kept on purpose; changing them changes the wire behavior)
 
-- **HTTP 200 on JSON-RPC errors.** -32602 (bad role, empty, >100k chars), -32601, -32001 and -32000 return HTTP 200; only parse errors return 400. A non-object JSON body returns a plain 500.
+- **HTTP 200 on JSON-RPC errors.** -32602 (bad role, empty, >100k chars, non-object params or message, malformed parts, contextId not a string of at most 128 chars), -32601, -32001 and -32000 return HTTP 200; only parse errors (-32700) and a non-object body (-32600) return 400.
 - **Inline n8n call.** The notify POST is awaited inside the task (not fire-and-forget). The blocking `message/send` response is released first, but a slow webhook holds the task coroutine for up to 10 s.
 - **Cancel then completed.** `tasks/cancel` marks the task canceled but does not stop openclaw; when the run finishes it overwrites the state with `completed` or `failed`.
 

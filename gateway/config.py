@@ -74,7 +74,7 @@ CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
 GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))
 CANCEL_PER_S = float(os.environ.get("GATEWAY_CANCEL_PER_S", "1"))
 MAX_BODY = 1_000_000
-MAX_INFLIGHT_PER_KEY = int(os.environ.get("GATEWAY_MAX_INFLIGHT_PER_KEY", "3"))
+MAX_INFLIGHT_PER_KEY = int(os.environ.get("GATEWAY_MAX_INFLIGHT_PER_KEY", "2"))
 MAX_PENDING = int(os.environ.get("GATEWAY_MAX_PENDING", "50"))
 MAX_TASKS_PER_KEY = int(os.environ.get("GATEWAY_MAX_TASKS_PER_KEY", "100"))
 PUBLIC_URL = os.environ.get("GATEWAY_PUBLIC_URL", "").strip() or "https://kimiclaw.hoyack.ai/"
@@ -89,3 +89,8 @@ MAX_TEXT = 100_000
 AGENT_TIMEOUT = 560           # seconds, passed to openclaw
 AGENT_CONCURRENCY = 3         # concurrent agent turns
 TASK_TTL = 24 * 3600          # task retention
+
+if os.environ.get("WEB_CONCURRENCY", "1").strip() not in ("", "1"):
+    raise RuntimeError("WEB_CONCURRENCY must be 1: rate limits and task caps are per process")
+if AGENT_CONCURRENCY > 1 and MAX_INFLIGHT_PER_KEY >= AGENT_CONCURRENCY:
+    raise RuntimeError(f"GATEWAY_MAX_INFLIGHT_PER_KEY must be below {AGENT_CONCURRENCY} so one key can't hold every agent slot")

@@ -22,20 +22,25 @@ BUCKET_OF = {"message/stream": "message/send"}
 _buckets: dict[tuple[str, str], tuple[float, float]] = {}
 
 
-def key_id_of(authz: str) -> str | None:
-    """The key_id part of `Bearer kc_<key_id>_<secret>`, if it is shaped like one (not proof the key is valid)."""
-    if not authz.startswith("Bearer kc_"):
+def bearer_token(authz: str) -> str:
+    scheme, _, token = authz.partition(" ")
+    return token if scheme.lower() == "bearer" else ""
+
+
+def key_id_of(token: str) -> str | None:
+    """The key_id part of `kc_<key_id>_<secret>`, if it is shaped like one (not proof the key is valid)."""
+    if not token.startswith("kc_"):
         return None
-    key_id, sep, _ = authz[len("Bearer kc_"):].partition("_")
+    key_id, sep, _ = token[len("kc_"):].partition("_")
     return key_id if sep and KEY_ID_RE.fullmatch(key_id) else None
 
 
-def verify(authz: str) -> str | None:
-    key_id = key_id_of(authz)
+def verify(token: str) -> str | None:
+    key_id = key_id_of(token)
     entry = API_KEYS.get(key_id) if key_id else None
     if entry is None:
         return None
-    presented = hashlib.sha256(authz[len("Bearer "):].encode()).hexdigest()
+    presented = hashlib.sha256(token.encode()).hexdigest()
     return key_id if hmac.compare_digest(presented.encode(), entry[0].encode()) else None
 
 
@@ -64,10 +69,10 @@ async def bearer_auth(request: Request, call_next):
         return await call_next(request)
     if request.url.path in PUBLIC_PATHS:
         return await call_next(request)
-    authz = request.headers.get("authorization", "")
-    key_id = verify(authz)
+    token = bearer_token(request.headers.get("authorization", ""))
+    key_id = verify(token)
     if key_id is None:
-        hint = key_id_of(authz)
+        hint = key_id_of(token)
         LOG.warning("unauthorized key_id_hint=%s path=%s", log_safe(hint or "-"), log_safe(request.url.path))
         request.state.key_id = f"invalid:{hint}" if hint else "none"
         return JSONResponse({"error": "unauthorized"}, status_code=401)

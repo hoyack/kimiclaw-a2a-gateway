@@ -25,7 +25,7 @@ def test_agent_card_public(gw_factory):
     assert card["securitySchemes"] == {"bearerAuth": {"type": "http", "scheme": "bearer"}}
 
 
-@pytest.mark.parametrize("hdr", [None, "Bearer wrong", KEY, f"bearer {KEY}", f"Bearer {TOKEN}", f"Bearer {KEY}x"])
+@pytest.mark.parametrize("hdr", [None, "Bearer wrong", KEY, f"Basic {KEY}", f"Bearer {TOKEN}", f"Bearer {KEY}x"])
 def test_unauthorized(gw_factory, hdr):
     c = gw_factory()
     h = {"Authorization": hdr} if hdr else {}
@@ -61,10 +61,29 @@ def test_unknown_method(gw_factory):
     assert r.json() == {"jsonrpc": "2.0", "id": 7, "error": {"code": -32601, "message": "method not found: foo/bar"}}
 
 
-def test_non_object_body_is_500(gw_factory):
-    # body.get on a list -> unhandled AttributeError -> 500 plain text
-    r = gw_factory().post("/", json=[1, 2])
-    assert r.status_code == 500
+@pytest.mark.parametrize("body", [[1, 2], "str", 5, True])
+def test_non_object_body_is_invalid_request(gw_factory, body):
+    r = gw_factory().post("/", json=body)
+    assert (r.status_code, r.json()["error"]["code"]) == (400, -32600)
+
+
+@pytest.mark.parametrize("method", ["message/send", "message/stream", "tasks/get", "tasks/cancel"])
+@pytest.mark.parametrize("params", [[1], "x", 5])
+def test_non_object_params_is_invalid_params(gw_factory, method, params):
+    r = gw_factory().post("/", json={"jsonrpc": "2.0", "id": "1", "method": method, "params": params})
+    assert (r.status_code, r.json()["error"]["code"]) == (200, -32602)
+
+
+@pytest.mark.parametrize("message", [
+    "x", [1], {"parts": "hello"}, {"parts": [1]}, {"parts": ["x"]}, {"parts": [{"kind": "text", "text": 5}]},
+    {"parts": [{"kind": "file", "file": "f"}]}, {"parts": [{"kind": "text", "text": "x"}], "contextId": 5},
+    {"parts": [{"kind": "text", "text": "x"}], "contextId": {}}, {"parts": [{"kind": "text", "text": "x"}], "contextId": "c" * 129},
+])
+@pytest.mark.parametrize("method", ["message/send", "message/stream"])
+def test_malformed_message_is_invalid_params(gw_factory, method, message):
+    r = gw_factory().post("/", json={"jsonrpc": "2.0", "id": "1", "method": method, "params": {"message": message}},
+                          timeout=5)
+    assert (r.status_code, r.json()["error"]["code"]) == (200, -32602)
 
 
 @pytest.mark.parametrize("params,msg", [

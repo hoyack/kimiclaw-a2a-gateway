@@ -27,7 +27,7 @@ paths:
               schema:
                 type: string
         '400':
-          description: parse error (-32700)
+          description: parse error (-32700) or a body that is not a JSON object (-32600)
         '401':
           description: unauthorized
         '413':

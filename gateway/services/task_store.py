@@ -16,6 +16,7 @@ agent_sem = asyncio.Semaphore(AGENT_CONCURRENCY)
 
 
 BUSY = {"busy": True}
+MAX_CONTEXT_ID = 128
 
 
 def owned_task(task_id, key_id: str) -> dict | None:
@@ -31,12 +32,23 @@ def prune_tasks():
         tasks.pop(k, None)
 
 
-async def execute_task(task_id: str, ctx_id: str, text: str, queue: asyncio.Queue | None):
-    entry = tasks[task_id]
+async def execute_task(entry: dict, task_id: str, ctx_id: str, text: str, queue: asyncio.Queue | None):
+    """Whatever happens, the task ends final, waiters wake and the stream closes."""
     try:
         await _execute_task(entry, task_id, ctx_id, text, queue)
+    except Exception as e:
+        LOG.error("task crashed task=%s error_type=%s", log_safe(task_id), type(e).__name__)
+        status = {"state": "failed", "message": make_agent_message(f"agent error (task {task_id})"), "timestamp": now()}
+        entry["task"].update(status=status, final=True)
+        if queue is not None:
+            queue.put_nowait({"kind": "status-update", "taskId": task_id, "contextId": ctx_id,
+                              "final": True, "status": status})
     finally:
         entry["running"] = False
+        if not entry["done"].is_set():
+            entry["done"].set()
+            if queue is not None:
+                queue.put_nowait(None)
 
 
 async def _execute_task(entry: dict, task_id: str, ctx_id: str, text: str, queue: asyncio.Queue | None):
@@ -88,7 +100,7 @@ async def _execute_task(entry: dict, task_id: str, ctx_id: str, text: str, queue
     if queue is not None:
         await queue.put(None)
     entry["done"].set()
-    event("task_finished", task_id=task_id, context_id=ctx_id, state=state,
+    event("task_finished", task_id=task_id, context_id=log_safe(ctx_id), state=state,
           duration_ms=int((time.time() - started) * 1000))
     await notify(f"task_{state}", task_id, ctx_id, {
         "state": state,
@@ -102,16 +114,24 @@ async def start_task(req_id, params, queue: asyncio.Queue | None, key_id: str):
     Returns BUSY when the key or the gateway has too many tasks running or queued. Past MAX_TASKS_PER_KEY stored
     tasks, the key's oldest finished ones are dropped."""
     msg = params.get("message") or {}
+    if not isinstance(msg, dict):
+        return rpc_error(req_id, -32602, "message must be an object")
     if msg.get("role") not in (None, "user"):
         return rpc_error(req_id, -32602, "only user-role messages accepted")
-    text = extract_text(msg)
+    try:
+        text = extract_text(msg)
+    except (AttributeError, TypeError):
+        return rpc_error(req_id, -32602, "invalid message parts")
     if not text:
         return rpc_error(req_id, -32602, "empty message")
     if len(text) > MAX_TEXT:
         return rpc_error(req_id, -32602, "message too large")
 
+    ctx_id = msg.get("contextId")
+    ctx_id = str(uuid.uuid4()) if ctx_id in (None, "") else ctx_id
+    if not isinstance(ctx_id, str) or len(ctx_id) > MAX_CONTEXT_ID:
+        return rpc_error(req_id, -32602, f"contextId must be a string of at most {MAX_CONTEXT_ID} chars")
     task_id = str(uuid.uuid4())
-    ctx_id = msg.get("contextId") or str(uuid.uuid4())
 
     # F26: never log message bodies; ids and length only.
     if msg.get("messageId"):
@@ -128,7 +148,7 @@ async def start_task(req_id, params, queue: asyncio.Queue | None, key_id: str):
         mine = [k for k, e in tasks.items() if e["owner"] == key_id and not e["running"]]
         for k in mine[:max(0, len(mine) + 1 - MAX_TASKS_PER_KEY)]:
             tasks.pop(k)
-        tasks[task_id] = {
+        entry = tasks[task_id] = {
             "owner": key_id,
             "running": True,
             "task": {
@@ -142,5 +162,5 @@ async def start_task(req_id, params, queue: asyncio.Queue | None, key_id: str):
             "done": asyncio.Event(),
         }
 
-    asyncio.create_task(execute_task(task_id, ctx_id, text, queue))
+    asyncio.create_task(execute_task(entry, task_id, ctx_id, text, queue))
     return {"taskId": task_id, "contextId": ctx_id}
