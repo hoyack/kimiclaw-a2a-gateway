@@ -193,6 +193,7 @@ jobs:
         with:
           image: ${{ env.SCAN_TAG }}
           format: spdx-json
+          syft-version: v1.54.0
           output-file: ${{ runner.temp }}/sbom.spdx.json
           upload-artifact: true
           artifact-name: image-sbom
