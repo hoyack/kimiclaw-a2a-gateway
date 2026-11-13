@@ -1,4 +1,4 @@
-# For Tugboat: test commands (CI workflow is yours; none is committed here)
+# For Tugboat: test commands (CI workflow: `.github/workflows/docker-build.yml`; see docs/ghcr.md)
 
 Python 3.13. No secrets or network access needed; tests use a fake `openclaw` (tests/fakebin) and a local mock n8n receiver.
 

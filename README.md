@@ -20,6 +20,8 @@ uvicorn app:app --host 127.0.0.1 --port 8000
 Docker: `docker build -t kimiclaw-gw . && docker run -e KIMICLAW_TOKEN -p 8000:8000 kimiclaw-gw`
 (the image does not contain openclaw; add it in a derived image or mount it).
 
+CI builds that Dockerfile and, on `main` only, pushes `ghcr.io/hoyack/kimiclaw-a2a-gateway` tagged with the commit SHA (never `latest`). Pull requests never push. See [docs/ghcr.md](docs/ghcr.md) for how to find the digest and for rollback.
+
 ## Layout
 
 ```
