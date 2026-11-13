@@ -9,6 +9,7 @@ CI builds the existing `Dockerfile` with `load: true`, scans the loaded image an
 - Pull requests build and scan only and never push.
 - Tags are the full commit SHA and the short SHA. The workflow never tags `latest`.
 - Re-running the workflow for the same SHA re-pushes the same tags.
+- After a successful push, the job attests build provenance (`actions/attest-build-provenance`) and an SPDX SBOM (`anchore/sbom-action` plus `actions/attest-sbom`) for the pushed digest, and pushes those attestations to GHCR. The push job also has `id-token: write` and `attestations: write` for that. The image itself is still the scanned tarball, not a rebuild.
 
 No new Actions secrets are used. The push job authenticates to GHCR with the built-in `GITHUB_TOKEN` only after the re-scan passes. The build-and-scan job has `contents: read` only.
 

@@ -12,4 +12,4 @@ USER gateway
 EXPOSE 8000
 # Liveness only: /healthz is public. /readyz is not used here because it is 503 until openclaw is present.
 HEALTHCHECK CMD python -c "import urllib.request as u;u.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

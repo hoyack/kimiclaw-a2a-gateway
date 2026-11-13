@@ -104,6 +104,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -139,6 +141,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push scanned image
+        id: push
         run: |
           set -euo pipefail
           dest="${RUNNER_TEMP}/scanned-image"
@@ -159,6 +162,12 @@ jobs:
             exit 1
           fi
           printf '%s\n' "${ref}" > image-digest.txt
+          digest="${ref##*@}"
+          case "${digest}" in
+            sha256:*) ;;
+            *) echo "Refusing to attest an unexpected digest format."; exit 1 ;;
+          esac
+          printf 'digest=%s\n' "${digest}" >> "${GITHUB_OUTPUT}"
           {
             echo "## Image digest"
             echo
@@ -170,7 +179,32 @@ jobs:
             echo
             echo "The digest is also uploaded as the \`image-digest\` artifact (\`image-digest.txt\`)."
             echo "Alamo should pull this reference by digest after a main run."
+            echo
+            echo "Build provenance and an SPDX SBOM are attested for this digest and pushed to GHCR."
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/hoyack/kimiclaw-a2a-gateway
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.SCAN_TAG }}
+          format: spdx-json
+          output-file: ${{ runner.temp }}/sbom.spdx.json
+          upload-artifact: true
+          artifact-name: image-sbom
+          upload-release-assets: false
+          dependency-snapshot: false
+
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-name: ghcr.io/hoyack/kimiclaw-a2a-gateway
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: ${{ runner.temp }}/sbom.spdx.json
+          push-to-registry: true
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
