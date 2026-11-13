@@ -30,6 +30,8 @@ paths:
           description: parse error (-32700)
         '401':
           description: unauthorized
+        '429':
+          description: rate limited; see Retry-After
       description: Validation errors (-32602), unknown method (-32601), not found
         (-32001) and gateway timeout (-32000) return HTTP 200 with a JSON-RPC error.
         Parse error returns 400.

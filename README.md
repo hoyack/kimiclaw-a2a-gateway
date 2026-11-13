@@ -4,7 +4,7 @@ A2A protocol (v1.0 subset) gateway fronting the local OpenClaw agent.
 
 - Public URL: `https://kimiclaw.hoyack.ai/`
 - Agent card: `GET /.well-known/agent.json` (public)
-- JSON-RPC: `POST /` (bearer token required)
+- JSON-RPC: `POST /` (bearer token required; per-caller keys and a per-caller rate limit, see env vars)
 - Origin: uvicorn on `127.0.0.1:8000`, tunnel via cloudflared systemd service
 
 ## Setup
@@ -26,7 +26,7 @@ Docker: `docker build -t kimiclaw-gw . && docker run -e KIMICLAW_TOKEN -p 8000:8
 app.py                     entrypoint shim (uvicorn app:app)
 gateway/config.py          env settings + .env fallback
 gateway/models.py          agent card, wire builders, pydantic schemas (docs only)
-gateway/auth.py            bearer middleware
+gateway/auth.py            bearer middleware (per-caller keys, POST / rate limit)
 gateway/telemetry.py       OpenTelemetry setup + request middleware
 gateway/routes/            a2a.py (GET /, agent card, POST /), health.py
 gateway/controllers/rpc.py JSON-RPC dispatch + SSE
@@ -40,7 +40,7 @@ openapi.yaml               frozen API contract (served spec must match; see test
 |---|---|---|---|
 | GET | `/.well-known/agent.json` | public | agent card |
 | GET | `/` | bearer | service info |
-| POST | `/` | bearer | JSON-RPC: `message/send`, `message/stream`, `tasks/get`, `tasks/cancel` |
+| POST | `/` | bearer | JSON-RPC: `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`. 429 + `Retry-After` over the caller's rate limit |
 | GET | `/healthz` | public | **new**: liveness, returns only `{"status":"ok"}` (no version/config) |
 | GET | `/readyz` | bearer | **new**: 200 if `openclaw` is on PATH, else 503 |
 
@@ -68,6 +68,10 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | Name | Default | Purpose |
 |---|---|---|
 | `KIMICLAW_TOKEN` | required (env or `.env`) | inbound bearer token; also the outbound notify credential |
+| `GATEWAY_API_KEYS` | unset | per-caller inbound keys, `caller:key,caller:key` (keys at least 32 chars, no commas; e.g. `openssl rand -hex 32`). When set, **only** these keys are accepted and `KIMICLAW_TOKEN` is just the notify credential. Unset: `KIMICLAW_TOKEN` is the one inbound key |
+| `GATEWAY_RATE_LIMIT` | `60` | JSON-RPC calls (`POST /`) allowed per caller per window; over it returns 429 with `Retry-After`. In-process, per replica |
+| `GATEWAY_RATE_WINDOW_S` | `60` | rate-limit window in seconds (fixed window) |
+| `GATEWAY_PUBLIC_URL` | `https://kimiclaw.hoyack.ai/` | `url` published in `/.well-known/agent.json` (e.g. `https://a2a.hoyack.ai/`) |
 | `GATEWAY_NOTIFY_URL` | empty (disabled) | task-event webhook (n8n AI firewall) |
 | `GATEWAY_NOTIFY_AUTH_MODE` | `raw` | `raw` (token), `bearer`, or `basic` (user:token). **Must be `basic` for the n8n A2A_Firewall webhook** |
 | `GATEWAY_NOTIFY_AUTH_USER` | `agent` | user for `basic` |
