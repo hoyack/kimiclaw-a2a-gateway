@@ -1,7 +1,7 @@
 """Characterization tests: pin CURRENT behavior of app.py (bugs included)."""
 import base64, json, time
 import httpx, pytest
-from conftest import TOKEN
+from conftest import KEY, TOKEN
 
 
 def rpc(method, params=None, id_="1"):
@@ -25,7 +25,7 @@ def test_agent_card_public(gw_factory):
     assert card["securitySchemes"] == {"bearerAuth": {"type": "http", "scheme": "bearer"}}
 
 
-@pytest.mark.parametrize("hdr", [None, "Bearer wrong", TOKEN, f"bearer {TOKEN}"])
+@pytest.mark.parametrize("hdr", [None, "Bearer wrong", KEY, f"bearer {KEY}", f"Bearer {TOKEN}", f"Bearer {KEY}x"])
 def test_unauthorized(gw_factory, hdr):
     c = gw_factory()
     h = {"Authorization": hdr} if hdr else {}

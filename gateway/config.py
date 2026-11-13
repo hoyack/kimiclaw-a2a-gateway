@@ -1,6 +1,7 @@
 """Env-based settings. Names, defaults and the .env fallback match the original app.py."""
 import logging
 import os
+import re
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -11,7 +12,8 @@ logging.basicConfig(
 LOG = logging.getLogger("kimiclaw")
 
 MAX_LOG_ID = 128
-MIN_API_KEY_LEN = 32
+KEY_ID_RE = re.compile(r"[a-z0-9]{8,12}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def log_safe(value) -> str:
@@ -40,28 +42,36 @@ def _load_token() -> str:
     return tok
 
 
-def _load_api_keys(default_token: str) -> dict:
-    """GATEWAY_API_KEYS="caller:key,caller:key" gives each caller its own key; unset keeps KIMICLAW_TOKEN as the
-    only key (caller "default"). Errors name the entry position, never the key."""
-    raw = os.environ.get("GATEWAY_API_KEYS", "").strip()
-    if not raw:
-        return {"default": default_token}
+def load_keys(path: str) -> dict[str, tuple[str, str]]:
+    """Keys file: one `<key_id> <sha256-hex of the full key> <caller>` per line; blank lines and # comments skipped.
+    Missing, empty or malformed refuses startup. Errors name the line number, never its content."""
+    if not path:
+        raise RuntimeError("GATEWAY_KEYS_FILE not set (path to the hashed API keys file)")
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        raise RuntimeError(f"GATEWAY_KEYS_FILE unreadable: {type(e).__name__}") from None
     keys = {}
-    for i, entry in enumerate(raw.split(","), 1):
-        name, sep, key = entry.strip().partition(":")
-        name, key = name.strip(), key.strip()
-        if not sep or not name or len(key) < MIN_API_KEY_LEN:
-            raise RuntimeError(f"GATEWAY_API_KEYS entry {i}: want caller:key with a key of at least {MIN_API_KEY_LEN} chars")
-        if name in keys or key in keys.values():
-            raise RuntimeError(f"GATEWAY_API_KEYS entry {i}: duplicate caller name or key")
-        keys[name] = key
+    for n, line in enumerate(lines, 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 3 or not KEY_ID_RE.fullmatch(parts[0]) or not SHA256_RE.fullmatch(parts[1]) or parts[0] in keys:
+            raise RuntimeError(f"GATEWAY_KEYS_FILE line {n}: want unique `<key_id> <sha256-hex> <caller>`")
+        keys[parts[0]] = (parts[1], parts[2])
+    if not keys:
+        raise RuntimeError("GATEWAY_KEYS_FILE has no keys")
     return keys
 
 
 TOKEN = _load_token()
-API_KEYS = _load_api_keys(TOKEN)
-RATE_LIMIT = int(os.environ.get("GATEWAY_RATE_LIMIT", "60"))
-RATE_WINDOW_S = int(os.environ.get("GATEWAY_RATE_WINDOW_S", "60"))
+API_KEYS = load_keys(os.environ.get("GATEWAY_KEYS_FILE", "").strip())
+CREATE_PER_MIN = float(os.environ.get("GATEWAY_CREATE_PER_MIN", "10"))
+CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
+GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))
+CANCEL_PER_S = float(os.environ.get("GATEWAY_CANCEL_PER_S", "1"))
+MAX_BODY = 1_000_000
 PUBLIC_URL = os.environ.get("GATEWAY_PUBLIC_URL", "").strip() or "https://kimiclaw.hoyack.ai/"
 NOTIFY_URL = os.environ.get("GATEWAY_NOTIFY_URL", "").strip()
 NOTIFY_AUTH_MODE = os.environ.get("GATEWAY_NOTIFY_AUTH_MODE", "raw").lower()

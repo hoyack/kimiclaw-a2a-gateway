@@ -4,7 +4,7 @@ A2A protocol (v1.0 subset) gateway fronting the local OpenClaw agent.
 
 - Public URL: `https://kimiclaw.hoyack.ai/`
 - Agent card: `GET /.well-known/agent.json` (public)
-- JSON-RPC: `POST /` (bearer token required; per-caller keys and a per-caller rate limit, see env vars)
+- JSON-RPC: `POST /` (per-caller key required, per-key rate limits; see "Caller keys")
 - Origin: uvicorn on `127.0.0.1:8000`, tunnel via cloudflared systemd service
 
 ## Setup
@@ -13,9 +13,10 @@ A2A protocol (v1.0 subset) gateway fronting the local OpenClaw agent.
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt            # requirements-dev.txt for tests
 export KIMICLAW_TOKEN=...                  # or put KIMICLAW_TOKEN=... in .env (chmod 600, gitignored)
+export GATEWAY_KEYS_FILE=/path/to/keys.txt # hashed caller keys, see "Caller keys"
 uvicorn app:app --host 127.0.0.1 --port 8000
 ```
-`openclaw` must be on PATH. The app refuses to start without `KIMICLAW_TOKEN`.
+`openclaw` must be on PATH. The app refuses to start without `KIMICLAW_TOKEN` or a valid `GATEWAY_KEYS_FILE`.
 
 Docker: `docker build -t kimiclaw-gw . && docker run -e KIMICLAW_TOKEN -p 8000:8000 kimiclaw-gw`
 (the image does not contain openclaw; add it in a derived image or mount it).
@@ -55,9 +56,23 @@ A2A `contextId` maps to OpenClaw session `a2a-<ctx>`; reuse it to continue a con
 
 ### Example
 ```bash
-curl -s https://kimiclaw.hoyack.ai/ -H "Authorization: Bearer $KIMICLAW_TOKEN" -H 'Content-Type: application/json' \
+curl -s https://kimiclaw.hoyack.ai/ -H "Authorization: Bearer $A2A_KEY" -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","messageId":"m1","parts":[{"kind":"text","text":"Summarize the systemd journal for yesterday"}]}}}'
 ```
+
+## Caller keys
+
+Each caller gets its own key, `kc_<key_id>_<secret>` (10-char hex id, 32 random bytes), sent as
+`Authorization: Bearer <key>` on everything except `/.well-known/agent.json` and `/healthz`. The gateway stores only
+`<key_id> <sha256 of the key> <caller>` lines in `GATEWAY_KEYS_FILE` (`#` comments allowed). Mint one with
+
+```bash
+python tools/new_api_key.py <caller> >> keys.txt   # stdout: the file line; stderr: the key, shown once
+```
+
+Give the key to the caller once; it is not stored anywhere. Revoke a key by deleting its line and restarting. A caller
+can hold two keys during rotation. Logs carry the `key_id`, never the key or its hash. Over a limit: 429 with
+`Retry-After`; `POST /` bodies over 1 MB: 413. Limits are in-process, per replica.
 
 ## Environment variables (names only)
 
@@ -67,10 +82,11 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 
 | Name | Default | Purpose |
 |---|---|---|
-| `KIMICLAW_TOKEN` | required (env or `.env`) | inbound bearer token; also the outbound notify credential |
-| `GATEWAY_API_KEYS` | unset | per-caller inbound keys, `caller:key,caller:key` (keys at least 32 chars, no commas; e.g. `openssl rand -hex 32`). When set, **only** these keys are accepted and `KIMICLAW_TOKEN` is just the notify credential. Unset: `KIMICLAW_TOKEN` is the one inbound key |
-| `GATEWAY_RATE_LIMIT` | `60` | JSON-RPC calls (`POST /`) allowed per caller per window; over it returns 429 with `Retry-After`. In-process, per replica |
-| `GATEWAY_RATE_WINDOW_S` | `60` | rate-limit window in seconds (fixed window) |
+| `KIMICLAW_TOKEN` | required (env or `.env`) | outbound notify credential (no longer accepted inbound) |
+| `GATEWAY_KEYS_FILE` | required | path to the hashed API keys file (mount it from a Secret; see "Caller keys"). Missing, empty or malformed refuses startup |
+| `GATEWAY_CREATE_PER_MIN` / `GATEWAY_CREATE_BURST` | `10` / `5` | per key: `message/send` + `message/stream` token bucket |
+| `GATEWAY_GET_PER_S` | `2` | per key: `tasks/get` |
+| `GATEWAY_CANCEL_PER_S` | `1` | per key: `tasks/cancel` |
 | `GATEWAY_PUBLIC_URL` | `https://kimiclaw.hoyack.ai/` | `url` published in `/.well-known/agent.json` (e.g. `https://a2a.hoyack.ai/`) |
 | `GATEWAY_NOTIFY_URL` | empty (disabled) | task-event webhook (n8n AI firewall) |
 | `GATEWAY_NOTIFY_AUTH_MODE` | `raw` | `raw` (token), `bearer`, or `basic` (user:token). **Must be `basic` for the n8n A2A_Firewall webhook** |
@@ -104,7 +120,6 @@ fans out exponentially. The n8n side MUST filter on `event`.
 - **HTTP 200 on JSON-RPC errors.** -32602 (bad role, empty, >200k chars), -32601, -32001 and -32000 return HTTP 200; only parse errors return 400. A non-object JSON body returns a plain 500.
 - **Inline n8n call.** The notify POST is awaited inside the task (not fire-and-forget). The blocking `message/send` response is released first, but a slow webhook holds the task coroutine for up to 10 s.
 - **Cancel then completed.** `tasks/cancel` marks the task canceled but does not stop openclaw; when the run finishes it overwrites the state with `completed` or `failed`.
-- **Shared token.** `KIMICLAW_TOKEN` is both the inbound bearer token and the outbound webhook credential. Rotating it means updating the n8n side too.
 
 ## Ops
 

@@ -3,7 +3,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx, pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOKEN = "dummy-test-token"
+TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN: outbound notify credential only
+KEY = "kc_testkey01_" + "k" * 43
+OTHER_KEY = "kc_testkey02_" + "o" * 43
+LIMITS_OFF = {"GATEWAY_CREATE_PER_MIN": "100000", "GATEWAY_CREATE_BURST": "1000",
+              "GATEWAY_GET_PER_S": "1000", "GATEWAY_CANCEL_PER_S": "1000"}
+
+KEYS_FILE = os.path.join(ROOT, "tests", "keys.test.txt")
 
 
 def free_port():
@@ -37,6 +43,8 @@ def start_gateway(tmp_path, extra_env):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
     env.update({
         "KIMICLAW_TOKEN": TOKEN,
+        "GATEWAY_KEYS_FILE": KEYS_FILE,
+        **LIMITS_OFF,
         "PATH": os.path.join(ROOT, "tests", "fakebin") + os.pathsep + env["PATH"],
         "FAKE_OPENCLAW_RECORD": str(rec),
         "NO_PROXY": "*",
@@ -64,7 +72,7 @@ def gw_factory(tmp_path):
     procs = []
     def make(**env):
         p, base, rec = start_gateway(tmp_path, env); procs.append(p)
-        c = httpx.Client(base_url=base, headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30)
+        c = httpx.Client(base_url=base, headers={"Authorization": f"Bearer {KEY}"}, timeout=30)
         c.argv_file = rec; c.log_file = tmp_path / "gateway.log"
         return c
     yield make

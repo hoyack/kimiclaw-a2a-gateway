@@ -149,7 +149,8 @@ async def telemetry_middleware(request, call_next):
         request_ms.record(ms, attrs)
         with trace.use_span(span):
             event("http_request", method=request.method, path=request.url.path, status=status,
-                  duration_ms=round(ms, 1), **getattr(request.state, "ids", {}))
+                  duration_ms=round(ms, 1), key_id=getattr(request.state, "key_id", None),
+                  **getattr(request.state, "ids", {}))
         span.end()
 
     try:

@@ -5,7 +5,8 @@ import json
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from gateway.config import AGENT_TIMEOUT, LOG, log_safe
+from gateway.auth import rate_limited, retry_after
+from gateway.config import AGENT_TIMEOUT, LOG, MAX_BODY, log_safe
 from gateway.models import now, rpc_error
 from gateway.services.task_store import start_task, tasks
 
@@ -32,15 +33,31 @@ async def sse_events(req_id, queue: asyncio.Queue):
         yield f"data: {json.dumps(rpc_error(req_id, -32000, f'stream error: {e}'))}\n\n"
 
 
+async def read_body(request: Request) -> bytes | None:
+    """The request body, or None once it passes MAX_BODY."""
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > MAX_BODY:
+            return None
+    return body
+
+
 async def handle_rpc(request: Request):
+    raw = await read_body(request)
+    if raw is None:
+        return JSONResponse({"error": "request body too large"}, status_code=413)
     try:
-        body = await request.json()
+        body = json.loads(raw)
     except Exception:
         return JSONResponse(rpc_error(None, -32700, "parse error"), status_code=400)
     method = body.get("method")
     req_id = body.get("id")
     params = body.get("params") or {}
     request.state.ids = {"rpc_method": method, "rpc_id": req_id}
+    retry = retry_after(request.state.key_id, method)
+    if retry:
+        return rate_limited(retry)
 
     if method == "message/send":
         started = await start_task(req_id, params, None)

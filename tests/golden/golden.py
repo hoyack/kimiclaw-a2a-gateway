@@ -4,7 +4,8 @@
 record:  python golden.py record --app-dir DIR      (starts DIR's app.py with stubs, writes cases/*.json)
 replay:  python golden.py replay --base-url URL --n8n-port PORT [--profile default|n8n_basic]
    n8n_basic profile: target also needs GATEWAY_NOTIFY_AUTH_MODE=basic GATEWAY_NOTIFY_AUTH_USER=n8n-dummy-user.
-   Target must run with: KIMICLAW_TOKEN=dummy-test-token, fakebin/ first on PATH,
+   Target must run with: KIMICLAW_TOKEN=dummy-test-token, GATEWAY_KEYS_FILE=tests/keys.test.txt, rate limits raised
+   (see start_app), fakebin/ first on PATH,
    FAKE_OPENCLAW_RECORD=<any file>, GATEWAY_NOTIFY_URL=http://127.0.0.1:PORT/webhook/firewall.
 replay-local: python golden.py replay-local --app-dir DIR   (starts DIR's app with stubs, then replays)
 Normalized: timestamps, UUIDs, durationMs, Content-Length/Date/server headers.
@@ -15,8 +16,9 @@ import httpx
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CASES = os.path.join(HERE, "cases")
-TOKEN = "dummy-test-token"
-AUTH = {"Authorization": f"Bearer {TOKEN}"}
+TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN, notify credential
+KEY = "kc_testkey01_" + "k" * 43  # inbound key; its hash is in tests/keys.test.txt
+AUTH = {"Authorization": f"Bearer {KEY}"}
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 TS = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?\+00:00")
 KEEP_HDR = {"content-type", "cache-control", "authorization", "user-agent"}
@@ -71,7 +73,7 @@ def msg(text, **kw):
 CASE_DEFS = {
     "get_root": [{"m": "GET", "p": "/"}],
     "get_root_unauth": [{"m": "GET", "p": "/", "auth": None}],
-    "get_root_wrong_scheme": [{"m": "GET", "p": "/", "auth": {"Authorization": TOKEN}}],
+    "get_root_wrong_scheme": [{"m": "GET", "p": "/", "auth": {"Authorization": KEY}}],
     "get_agent_card": [{"m": "GET", "p": "/.well-known/agent.json", "auth": None}],
     "post_parse_error": [{"m": "POST", "p": "/", "raw": "{bad"}],
     "post_unknown_method": [{"m": "POST", "p": "/", "json": rpc("foo/bar", {}, 7)}],
@@ -149,7 +151,9 @@ def free_port():
 def start_app(app_dir, n8n_port, extra=None):
     port = free_port()
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
-    env.update(KIMICLAW_TOKEN=TOKEN, PATH=os.path.join(HERE, "fakebin") + os.pathsep + env["PATH"],
+    env.update(KIMICLAW_TOKEN=TOKEN, GATEWAY_KEYS_FILE=os.path.join(os.path.dirname(HERE), "keys.test.txt"),
+               GATEWAY_CREATE_PER_MIN="100000", GATEWAY_CREATE_BURST="1000", GATEWAY_GET_PER_S="1000",
+               GATEWAY_CANCEL_PER_S="1000", PATH=os.path.join(HERE, "fakebin") + os.pathsep + env["PATH"],
                FAKE_OPENCLAW_RECORD=os.path.join(tempfile.mkdtemp(prefix="golden-"), "openclaw-argv.jsonl"),
                GATEWAY_NOTIFY_URL=f"http://127.0.0.1:{n8n_port}/webhook/firewall", NO_PROXY="*")
     env.update(extra or {})

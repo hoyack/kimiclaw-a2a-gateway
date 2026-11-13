@@ -1,4 +1,4 @@
-"""Regenerate openapi.yaml from the app: KIMICLAW_TOKEN=x python tools/freeze_openapi.py"""
+"""Regenerate openapi.yaml from the app: KIMICLAW_TOKEN=x GATEWAY_KEYS_FILE=tests/keys.test.txt python tools/freeze_openapi.py"""
 import os
 import sys
 

@@ -1,4 +1,5 @@
-"""Per-caller bearer auth and a per-caller fixed-window rate limit on JSON-RPC task calls (POST /)."""
+"""Per-caller API keys (`kc_<key_id>_<secret>`, checked against hashes from GATEWAY_KEYS_FILE) and per-key token buckets."""
+import hashlib
 import hmac
 import math
 import time
@@ -6,32 +7,56 @@ import time
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from gateway.config import API_KEYS, RATE_LIMIT, RATE_WINDOW_S
+from gateway.config import API_KEYS, CANCEL_PER_S, CREATE_BURST, CREATE_PER_MIN, GET_PER_S, KEY_ID_RE, LOG, log_safe
 
 PUBLIC_PATHS = {"/.well-known/agent.json", "/healthz"}
 
-_windows: dict[str, tuple[float, int]] = {}
+# rpc method -> (tokens per second, bucket size)
+LIMITS = {
+    "message/send": (CREATE_PER_MIN / 60, CREATE_BURST),
+    "message/stream": (CREATE_PER_MIN / 60, CREATE_BURST),
+    "tasks/get": (GET_PER_S, max(1, math.ceil(GET_PER_S))),
+    "tasks/cancel": (CANCEL_PER_S, max(1, math.ceil(CANCEL_PER_S))),
+}
+BUCKET_OF = {"message/stream": "message/send"}
+_buckets: dict[tuple[str, str], tuple[float, float]] = {}
 
 
-def caller_for(authz: str) -> str | None:
-    """Checks every key so timing does not reveal which one matched."""
-    found = None
-    for name, key in API_KEYS.items():
-        if hmac.compare_digest(authz.encode(), f"Bearer {key}".encode()):
-            found = name
-    return found
+def key_id_of(authz: str) -> str | None:
+    """The key_id part of `Bearer kc_<key_id>_<secret>`, if it is shaped like one (not proof the key is valid)."""
+    if not authz.startswith("Bearer kc_"):
+        return None
+    key_id, sep, _ = authz[len("Bearer kc_"):].partition("_")
+    return key_id if sep and KEY_ID_RE.fullmatch(key_id) else None
 
 
-def retry_after(caller: str) -> int:
-    """0 if the call is allowed (and counted), else seconds until the caller's window resets."""
+def verify(authz: str) -> str | None:
+    key_id = key_id_of(authz)
+    entry = API_KEYS.get(key_id) if key_id else None
+    if entry is None:
+        return None
+    presented = hashlib.sha256(authz[len("Bearer "):].encode()).hexdigest()
+    return key_id if hmac.compare_digest(presented.encode(), entry[0].encode()) else None
+
+
+def retry_after(key_id: str, method: str) -> int:
+    """0 if allowed (a token is spent), else whole seconds until the next token. Methods without a limit are free."""
+    if not isinstance(method, str) or method not in LIMITS:
+        return 0
+    rate, size = LIMITS[method]
+    slot = (key_id, BUCKET_OF.get(method, method))
     now = time.monotonic()
-    start, count = _windows.get(caller, (now, 0))
-    if now - start >= RATE_WINDOW_S:
-        start, count = now, 0
-    if count >= RATE_LIMIT:
-        return max(1, math.ceil(start + RATE_WINDOW_S - now))
-    _windows[caller] = (start, count + 1)
+    tokens, last = _buckets.get(slot, (size, now))
+    tokens = min(size, tokens + (now - last) * rate)
+    if tokens < 1:
+        _buckets[slot] = (tokens, now)
+        return max(1, math.ceil((1 - tokens) / rate))
+    _buckets[slot] = (tokens - 1, now)
     return 0
+
+
+def rate_limited(wait: int) -> JSONResponse:
+    return JSONResponse({"error": "rate limited"}, status_code=429, headers={"Retry-After": str(wait)})
 
 
 async def bearer_auth(request: Request, call_next):
@@ -39,11 +64,14 @@ async def bearer_auth(request: Request, call_next):
         return await call_next(request)
     if request.url.path in PUBLIC_PATHS:
         return await call_next(request)
-    caller = caller_for(request.headers.get("authorization", ""))
-    if caller is None:
+    authz = request.headers.get("authorization", "")
+    key_id = verify(authz)
+    if key_id is None:
+        hint = key_id_of(authz)
+        LOG.warning("unauthorized key_id_hint=%s path=%s", log_safe(hint or "-"), log_safe(request.url.path))
+        request.state.key_id = f"invalid:{hint}" if hint else "none"
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    if request.method == "POST" and request.url.path == "/":
-        wait = retry_after(caller)
-        if wait:
-            return JSONResponse({"error": "rate limited"}, status_code=429, headers={"Retry-After": str(wait)})
+    request.state.key_id = key_id
+    LOG.info("request key_id=%s caller=%s %s %s", key_id, log_safe(API_KEYS[key_id][1]), request.method,
+             log_safe(request.url.path))
     return await call_next(request)

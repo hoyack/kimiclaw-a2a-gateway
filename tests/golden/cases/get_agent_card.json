@@ -14,7 +14,7 @@
         "json": {
           "protocolVersion": "1.0",
           "name": "Kimiclaw",
-          "description": "A2A gateway into the OpenClaw agent (kimi-claw). Research, code, ops, writing, automation.",
+          "description": "A2A agent: research, code, writing, planning, automation.",
           "url": "https://kimiclaw.hoyack.ai/",
           "provider": {
             "organization": "hoyack"
@@ -46,11 +46,10 @@
             {
               "id": "general-agent",
               "name": "General agent",
-              "description": "General-purpose agent: research, coding, shell ops, writing, planning, automation.",
+              "description": "General-purpose agent: research, coding, writing, planning, automation.",
               "tags": [
                 "general-purpose",
-                "agent",
-                "openclaw"
+                "agent"
               ]
             }
           ],
