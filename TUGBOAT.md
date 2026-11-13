@@ -9,7 +9,7 @@ python -m pytest tests -q          # characterization + contract tests, ~35 s
 ```
 
 Contract check only: `python -m pytest tests/test_contract.py -q`
-If routes or schemas change on purpose: `KIMICLAW_TOKEN=x python tools/freeze_openapi.py` and commit openapi.yaml.
+If routes or schemas change on purpose: `GATEWAY_KEYS_FILE=tests/keys.test.txt python tools/freeze_openapi.py` and commit openapi.yaml.
 
 Golden replay (parity against fixtures recorded from original main, vendored in tests/golden/):
 ```bash
@@ -22,4 +22,4 @@ Docker smoke: `docker build -t kimiclaw-gw .`; the HEALTHCHECK hits public `/hea
 **`/readyz` returns 503 without OpenClaw installed. That is by design, not an outage.** CI and the stock image
 have no `openclaw`, so expect 503 there (tests cover it). Probe `/healthz` (public, `{"status":"ok"}`) for liveness.
 
-- Daily telemetry log rotation assumes a single uvicorn worker; multiple workers would race on rotation.
+- Telemetry file rotation assumes a single uvicorn worker; multiple workers would race on rotation.

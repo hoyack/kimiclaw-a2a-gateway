@@ -33,7 +33,9 @@ RPC_DOC = {
     "responses": {"200": {"description": "JSON-RPC response, or text/event-stream for message/stream",
                           "content": {"application/json": {"schema": {"$ref": "#/components/schemas/JsonRpcResponse"}},
                                       "text/event-stream": {"schema": {"type": "string"}}}},
-                  "400": {"description": "parse error (-32700)"}, "401": {"description": "unauthorized"}},
+                  "400": {"description": "parse error (-32700) or a body that is not a JSON object (-32600)"}, "401": {"description": "unauthorized"},
+                  "413": {"description": "request body over 1 MB"},
+                  "429": {"description": "rate limited; see Retry-After"}},
 }
 
 

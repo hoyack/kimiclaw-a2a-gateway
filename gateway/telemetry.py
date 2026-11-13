@@ -1,5 +1,6 @@
 """OpenTelemetry: traces, metrics and logs.
-- Default: JSONL files under GATEWAY_TELEMETRY_DIR (default ./telemetry), rotated daily, 7 days kept.
+- Default: JSONL files under GATEWAY_TELEMETRY_DIR (default ./telemetry), rotated by size: each of traces, metrics
+  and logs keeps at most 5 files of GATEWAY_TELEMETRY_FILE_MB (default 10), so 150 MB total by default.
 - OTEL_EXPORTER_OTLP_ENDPOINT set (e.g. https://otel.example.com:4318): OTLP/HTTP is used INSTEAD of the files.
   Standard OTEL_* env vars apply (OTEL_EXPORTER_OTLP_HEADERS etc.). A warning is logged for http:// to a
   non-localhost host, because that sends telemetry in plaintext.
@@ -20,7 +21,8 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, Spa
 
 TELEMETRY_DIR = os.environ.get("GATEWAY_TELEMETRY_DIR", "telemetry")
 OTLP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
-RETENTION_DAYS = 7  # daily rotation, 7 backups kept
+FILE_BYTES = int(float(os.environ.get("GATEWAY_TELEMETRY_FILE_MB", "10")) * 1_000_000)
+BACKUPS = 4
 
 tracer = trace.get_tracer("kimiclaw")
 meter = metrics.get_meter("kimiclaw")
@@ -35,9 +37,9 @@ EVENTS.propagate = False
 EVENTS.setLevel(logging.INFO)
 
 
-def _daily_handler(name: str) -> logging.Handler:
-    return logging.handlers.TimedRotatingFileHandler(os.path.join(TELEMETRY_DIR, f"{name}.jsonl"),
-                                                     when="midnight", backupCount=RETENTION_DAYS, utc=True)
+def _capped_handler(name: str) -> logging.Handler:
+    return logging.handlers.RotatingFileHandler(os.path.join(TELEMETRY_DIR, f"{name}.jsonl"),
+                                                maxBytes=FILE_BYTES, backupCount=BACKUPS)
 
 
 def _rotating(name: str) -> logging.Logger:
@@ -45,7 +47,7 @@ def _rotating(name: str) -> logging.Logger:
     lg.propagate = False
     lg.setLevel(logging.INFO)
     if not lg.handlers:
-        h = _daily_handler(name)
+        h = _capped_handler(name)
         h.setFormatter(logging.Formatter("%(message)s"))
         lg.addHandler(h)
     return lg
@@ -122,7 +124,7 @@ def setup():
         os.makedirs(TELEMETRY_DIR, exist_ok=True)
         tp.add_span_processor(BatchSpanProcessor(_FileSpanExporter()))
         readers = [PeriodicExportingMetricReader(_FileMetricExporter(), export_interval_millis=60_000)]
-        logs_handler = _daily_handler("logs")
+        logs_handler = _capped_handler("logs")
         logs_handler.setFormatter(_JsonFormatter())
         EVENTS.addHandler(logs_handler)
     trace.set_tracer_provider(tp)
@@ -149,7 +151,8 @@ async def telemetry_middleware(request, call_next):
         request_ms.record(ms, attrs)
         with trace.use_span(span):
             event("http_request", method=request.method, path=request.url.path, status=status,
-                  duration_ms=round(ms, 1), **getattr(request.state, "ids", {}))
+                  duration_ms=round(ms, 1), key_id=getattr(request.state, "key_id", None),
+                  **getattr(request.state, "ids", {}))
         span.end()
 
     try:

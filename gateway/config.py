@@ -1,6 +1,7 @@
 """Env-based settings. Names, defaults and the .env fallback match the original app.py."""
 import logging
 import os
+import re
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -11,6 +12,8 @@ logging.basicConfig(
 LOG = logging.getLogger("kimiclaw")
 
 MAX_LOG_ID = 128
+KEY_ID_RE = re.compile(r"[a-z0-9]{8,12}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def log_safe(value) -> str:
@@ -24,7 +27,8 @@ def log_safe(value) -> str:
 
 
 def _load_token() -> str:
-    """Env var first, then .env. Missing or empty fails at startup with a clear message (never the value)."""
+    """Env var first, then .env. Needed only when GATEWAY_NOTIFY_URL is set; then missing or empty fails at startup
+    with a clear message (never the value)."""
     tok = (os.environ.get("KIMICLAW_TOKEN") or "").strip()
     if not tok:
         env_path = os.path.join(BASE_DIR, ".env")
@@ -35,12 +39,45 @@ def _load_token() -> str:
                         tok = line.split("=", 1)[1].strip()
                         break
     if not tok:
-        raise RuntimeError("KIMICLAW_TOKEN not set (set the env var or add KIMICLAW_TOKEN=... to .env; empty is refused)")
+        raise RuntimeError("KIMICLAW_TOKEN not set but GATEWAY_NOTIFY_URL is (set the env var or add KIMICLAW_TOKEN=... to .env; empty is refused)")
     return tok
 
 
-TOKEN = _load_token()
+def load_keys(path: str) -> dict[str, tuple[str, str]]:
+    """Keys file: one `<key_id> <sha256-hex of the full key> <caller>` per line; blank lines and # comments skipped.
+    Missing, empty or malformed refuses startup. Errors name the line number, never its content."""
+    if not path:
+        raise RuntimeError("GATEWAY_KEYS_FILE not set (path to the hashed API keys file)")
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        raise RuntimeError(f"GATEWAY_KEYS_FILE unreadable: {type(e).__name__}") from None
+    keys = {}
+    for n, line in enumerate(lines, 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 3 or not KEY_ID_RE.fullmatch(parts[0]) or not SHA256_RE.fullmatch(parts[1]) or parts[0] in keys:
+            raise RuntimeError(f"GATEWAY_KEYS_FILE line {n}: want unique `<key_id> <sha256-hex> <caller>`")
+        keys[parts[0]] = (parts[1], parts[2])
+    if not keys:
+        raise RuntimeError("GATEWAY_KEYS_FILE has no keys")
+    return keys
+
+
 NOTIFY_URL = os.environ.get("GATEWAY_NOTIFY_URL", "").strip()
+TOKEN = _load_token() if NOTIFY_URL else ""  # outbound notify credential only; never accepted inbound
+API_KEYS = load_keys(os.environ.get("GATEWAY_KEYS_FILE", "").strip())
+CREATE_PER_MIN = float(os.environ.get("GATEWAY_CREATE_PER_MIN", "10"))
+CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
+GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))
+CANCEL_PER_S = float(os.environ.get("GATEWAY_CANCEL_PER_S", "1"))
+MAX_BODY = 1_000_000
+MAX_INFLIGHT_PER_KEY = int(os.environ.get("GATEWAY_MAX_INFLIGHT_PER_KEY", "2"))
+MAX_PENDING = int(os.environ.get("GATEWAY_MAX_PENDING", "50"))
+MAX_TASKS_PER_KEY = int(os.environ.get("GATEWAY_MAX_TASKS_PER_KEY", "100"))
+PUBLIC_URL = os.environ.get("GATEWAY_PUBLIC_URL", "").strip() or "https://kimiclaw.hoyack.ai/"
 NOTIFY_AUTH_MODE = os.environ.get("GATEWAY_NOTIFY_AUTH_MODE", "raw").lower()
 NOTIFY_AUTH_USER = os.environ.get("GATEWAY_NOTIFY_AUTH_USER", "agent")
 NOTIFY_EVENTS = {e.strip() for e in os.environ.get(
@@ -48,7 +85,12 @@ NOTIFY_EVENTS = {e.strip() for e in os.environ.get(
 NOTIFY_TIMEOUT = 10
 NOTIFY_FAIL_LIMIT = int(os.environ.get("GATEWAY_NOTIFY_FAIL_LIMIT", "5"))
 NOTIFY_COOLDOWN_S = int(os.environ.get("GATEWAY_NOTIFY_COOLDOWN_S", "900"))
-MAX_TEXT = 200_000
+MAX_TEXT = 100_000
 AGENT_TIMEOUT = 560           # seconds, passed to openclaw
 AGENT_CONCURRENCY = 3         # concurrent agent turns
 TASK_TTL = 24 * 3600          # task retention
+
+if os.environ.get("WEB_CONCURRENCY", "1").strip() not in ("", "1"):
+    raise RuntimeError("WEB_CONCURRENCY must be 1: rate limits and task caps are per process")
+if AGENT_CONCURRENCY > 1 and MAX_INFLIGHT_PER_KEY >= AGENT_CONCURRENCY:
+    raise RuntimeError(f"GATEWAY_MAX_INFLIGHT_PER_KEY must be below {AGENT_CONCURRENCY} so one key can't hold every agent slot")

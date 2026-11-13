@@ -34,7 +34,7 @@
           "jsonrpc": "2.0",
           "id": "1",
           "result": {
-            "id": "t-fail",
+            "id": "<uuid>",
             "contextId": "c-fail",
             "kind": "task",
             "status": {
@@ -44,7 +44,7 @@
                 "parts": [
                   {
                     "kind": "text",
-                    "text": "agent error: agent exited 3: boom\n"
+                    "text": "agent error (task <uuid>)"
                   }
                 ],
                 "messageId": "<uuid>"
@@ -58,7 +58,7 @@
                 "parts": [
                   {
                     "kind": "text",
-                    "text": "agent error: agent exited 3: boom\n"
+                    "text": "agent error (task <uuid>)"
                   }
                 ],
                 "messageId": "<uuid>"
@@ -96,11 +96,11 @@
       "json": {
         "event": "task_failed",
         "source": "kimiclaw-a2a-gateway",
-        "taskId": "t-fail",
+        "taskId": "<uuid>",
         "contextId": "c-fail",
         "timestamp": "<ts>",
         "state": "failed",
-        "reply": "agent error: agent exited 3: boom\n",
+        "reply": "agent error (task <uuid>)",
         "durationMs": "<int>"
       },
       "key_order": [

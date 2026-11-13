@@ -34,7 +34,7 @@
           "jsonrpc": "2.0",
           "id": "1",
           "result": {
-            "id": "t-c",
+            "id": "<uuid>",
             "contextId": "c-c",
             "kind": "task",
             "status": {
@@ -76,7 +76,7 @@
           "jsonrpc": "2.0",
           "id": "1",
           "result": {
-            "id": "t-c",
+            "id": "<uuid>",
             "contextId": "c-c",
             "kind": "task",
             "status": {
@@ -118,7 +118,7 @@
           "jsonrpc": "2.0",
           "id": "1",
           "result": {
-            "id": "t-c",
+            "id": "<uuid>",
             "contextId": "c-c",
             "kind": "task",
             "status": {
@@ -192,7 +192,7 @@
       "json": {
         "event": "task_completed",
         "source": "kimiclaw-a2a-gateway",
-        "taskId": "t-c",
+        "taskId": "<uuid>",
         "contextId": "c-c",
         "timestamp": "<ts>",
         "state": "completed",

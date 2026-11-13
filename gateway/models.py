@@ -3,11 +3,13 @@ import json
 import uuid
 from datetime import datetime, timezone
 
+from gateway.config import PUBLIC_URL
+
 AGENT_CARD = {
     "protocolVersion": "1.0",
     "name": "Kimiclaw",
-    "description": "A2A gateway into the OpenClaw agent (kimi-claw). Research, code, ops, writing, automation.",
-    "url": "https://kimiclaw.hoyack.ai/",
+    "description": "A2A agent: research, code, writing, planning, automation.",
+    "url": PUBLIC_URL,
     "provider": {"organization": "hoyack"},
     "version": "0.1.0",
     "capabilities": {
@@ -23,8 +25,8 @@ AGENT_CARD = {
         {
             "id": "general-agent",
             "name": "General agent",
-            "description": "General-purpose agent: research, coding, shell ops, writing, planning, automation.",
-            "tags": ["general-purpose", "agent", "openclaw"],
+            "description": "General-purpose agent: research, coding, writing, planning, automation.",
+            "tags": ["general-purpose", "agent"],
         }
     ],
     "supportsAuthenticatedExtendedCard": False,

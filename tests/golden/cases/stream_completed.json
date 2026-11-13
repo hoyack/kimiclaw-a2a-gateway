@@ -37,7 +37,7 @@
             "id": 9,
             "result": {
               "kind": "status-update",
-              "taskId": "t-s",
+              "taskId": "<uuid>",
               "contextId": "c-s",
               "final": false,
               "status": {
@@ -51,7 +51,7 @@
             "id": 9,
             "result": {
               "kind": "artifact-update",
-              "taskId": "t-s",
+              "taskId": "<uuid>",
               "contextId": "c-s",
               "final": false,
               "artifact": {
@@ -72,7 +72,7 @@
             "id": 9,
             "result": {
               "kind": "status-update",
-              "taskId": "t-s",
+              "taskId": "<uuid>",
               "contextId": "c-s",
               "final": true,
               "status": {
@@ -116,7 +116,7 @@
       "json": {
         "event": "task_completed",
         "source": "kimiclaw-a2a-gateway",
-        "taskId": "t-s",
+        "taskId": "<uuid>",
         "contextId": "c-s",
         "timestamp": "<ts>",
         "state": "completed",
