@@ -21,7 +21,7 @@ python -m gateway --host 127.0.0.1 --port 8000
 
 Docker: the image CMD is still `uvicorn app:app` and must be overridden to `["python","-m","gateway"]`, with `KIMICLAW_LIMIT_CONCURRENCY` set and both 8000 and 8001 published. The stock HEALTHCHECK still hits `:8000/healthz` and should be moved to `:8001/healthz`. The image does not contain openclaw; add it in a derived image or mount it.
 
-A reverse proxy with client header and body timeouts (for example ingress nginx) is required in front of the gateway for any public deploy. The app's header timeout (`GATEWAY_HEADER_TIMEOUT_S`, default 5 s) and body deadlines are defense in depth; uvicorn 0.54 counts idle connections toward `limit_concurrency` and will not time them out on its own.
+A buffering reverse proxy (for example ingress nginx) with request buffering on and no idle upstream connections is required in front of the gateway for any public deploy. Client header and body timeouts on that proxy are recommended. The app's header timeout (`GATEWAY_HEADER_TIMEOUT_S`, default 5 s) and body deadlines are defense in depth; uvicorn 0.54 counts idle connections toward `limit_concurrency` and will not time them out on its own.
 
 ## Layout
 
@@ -207,7 +207,7 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | `GATEWAY_SIGNATURE_PAST_S` / `GATEWAY_SIGNATURE_FUTURE_S` | `300` / `30` | how far behind / ahead of the gateway clock a signed timestamp may be; ahead must not exceed behind. Startup waits `FUTURE_S + 1` s (~31 s by default) so a future-stamped request captured before a restart cannot be replayed after it |
 | `KIMICLAW_LIMIT_CONCURRENCY` | required (no default) | uvicorn concurrency cap on the main port; an integer from 64 to 4096 (`^[0-9]+$` only), fail closed if missing or out of range. Recommended 1024. Applied only by `python -m gateway` (CMD `["python","-m","gateway"]`), which also pins `workers=1`. `uvicorn app:app` is refused; do not pass `--limit-concurrency` or `--workers` on a command line — the launcher does not take those flags, so an env or CLI override cannot fight it |
 | `GATEWAY_PROBE_PORT` | `8001` | uncapped probe listener in the same process: `GET /healthz` and `GET /readyz`. Must differ from the main port. Range 1–65535, digits only |
-| `GATEWAY_HEADER_TIMEOUT_S` | `5` | seconds to wait for complete request headers on a new or keep-alive connection (1–30, digits only); the transport is closed if the deadline passes. Defense in depth; a front proxy with client header and body timeouts is still required for public deploys |
+| `GATEWAY_HEADER_TIMEOUT_S` | `5` | seconds to wait for complete request headers on a new or keep-alive connection (1–30, digits only); the transport is closed if the deadline passes. Defense in depth; a buffering reverse proxy (request buffering on, no idle upstream connections) is still required for public deploys |
 | `GATEWAY_READS_PER_CALLER` | `3` | per caller: reserved body-read slots for already-verified requests (2 to 4); more gets 429 |
 | `GATEWAY_BODY_READ_TIMEOUT_S` / `GATEWAY_BODY_IDLE_TIMEOUT_S` | `10` / `5` | total time to read a body / longest gap between chunks; past either gets 408 |
 | `GATEWAY_MAX_TASKS_PER_KEY` | `100` | per caller: stored tasks; the oldest finished ones are dropped past this |
