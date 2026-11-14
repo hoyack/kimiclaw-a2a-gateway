@@ -79,6 +79,22 @@ class _FileMetricExporter(MetricExporter):
         pass
 
 
+class _SkipQuiet(SpanExporter):
+    """Drops spans marked kimiclaw.quiet (read-pool 503/429/408), so they never hit the file or OTLP."""
+    def __init__(self, inner):
+        self.inner = inner
+
+    def export(self, spans):
+        kept = [s for s in spans if not (s.attributes or {}).get("kimiclaw.quiet")]
+        return SpanExportResult.SUCCESS if not kept else self.inner.export(kept)
+
+    def shutdown(self, **kw):
+        return self.inner.shutdown(**kw) if hasattr(self.inner, "shutdown") else None
+
+    def force_flush(self, timeout_millis=None, **kw):
+        return True if not hasattr(self.inner, "force_flush") else self.inner.force_flush(timeout_millis, **kw)
+
+
 class _JsonFormatter(logging.Formatter):
     def format(self, record):
         ctx = trace.get_current_span().get_span_context()
@@ -115,14 +131,14 @@ def setup():
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
         from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-        tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        tp.add_span_processor(BatchSpanProcessor(_SkipQuiet(OTLPSpanExporter())))
         readers = [PeriodicExportingMetricReader(OTLPMetricExporter())]
         lp = LoggerProvider(resource=resource)
         lp.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
         EVENTS.addHandler(LoggingHandler(logger_provider=lp))
     else:
         os.makedirs(TELEMETRY_DIR, exist_ok=True)
-        tp.add_span_processor(BatchSpanProcessor(_FileSpanExporter()))
+        tp.add_span_processor(BatchSpanProcessor(_SkipQuiet(_FileSpanExporter())))
         readers = [PeriodicExportingMetricReader(_FileMetricExporter(), export_interval_millis=60_000)]
         logs_handler = _capped_handler("logs")
         logs_handler.setFormatter(_JsonFormatter())
@@ -143,6 +159,10 @@ async def telemetry_middleware(request, call_next):
     state = {"status": 500}
 
     def finish():
+        if getattr(request, "state", None) is not None and getattr(request.state, "quiet_read", False):
+            span.set_attribute("kimiclaw.quiet", True)
+            span.end()
+            return
         ms = (time.perf_counter() - started) * 1000
         status = state["status"]
         span.set_attribute("http.response.status_code", status)

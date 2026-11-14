@@ -26,12 +26,12 @@ def test_agent_card_public(gw_factory):
     assert card["securitySchemes"]["kcEd25519"]["name"] == "X-KC-Signature"
 
 
-SIGNED_SHAPE = {"X-KC-Key-Id": "testkey01", "X-KC-Timestamp": str(int(time.time())), "X-KC-Nonce": "n" * 24,
+SIGNED_SHAPE = {"X-KC-Key-Id": "a1a1a1a1a1", "X-KC-Timestamp": str(int(time.time())), "X-KC-Nonce": "n" * 24,
                 "X-KC-Signature": "0" * 64}
 
 
 @pytest.mark.parametrize("h", [{}, {"Authorization": "Bearer wrong"}, {"Authorization": f"Bearer {TOKEN}"},
-                               {"Authorization": "Bearer kc_testkey01_" + "k" * 43}, SIGNED_SHAPE])
+                               {"Authorization": "Bearer kc_a1a1a1a1a1_" + "k" * 43}, SIGNED_SHAPE])
 def test_unauthorized(gw_factory, h):
     c = gw_factory()
     for m, p in (("GET", "/"), ("POST", "/"), ("GET", "/docs"), ("GET", "/nope"),

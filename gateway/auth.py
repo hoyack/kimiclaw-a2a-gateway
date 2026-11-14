@@ -24,11 +24,13 @@ TIMESTAMP_RE = re.compile(r"[0-9]{1,12}")
 NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 SIGNATURE_RE = re.compile(r"[0-9a-f]{128}")
 DUMMY_KEY = Ed25519PrivateKey.generate().public_key()  # unknown key_ids pay for the same verify as a wrong signature
-STARTED_S = int(time.time())  # nonces don't survive a restart, so nothing signed in or before this second is accepted
+STARTED_S = int(time.time())  # nonces don't survive a restart; reject timestamps at or before STARTED_S + FUTURE_S
 MAX_UNKNOWN_READS = 32
 _reads: dict[str, int] = {}  # pre-auth body reads in progress: "" = unknown key_ids (shared), else per caller
 READ_FAILURES = {"too_large": (413, "request body too large"), "read_deadline": (408, "request timeout"),
                  "read_idle": (408, "request timeout"), "client_disconnected": (400, "client disconnected")}
+QUIET_READS = {"pool_full", "read_deadline", "read_idle"}  # 503/429/408: aggregate, no per-request log or trace
+_refusals: dict[str, dict] = {}  # pool_name -> {reasons, task}
 
 # rpc method -> (tokens per second, bucket size)
 LIMITS = {
@@ -133,6 +135,34 @@ def unauthorized(request: Request, key_id: str, reason: str) -> JSONResponse:
     return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
+def emit_refusals(pool_name: str, reasons: dict[str, int]):
+    count = sum(reasons.values())
+    parts = ",".join(f"{k}:{v}" for k, v in sorted(reasons.items()))
+    LOG.warning("read refused pool=%s count=%d reasons=%s", pool_name, count, parts)
+
+
+async def _flush_refusals(pool_name: str):
+    await asyncio.sleep(1)
+    rec = _refusals.get(pool_name)
+    if rec is None:
+        return
+    reasons, rec["reasons"] = rec["reasons"], {}
+    rec["task"] = None
+    if reasons:
+        emit_refusals(pool_name, reasons)
+    if rec["reasons"] and rec["task"] is None:
+        rec["task"] = asyncio.get_running_loop().create_task(_flush_refusals(pool_name))
+
+
+def note_refusal(request: Request, pool_name: str, reason: str):
+    """503/429/408 from the read pools: one log line per pool per second, no per-request trace."""
+    request.state.quiet_read = True
+    rec = _refusals.setdefault(pool_name, {"reasons": {}, "task": None})
+    rec["reasons"][reason] = rec["reasons"].get(reason, 0) + 1
+    if rec["task"] is None:
+        rec["task"] = asyncio.get_running_loop().create_task(_flush_refusals(pool_name))
+
+
 async def signed_auth(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
         return await call_next(request)
@@ -147,14 +177,14 @@ async def signed_auth(request: Request, call_next):
         return unauthorized(request, key_id, "malformed_header")
     if not -SIGNATURE_FUTURE_S <= time.time() - int(timestamp) <= SIGNATURE_PAST_S:
         return unauthorized(request, key_id, "stale_timestamp")
-    if int(timestamp) <= STARTED_S:
+    if int(timestamp) <= STARTED_S + SIGNATURE_FUTURE_S:
         return unauthorized(request, key_id, "stale_after_restart")
     caller, key = PUBLIC_KEYS.get(key_id, (None, DUMMY_KEY))
     pool = caller or ""
     pool_name = "caller" if caller else "unknown"
     request.state.key_id = f"unverified:{key_id}"
     if _reads.get(pool, 0) >= (READS_PER_CALLER if caller else MAX_UNKNOWN_READS):
-        LOG.warning("read refused pool=%s reason=pool_full key_id=%s", pool_name, key_id)
+        note_refusal(request, pool_name, "pool_full")
         if caller:
             return rate_limited(1)
         return JSONResponse({"error": "busy"}, status_code=503, headers={"Retry-After": "1"})
@@ -164,7 +194,10 @@ async def signed_auth(request: Request, call_next):
     finally:
         _reads[pool] -= 1
     if isinstance(hashed, str):
-        LOG.warning("read failed pool=%s reason=%s key_id=%s", pool_name, hashed, key_id)
+        if hashed in QUIET_READS:
+            note_refusal(request, pool_name, hashed)
+        else:
+            LOG.warning("read failed pool=%s reason=%s key_id=%s", pool_name, hashed, key_id)
         status, error = READ_FAILURES[hashed]
         return JSONResponse({"error": error}, status_code=status)
     body_sha256, body = hashed

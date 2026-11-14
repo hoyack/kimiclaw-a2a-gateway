@@ -8,7 +8,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def test_served_spec_matches_frozen_yaml(gw_factory):
-    served = gw_factory().get("/openapi.json").json()
+    served = gw_factory(GATEWAY_SIGNATURE_FUTURE_S="30", GATEWAY_SIGNATURE_PAST_S="300").get("/openapi.json").json()
     with open(os.path.join(ROOT, "openapi.yaml")) as f:
         assert served == yaml.safe_load(f)
 
@@ -26,7 +26,7 @@ def test_healthz_readyz(gw_factory):
 def test_healthz_public_minimal_readyz_protected(gw_factory):
     import httpx
     base = str(gw_factory().base_url)
-    for h in ({}, {"X-KC-Key-Id": "testkey01", "X-KC-Signature": "0" * 64}):
+    for h in ({}, {"X-KC-Key-Id": "a1a1a1a1a1", "X-KC-Signature": "0" * 64}):
         r = httpx.get(base + "/healthz", headers=h)
         assert (r.status_code, r.json()) == (200, {"status": "ok"})
         r = httpx.get(base + "/readyz", headers=h)

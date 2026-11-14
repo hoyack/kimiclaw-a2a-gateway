@@ -4,7 +4,7 @@
 record:  python golden.py record --app-dir DIR      (starts DIR's app.py with stubs, writes cases/*.json)
 replay:  python golden.py replay --base-url URL --n8n-port PORT [--profile default|n8n_basic]
    n8n_basic profile: target also needs GATEWAY_NOTIFY_AUTH_MODE=basic GATEWAY_NOTIFY_AUTH_USER=n8n-dummy-user.
-   Target must run with: KIMICLAW_TOKEN=dummy-test-token, GATEWAY_PUBLIC_KEYS_FILE=<file with a testkey01 public line; pass
+   Target must run with: KIMICLAW_TOKEN=dummy-test-token, GATEWAY_PUBLIC_KEYS_FILE=<file with a a1a1a1a1a1 public line; pass
    the matching private key as --private-key-file>, rate limits raised
    (see start_app), fakebin/ first on PATH,
    HOME=<writable dir>, GATEWAY_NOTIFY_URL=http://127.0.0.1:PORT/webhook/firewall.
@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives import serialization  # noqa: E402
 
 CASES = os.path.join(HERE, "cases")
 TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN, notify credential
-SIGNER = Signer("testkey01", secrets.token_urlsafe(32))  # replay-local: fresh Ed25519 key per run; replay: --private-key-file
+SIGNER = Signer("a1a1a1a1a1", secrets.token_urlsafe(32))  # replay-local: fresh Ed25519 key per run; replay: --private-key-file
 AUTH = {}
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 TS = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?\+00:00")
@@ -78,7 +78,7 @@ def msg(text, **kw):
 CASE_DEFS = {
     "get_root": [{"m": "GET", "p": "/"}],
     "get_root_unauth": [{"m": "GET", "p": "/", "auth": None}],
-    "get_root_wrong_scheme": [{"m": "GET", "p": "/", "auth": {"Authorization": "Bearer kc_testkey01_" + "k" * 43}}],
+    "get_root_wrong_scheme": [{"m": "GET", "p": "/", "auth": {"Authorization": "Bearer kc_a1a1a1a1a1_" + "k" * 43}}],
     "get_agent_card": [{"m": "GET", "p": "/.well-known/agent.json", "auth": None}],
     "post_parse_error": [{"m": "POST", "p": "/", "raw": "{bad"}],
     "post_unknown_method": [{"m": "POST", "p": "/", "json": rpc("foo/bar", {}, 7)}],
@@ -171,6 +171,7 @@ def start_app(app_dir, n8n_port, extra=None):
     with os.fdopen(os.open(keys, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
         raw = load_private_key(SIGNER.private_key).public_key().public_bytes(serialization.Encoding.Raw,
                                                                              serialization.PublicFormat.Raw)
+        f.write("# kimiclaw-public-keys v1\n")
         f.write(f"{SIGNER.key_id} golden {base64.urlsafe_b64encode(raw).rstrip(b'=').decode()}\n")
     env.update(KIMICLAW_TOKEN=TOKEN, GATEWAY_PUBLIC_KEYS_FILE=keys,
                GATEWAY_CREATE_PER_MIN="100000", GATEWAY_CREATE_BURST="1000", GATEWAY_GET_PER_S="1000",
@@ -180,7 +181,10 @@ def start_app(app_dir, n8n_port, extra=None):
     env.update(extra or {})
     p = subprocess.Popen([sys.executable, "-m", "uvicorn", "app:app", "--port", str(port), "--log-level", "warning"], cwd=app_dir, env=env)
     base = f"http://127.0.0.1:{port}"
-    for _ in range(100):
+    deadline = time.time() + int(env.get("GATEWAY_SIGNATURE_FUTURE_S", "30")) + 10
+    while time.time() < deadline:
+        if p.poll() is not None:
+            break
         try: httpx.get(base + "/.well-known/agent.json", timeout=0.5); break
         except Exception: time.sleep(0.1)
     return p, base
@@ -202,7 +206,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("mode", choices=["record", "replay", "replay-local"])
     ap.add_argument("--app-dir"); ap.add_argument("--base-url"); ap.add_argument("--n8n-port", type=int, default=0)
     ap.add_argument("--profile", default="default", choices=list(PROFILES)); ap.add_argument("--only")
-    ap.add_argument("--private-key-file", help="replay: private key for the target's testkey01 public line")
+    ap.add_argument("--private-key-file", help="replay: private key for the target's a1a1a1a1a1 public line")
     a = ap.parse_args()
     if a.mode == "replay":
         SIGNER.private_key = open(a.private_key_file).read().strip()

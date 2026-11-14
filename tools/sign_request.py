@@ -2,7 +2,7 @@
 """Sign requests to the kimiclaw gateway with the caller's Ed25519 private key (README "Request signing").
 
 Library:  httpx.Client(base_url=URL, auth=Signer(key_id, private_key))  signs every request it sends;
-          private_key is the unpadded base64url line tools/new_api_key.py printed.
+          private_key is the unpadded base64url line tools/new_keypair.py wrote (or tools/new_api_key.py --mint printed).
 CLI:      python tools/sign_request.py --key-id ID (--private-key-file FILE | env KC_PRIVATE_KEY) URL ['{"jsonrpc": ...}']
           GET without a body, POST (application/json) with one; prints the status line and the response body.
           The key comes from a file or the environment, so it never lands in argv or shell history.

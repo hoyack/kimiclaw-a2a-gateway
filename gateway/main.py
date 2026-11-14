@@ -6,9 +6,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 
-from gateway import telemetry
-from gateway.config import LOG
-from gateway.auth import STARTED_S, signed_auth
+from gateway import auth, telemetry
+from gateway.config import LOG, SIGNATURE_FUTURE_S
 from gateway.models import SCHEMAS, SECURITY_SCHEMES
 from gateway.routes import a2a, health
 
@@ -16,7 +15,7 @@ from gateway.routes import a2a, health
 @asynccontextmanager
 async def lifespan(app):
     LOG.warning("rate limits and task caps are per process; run exactly one replica and one worker")
-    await asyncio.sleep(max(0.0, STARTED_S + 1 - time.time()))  # serve only once requests can be signed after STARTED_S
+    await asyncio.sleep(max(0.0, auth.STARTED_S + SIGNATURE_FUTURE_S + 1 - time.time()))  # serve only after STARTED_S + FUTURE_S
     yield
     telemetry.shutdown()  # flush spans/metrics on graceful stop
 
@@ -24,7 +23,7 @@ async def lifespan(app):
 def create_app() -> FastAPI:
     app = FastAPI(title="Kimiclaw A2A Gateway", version="0.1.0", lifespan=lifespan)
     telemetry.setup()
-    app.middleware("http")(signed_auth)
+    app.middleware("http")(auth.signed_auth)
     app.middleware("http")(telemetry.telemetry_middleware)  # added last = outermost, so 401s are recorded
     app.include_router(a2a.router)
     app.include_router(health.router)

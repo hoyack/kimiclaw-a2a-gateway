@@ -54,15 +54,17 @@ def get(base, key):
 
 def test_with_32_unknown_key_reads_held_valid_callers_get_200_at_once(gw):
     _, base, port, log = gw(**SHORT)
-    held = [stall(port, "zzzzzzzzzz") for _ in range(32)]
+    held = [stall(port, "eeeeeeeeee") for _ in range(32)]
     time.sleep(0.3)
-    extra = stall(port, "zzzzzzzzzz")
+    extra = stall(port, "eeeeeeeeee")
     assert status(extra, 1) == 503
     for key in (KEY, OTHER_KEY):
         started = time.monotonic()
         assert get(base, key).status_code == 200 and time.monotonic() - started < 1
     assert [status(s) for s in held] == [408] * 32
-    assert "read refused pool=unknown reason=pool_full key_id=zzzzzzzzzz" in log.read_text()
+    time.sleep(1.1)
+    text = log.read_text()
+    assert "read refused pool=unknown count=" in text and "pool_full:" in text
 
 
 def test_a_slow_upload_on_caller_a_does_not_affect_caller_b(gw):
@@ -74,7 +76,9 @@ def test_a_slow_upload_on_caller_a_does_not_affect_caller_b(gw):
     assert [get(base, OTHER_KEY).status_code for _ in range(3)] == [200] * 3
     assert [status(s) for s in held] == [408] * 3
     assert get(base, KEY).status_code == 200
-    assert "read refused pool=caller reason=pool_full key_id=testkey01" in log.read_text()
+    time.sleep(1.1)
+    text = log.read_text()
+    assert "read refused pool=caller count=" in text and "pool_full:" in text
 
 
 def test_a_flood_with_a_real_key_id_but_not_its_private_key_only_fills_that_callers_pool(gw):
@@ -83,36 +87,40 @@ def test_a_flood_with_a_real_key_id_but_not_its_private_key_only_fills_that_call
     time.sleep(0.5)
     assert sorted(status(s, 0.5) or 0 for s in flood[3:]) == [429] * 17
     assert [get(base, OTHER_KEY).status_code for _ in range(5)] == [200] * 5
-    unknown = httpx.post(base + "/", content=GET, auth=type(KEY)("zzzzzzzzzz", KEY.private_key))
+    unknown = httpx.post(base + "/", content=GET, auth=type(KEY)("eeeeeeeeee", KEY.private_key))
     assert unknown.status_code == 401
     assert [status(s) for s in flood[:3]] == [408] * 3
 
 
 def test_100_aborted_reads_in_each_pool_leak_no_slots(gw):
     _, base, port, log = gw()
-    for key_id, private_key in (("zzzzzzzzzz", None), (KEY.key_id, KEY.private_key)):
+    for key_id, private_key in (("eeeeeeeeee", None), (KEY.key_id, KEY.private_key)):
         for _ in range(100):
             s = stall(port, key_id, private_key, sent=b"x" * 10)
             s.close()
     time.sleep(1)
-    unknown = [stall(port, "zzzzzzzzzz") for _ in range(32)]
+    unknown = [stall(port, "eeeeeeeeee") for _ in range(32)]
     mine = [stall(port, KEY.key_id, KEY.private_key) for _ in range(3)]
     time.sleep(0.3)
     assert [status(s, 0.05) for s in unknown + mine] == [None] * 35
-    assert status(stall(port, "zzzzzzzzzz"), 1) == 503
+    assert status(stall(port, "eeeeeeeeee"), 1) == 503
     assert status(stall(port, KEY.key_id, KEY.private_key), 1) == 429
     assert get(base, OTHER_KEY).status_code == 200
+    time.sleep(1.1)
     text = log.read_text()
     for pool in ("unknown", "caller"):
-        assert text.count(f"read failed pool={pool} reason=client_disconnected") + text.count(
-            f"read refused pool={pool} reason=pool_full") >= 100
+        n = text.count(f"read failed pool={pool} reason=client_disconnected")
+        for ln in text.splitlines():
+            if f"read refused pool={pool} count=" in ln:
+                n += int(ln.split("count=", 1)[1].split()[0])
+        assert n >= 100, (pool, n)
     assert "Traceback" not in text
 
 
 def test_a_stalled_read_gets_408_at_the_idle_timeout_and_a_trickle_at_the_deadline(gw):
     _, base, port, log = gw(**SHORT)
     started = time.monotonic()
-    assert status(stall(port, "zzzzzzzzzz")) == 408
+    assert status(stall(port, "eeeeeeeeee")) == 408
     assert 1.3 < time.monotonic() - started < 2.5
     s = stall(port, KEY.key_id, KEY.private_key, sent=b"x")
     started = time.monotonic()
@@ -124,20 +132,67 @@ def test_a_stalled_read_gets_408_at_the_idle_timeout_and_a_trickle_at_the_deadli
             break
     assert status(s) == 408
     assert 2.5 < time.monotonic() - started < 4.5
+    time.sleep(1.1)
     text = log.read_text()
-    assert "read failed pool=unknown reason=read_idle key_id=zzzzzzzzzz" in text
-    assert "read failed pool=caller reason=read_deadline key_id=testkey01" in text
+    assert "read refused pool=unknown count=" in text and "read_idle:" in text
+    assert "read refused pool=caller count=" in text and "read_deadline:" in text
     assert get(base, KEY).status_code == 200
 
 
 def test_shutdown_is_not_blocked_by_held_reads(gw):
     p, _, port, _ = gw(**SHORT)
-    held = [stall(port, "zzzzzzzzzz") for _ in range(32)] + [stall(port, KEY.key_id) for _ in range(3)]
+    held = [stall(port, "eeeeeeeeee") for _ in range(32)] + [stall(port, KEY.key_id) for _ in range(3)]
     time.sleep(0.3)
     started = time.monotonic()
     p.terminate(); p.wait(15)
     assert time.monotonic() - started < 4
     [s.close() for s in held]
+
+
+def test_a_flood_of_read_refusals_is_aggregated_to_one_log_line_per_pool_per_second_and_leaves_no_traces(gw, tmp_path):
+    tdir = tmp_path / "tel"
+    p, base, port, log = gw(GATEWAY_TELEMETRY_DIR=str(tdir), **SHORT)
+    held = [stall(port, "eeeeeeeeee") for _ in range(32)] + [stall(port, KEY.key_id, KEY.private_key) for _ in range(3)]
+    time.sleep(0.2)
+    started = time.monotonic()
+    codes = []
+    for _ in range(120):
+        codes.append(status(stall(port, "eeeeeeeeee"), 1))
+        codes.append(status(stall(port, KEY.key_id, KEY.private_key), 1))
+    # held reads hit the idle timeout and become 408
+    assert [status(s) for s in held] == [408] * 35
+    elapsed = time.monotonic() - started
+    time.sleep(1.1)
+    p.terminate(); p.wait(5)
+    text = log.read_text()
+    unknown = [ln for ln in text.splitlines() if "read refused pool=unknown count=" in ln]
+    caller = [ln for ln in text.splitlines() if "read refused pool=caller count=" in ln]
+    assert unknown and caller
+    assert all("key_id=" not in ln for ln in unknown + caller)
+    assert "reason=pool_full key_id=" not in text and "reason=read_idle key_id=" not in text
+    slack = 2
+    assert len(unknown) <= elapsed + slack and len(caller) <= elapsed + slack, (len(unknown), len(caller), elapsed)
+    assert codes.count(503) + codes.count(429) >= 200
+    traces = tdir / "traces.jsonl"
+    raw = traces.read_text() if traces.exists() else ""
+    import json
+    statuses = []
+    for ln in raw.splitlines():
+        if not ln.strip():
+            continue
+        doc = json.loads(ln)
+        attrs = {a["key"]: a.get("value", a) for a in doc.get("attributes", [])} if isinstance(doc.get("attributes"), list) else doc.get("attributes") or {}
+        # otel to_json uses a list of {key, value}
+        val = None
+        if isinstance(doc.get("attributes"), list):
+            for a in doc["attributes"]:
+                if a.get("key") == "http.response.status_code":
+                    val = a.get("value")
+                    if isinstance(val, dict):
+                        val = val.get("intValue") or val.get("value")
+        if val is not None:
+            statuses.append(int(val))
+    assert not any(s in (408, 429, 503) for s in statuses), statuses
 
 
 @pytest.mark.skipif(not os.environ.get("KC_SUSTAINED_S"), reason="set KC_SUSTAINED_S=30 to run the sustained flood")
@@ -148,7 +203,7 @@ def test_sustained_unknown_key_flood_never_503s_a_valid_caller(gw):
     attacker, lock = {}, threading.Lock()
     def keep_one_slot():
         while time.monotonic() < stop:
-            code = status(stall(port, "zzzzzzzzzz"), 30)
+            code = status(stall(port, "eeeeeeeeee"), 30)
             with lock:
                 attacker[code] = attacker.get(code, 0) + 1
     threads = [threading.Thread(target=keep_one_slot, daemon=True) for _ in range(32)]

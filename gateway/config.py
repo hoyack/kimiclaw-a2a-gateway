@@ -1,11 +1,12 @@
 """Env-based settings. Names, defaults and the .env fallback match the original app.py."""
-import base64
 import logging
 import os
 import re
 import stat
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from gateway.pubkey import public_key
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -16,9 +17,9 @@ logging.basicConfig(
 LOG = logging.getLogger("kimiclaw")
 
 MAX_LOG_ID = 128
-KEY_ID_RE = re.compile(r"[a-z0-9]{8,12}")
+KEY_ID_RE = re.compile(r"[0-9a-f]{10}")  # exactly what tools/new_api_key.py mints (token_hex(5))
 CALLER_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
-PUBLIC_KEY_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+PUBLIC_KEYS_HEADER = "# kimiclaw-public-keys v1"
 
 
 def log_safe(value) -> str:
@@ -48,27 +49,19 @@ def _load_token() -> str:
     return tok
 
 
-def public_key(text: str) -> Ed25519PublicKey | None:
-    """An Ed25519 public key as canonical unpadded base64url of its 32 raw bytes, else None."""
-    if not PUBLIC_KEY_RE.fullmatch(text):
-        return None
-    raw = base64.urlsafe_b64decode(text + "=")
-    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode() != text:
-        return None
-    try:
-        return Ed25519PublicKey.from_public_bytes(raw)
-    except ValueError:
-        return None
-
-
 def load_public_keys(path: str) -> dict[str, tuple[str, Ed25519PublicKey]]:
-    """Public keys file: one `<key_id> <caller> <public_key>` per line; blank lines and # comments skipped. A caller
-    may have several key_ids (rotation). Missing, empty, malformed or writable by group or others refuses startup.
-    Errors name the line number, never its content."""
+    """Public keys file: first line must be `# kimiclaw-public-keys v1`, then one `<key_id> <caller> <public_key>`
+    per line; blank lines and # comments skipped. A caller may have several key_ids (rotation). Missing, empty,
+    malformed, missing the header, or writable by group or others refuses startup. Errors name the line number,
+    never its content. Setting GATEWAY_SIGNING_KEYS_FILE (the old HMAC secrets path) refuses startup, even if
+    GATEWAY_PUBLIC_KEYS_FILE is also set."""
+    if "GATEWAY_SIGNING_KEYS_FILE" in os.environ:
+        raise RuntimeError("GATEWAY_SIGNING_KEYS_FILE is set; it held HMAC secrets and is no longer read. "
+                           "Unset it and set GATEWAY_PUBLIC_KEYS_FILE to the callers' Ed25519 public keys "
+                           "(mint with tools/new_api_key.py). The file must start with `# kimiclaw-public-keys v1`")
     if not path:
-        hint = " (GATEWAY_SIGNING_KEYS_FILE held HMAC secrets and is gone: mint Ed25519 keys with tools/new_api_key.py)" \
-            if os.environ.get("GATEWAY_SIGNING_KEYS_FILE") else ""
-        raise RuntimeError("GATEWAY_PUBLIC_KEYS_FILE not set (path to the callers' Ed25519 public keys)" + hint)
+        raise RuntimeError("GATEWAY_PUBLIC_KEYS_FILE not set (path to the callers' Ed25519 public keys; "
+                           "first line must be `# kimiclaw-public-keys v1`)")
     try:
         with open(path) as f:
             mode = os.fstat(f.fileno()).st_mode
@@ -77,15 +70,18 @@ def load_public_keys(path: str) -> dict[str, tuple[str, Ed25519PublicKey]]:
         raise RuntimeError(f"GATEWAY_PUBLIC_KEYS_FILE unreadable: {type(e).__name__}") from None
     if mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise RuntimeError(f"GATEWAY_PUBLIC_KEYS_FILE mode {stat.S_IMODE(mode):o} is writable by group or others")
+    if not lines or lines[0] != PUBLIC_KEYS_HEADER:
+        raise RuntimeError("GATEWAY_PUBLIC_KEYS_FILE: first line must be `# kimiclaw-public-keys v1`")
     keys = {}
     for n, line in enumerate(lines, 1):
-        if not line.strip() or line.lstrip().startswith("#"):
+        if n == 1 or not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split()
         key = public_key(parts[2]) if len(parts) == 3 else None
         if key is None or not KEY_ID_RE.fullmatch(parts[0]) or not CALLER_RE.fullmatch(parts[1]) or parts[0] in keys:
             raise RuntimeError(f"GATEWAY_PUBLIC_KEYS_FILE line {n}: want unique `<key_id> <caller> <public_key>` "
-                               "(caller: up to 32 of A-Z a-z 0-9 _; public_key: 32-byte Ed25519 key, unpadded base64url)")
+                               "(key_id: 10 lowercase hex; caller: up to 32 of A-Z a-z 0-9 _; "
+                               "public_key: 32-byte canonical on-curve Ed25519 key of order > 8, unpadded base64url)")
         keys[parts[0]] = (parts[1], key)
     if not keys:
         raise RuntimeError("GATEWAY_PUBLIC_KEYS_FILE has no keys")

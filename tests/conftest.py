@@ -8,7 +8,7 @@ from sign_request import Signer, load_private_key  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402
 
 TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN: outbound notify credential only
-CALLERS = {"testkey01": "alice", "testkey02": "bob", "testkey03": "alice"}  # testkey03: alice's rotation key
+CALLERS = {"a1a1a1a1a1": "alice", "b2b2b2b2b2": "bob", "a1a1a1a1a3": "alice"}  # a1a1a1a1a3: alice's rotation key
 PRIVATE_KEYS = {key_id: secrets.token_urlsafe(32) for key_id in CALLERS}  # fresh Ed25519 seeds every run, never committed
 
 
@@ -17,17 +17,19 @@ def public_key(private_key: str) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-KEY = Signer("testkey01", PRIVATE_KEYS["testkey01"])
-OTHER_KEY = Signer("testkey02", PRIVATE_KEYS["testkey02"])
+KEY = Signer("a1a1a1a1a1", PRIVATE_KEYS["a1a1a1a1a1"])
+OTHER_KEY = Signer("b2b2b2b2b2", PRIVATE_KEYS["b2b2b2b2b2"])
 LIMITS_OFF = {"GATEWAY_CREATE_PER_MIN": "100000", "GATEWAY_CREATE_BURST": "1000",
               "GATEWAY_REQUESTS_PER_S": "100000", "GATEWAY_REQUESTS_BURST": "100000",
-              "GATEWAY_GET_PER_S": "1000", "GATEWAY_CANCEL_PER_S": "1000"}
+              "GATEWAY_GET_PER_S": "1000", "GATEWAY_CANCEL_PER_S": "1000",
+              "GATEWAY_SIGNATURE_FUTURE_S": "2"}
 
 
 
-def write_keys_file(path, key_ids=("testkey01", "testkey02"), mode=0o600):
+def write_keys_file(path, key_ids=("a1a1a1a1a1", "b2b2b2b2b2"), mode=0o600):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "w") as f:
+        f.write("# kimiclaw-public-keys v1\n")
         f.writelines(f"{k} {CALLERS[k]} {public_key(PRIVATE_KEYS[k])}\n" for k in key_ids)
     os.chmod(path, mode)
     return str(path)
@@ -80,7 +82,10 @@ def start_gateway(tmp_path, extra_env):
     p = subprocess.Popen([sys.executable, "-m", "uvicorn", "app:app", "--port", str(port)],
                          cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
     base = f"http://127.0.0.1:{port}"
-    for _ in range(100):
+    deadline = time.time() + int(env.get("GATEWAY_SIGNATURE_FUTURE_S", "30")) + 10
+    while time.time() < deadline:
+        if p.poll() is not None:
+            break
         try:
             httpx.get(base + "/.well-known/agent.json", timeout=0.5); break
         except Exception:

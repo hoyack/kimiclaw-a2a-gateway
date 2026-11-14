@@ -56,7 +56,7 @@ A2A `contextId` maps to OpenClaw session `a2a-<caller>-<ctx>`; reuse it to conti
 
 ### Example
 ```bash
-# the private key line from tools/new_api_key.py, kept by the CALLER (file, chmod 600, or env KC_PRIVATE_KEY)
+# the private key file from tools/new_keypair.py, kept by the CALLER (chmod 600, or env KC_PRIVATE_KEY)
 python tools/sign_request.py --key-id "$A2A_KEY_ID" --private-key-file a2a.key https://kimiclaw.hoyack.ai/ \
   '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","messageId":"m1","parts":[{"kind":"text","text":"Summarize the systemd journal for yesterday"}]}}}'
 ```
@@ -97,7 +97,7 @@ duplicate-key rule to get wrong. This is the reviewed design from the HMAC round
 
 The gateway checks, in order: each of the four headers present exactly once (a repeated `X-KC-*` header is rejected)
 and well formed, the timestamp at most 300 s behind its clock and at most 30 s ahead (`GATEWAY_SIGNATURE_PAST_S`,
-`GATEWAY_SIGNATURE_FUTURE_S`) and later than the second the process started in, then a slot for reading the body (see
+`GATEWAY_SIGNATURE_FUTURE_S`) and later than the start second plus `GATEWAY_SIGNATURE_FUTURE_S`, then a slot for reading the body (see
 below), the body is at most 1 MB (else 413), read within the deadlines below (else 408) and hashed chunk by chunk (its
 bytes are kept only when the key_id is known, so an unknown key_id costs one chunk of memory), then the Ed25519 signature
 over the bytes it received, before any JSON parsing. An unknown key_id is verified against a random dummy public key,
@@ -118,14 +118,16 @@ Bodies are read before the signature can be checked, so reads are pooled by the 
 - Every read has a total deadline (`GATEWAY_BODY_READ_TIMEOUT_S`, default 10 s) and a limit on the gap between chunks
   (`GATEWAY_BODY_IDLE_TIMEOUT_S`, default 5 s); past either the request gets `408 {"error": "request timeout"}`. A
   client that disconnects mid-body gets nothing back and no traceback is logged. The slot is freed whatever happens.
-- Refused and failed reads are logged as `read refused pool=<unknown|caller> reason=pool_full key_id=...` or
-  `read failed pool=... reason=<too_large|read_deadline|read_idle|client_disconnected> key_id=...`.
+- 503, 429 and 408 from the read pools (pool_full, read_deadline, read_idle) are not logged or traced per
+  request. One aggregated line per pool per second records the count and reasons
+  (`read refused pool=<unknown|caller> count=N reasons=pool_full:N,...`). Per-request logs remain for 413
+  (`too_large`) and a client disconnect (`client_disconnected`).
 
 Peak RSS stays within tens of MB however many 1 MB unauthenticated bodies arrive, slow uploads with junk key_ids can
 no longer 503 a real caller, and since every read ends within 10 s, held reads can't block shutdown for longer than
 that. key_ids are not secret (they travel in every request), but they must be unguessable: someone who has a caller's
 key_id can fill that caller's small pool and get it 429s. They are 40 random bits from `secrets` and must only be
-issued by `tools/new_api_key.py`. A per-IP connection cap belongs at the edge, not in the gateway.
+issued by `tools/new_api_key.py` (10 lowercase hex characters; callers never choose a key_id). The caller should mint the keypair with `tools/new_keypair.py`. A per-IP connection cap belongs at the edge, not in the gateway.
 
 Any rejection is `401 {"error": "unauthorized"}`. The reason (`duplicate_header`, `missing_header`, `malformed_header`, `stale_timestamp`, `stale_after_restart`,
 `unknown_key`, `bad_signature`, `replayed_nonce`) goes to the log with the key_id. A header value that isn't shaped like
@@ -137,41 +139,56 @@ Nonces are kept in process memory per caller, each until its timestamp leaves th
 `Retry-After` set to when its oldest nonce expires. Only that caller is affected: other callers keep getting 200 and
 never 401. Memory is bounded by callers × cap. Per-process state is sound because the
 gateway runs one worker. A restart forgets the nonces, so the gateway also rejects (401, reason `stale_after_restart`)
-any timestamp from the second it started in or earlier, and holds startup until the next second begins before it
-serves (startup takes up to 1 s longer). That covers every request timestamped before the restart. What remains: a
-request timestamped up to 30 s in the future (`GATEWAY_SIGNATURE_FUTURE_S`), captured before a restart, can be
-replayed once after it until its timestamp falls behind the restart second, so at most 30 s after it was signed. The
-cost: right after a restart, requests signed just before it get 401, and a caller whose clock lags by N seconds gets
-401 for N seconds after each restart. Callers should re-sign and retry. `Authorization: Bearer` keys are no longer accepted.
+any timestamp at or before the start second plus `GATEWAY_SIGNATURE_FUTURE_S`, and holds startup for
+`GATEWAY_SIGNATURE_FUTURE_S + 1` seconds (about 31 s by default) before it serves. That covers every previously
+acceptable timestamp, including one stamped up to 30 s ahead and captured before the restart: it cannot be replayed
+after it. There is no remaining capture-across-restart window. The cost: right after a restart, requests signed just
+before it get 401, a caller whose clock lags by N seconds gets 401 for N seconds after each restart, and startup is
+delayed by about 31 s. Callers should re-sign and retry. `Authorization: Bearer` keys are no longer accepted.
 
 ### Caller keys
 
-`GATEWAY_PUBLIC_KEYS_FILE` holds one `<key_id> <caller> <public_key>` line per key (`#` comments allowed), where
-`public_key` is the 32-byte Ed25519 public key as unpadded base64url (43 chars). It holds no secrets: a public key can
-verify a signature but not make one. It can be a ConfigMap or a read-only mount; the gateway only insists that nobody
-but its owner can write it, because whoever can add a line can add a caller.
+`GATEWAY_PUBLIC_KEYS_FILE` must start with the line `# kimiclaw-public-keys v1`, then one
+`<key_id> <caller> <public_key>` line per key (`#` comments allowed), where `public_key` is the 32-byte Ed25519 public
+key as unpadded base64url (43 chars). It holds no secrets: a public key can verify a signature but not make one. It can
+be a ConfigMap or a read-only mount; the gateway only insists that nobody but its owner can write it, because whoever
+can add a line can add a caller.
 
-Startup is refused, with an error that names only the line number, if the file is missing, empty or malformed, if a
-key_id repeats, if a caller name isn't 1 to 32 of `A-Z a-z 0-9 _`, if a public key isn't exactly 32 bytes in canonical
-unpadded base64url, or if the file is writable by its group or others. The old `GATEWAY_SIGNING_KEYS_FILE` (HMAC
-secrets) is no longer read; setting only it refuses startup with a pointer here. Mint a keypair with
+Startup is refused, with an error that names only the line number, if the file is missing, empty or malformed, if the
+first line isn't the format header, if a key_id isn't exactly 10 lowercase hex characters (the format
+`tools/new_api_key.py` mints; callers never choose a key_id), if a key_id repeats, if a caller name isn't 1 to 32 of
+`A-Z a-z 0-9 _`, if a public key isn't a canonical 32-byte on-curve Ed25519 key of order greater than 8 (all-zero,
+the identity, other small-order points, non-canonical y, and off-curve encodings are refused), or if the file is writable by its group or others. The old
+`GATEWAY_SIGNING_KEYS_FILE` (HMAC secrets) is no longer read; setting it at all, even together with
+`GATEWAY_PUBLIC_KEYS_FILE`, refuses startup. A 32-byte HMAC secret would otherwise parse as an Ed25519 public key, so
+the format header is required to stop an old secrets file being loaded. The caller generates the keypair; the operator
+only ever receives the public key:
 
 ```bash
-python tools/new_api_key.py <caller>
+# on the caller: writes the private key to a2a.key (chmod 600) and prints only the public key
+python tools/new_keypair.py --private-key-file a2a.key > pub.b64
+# on the operator: prints the public line to append to GATEWAY_PUBLIC_KEYS_FILE
+python tools/new_api_key.py --caller <caller> --public-key-file pub.b64
 ```
 
-It prints, once, a warning, the **private key** (unpadded base64url of the 32-byte Ed25519 seed), and the public line
-for the keys file. Hand the private key to the caller over a secure channel and don't keep a copy; the caller stores
-it (a chmod 600 file for `--private-key-file`, or `KC_PRIVATE_KEY`). Append only the last line to the keys file. Pasting
-the whole output there by mistake fails startup, because the private key line doesn't parse.
+(`--public-key` also accepts the public key directly.) Create the keys file with `# kimiclaw-public-keys v1` as its
+first line, then append the public line. The private key stays on the caller (the 0600 file, or `KC_PRIVATE_KEY`).
+
+If the caller cannot mint a keypair, `python tools/new_api_key.py --caller <caller> --mint` (or `new_api_key.py <caller>`)
+prints, once, a warning, the **private key**, and the public line. Hand the private key to the caller over a secure
+channel and don't keep a copy. Prefer caller-generated keys: the operator then never sees the private key. Pasting
+`--mint` output into the keys file by mistake fails startup, because the private key line doesn't parse.
 
 key_ids are not secret but must be unguessable (see the read pools above). **`tools/new_api_key.py` is the only
-supported way to issue a key_id:** it draws 40 bits from Python's `secrets` module (the OS CSPRNG), and the keypair
-comes from `cryptography`'s Ed25519 generator.
+supported way to issue a key_id, and callers never choose one:** the tool draws 10 lowercase hex characters (40 bits)
+from Python's `secrets` module (the OS CSPRNG), and the loader accepts only that shape. The keypair comes
+from `cryptography`'s Ed25519 generator, on the caller via `tools/new_keypair.py` unless `--mint` is used. A submitted
+public key that is small-order, off-curve or non-canonical is refused, so a caller cannot register a key that would
+let anyone forge requests as them.
 
 **Rotation.** A caller can have several key_ids at once:
-1. Run `new_api_key.py` with the same caller name and add the new public line.
-2. Restart the gateway, then give the caller the new key_id and private key. Both keys work during the overlap.
+1. The caller runs `new_keypair.py` again. Run `new_api_key.py --caller <same name> --public-key-file` and add the new public line.
+2. Restart the gateway, then give the caller the new key_id. Both keys work during the overlap.
 3. Once the caller has switched, delete the old line and restart.
 
 To revoke a key immediately, delete its line and restart.
@@ -197,7 +214,7 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | Name | Default | Purpose |
 |---|---|---|
 | `KIMICLAW_TOKEN` | required only when `GATEWAY_NOTIFY_URL` is set (env or `.env`) | outbound notify credential; never accepted inbound |
-| `GATEWAY_PUBLIC_KEYS_FILE` | required | path to the callers' Ed25519 public keys (see "Caller keys"; no secrets). Missing, empty, malformed or writable by group or others refuses startup. Replaces `GATEWAY_SIGNING_KEYS_FILE` |
+| `GATEWAY_PUBLIC_KEYS_FILE` | required | path to the callers' Ed25519 public keys (see "Caller keys"; no secrets). First line must be `# kimiclaw-public-keys v1`. Missing, empty, malformed, headerless or writable by group or others refuses startup. Setting `GATEWAY_SIGNING_KEYS_FILE` at all refuses startup |
 | `GATEWAY_CREATE_PER_MIN` / `GATEWAY_CREATE_BURST` | `10` / `5` | per caller: `message/send` + `message/stream` token bucket |
 | `GATEWAY_GET_PER_S` | `2` | per caller: `tasks/get` |
 | `GATEWAY_CANCEL_PER_S` | `1` | per caller: `tasks/cancel` |
@@ -206,7 +223,7 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | `GATEWAY_MAX_PENDING` | `50` | all callers: running or queued tasks; more gets 429 |
 | `GATEWAY_REQUESTS_PER_S` / `GATEWAY_REQUESTS_BURST` | `5` / `10` | per caller: every signed request (any path or method), checked before its nonce is stored; empty gets 429 |
 | `GATEWAY_MAX_NONCES_PER_CALLER` | `20000` | per caller: live nonces kept for replay checks; more gets 429 until the oldest expires |
-| `GATEWAY_SIGNATURE_PAST_S` / `GATEWAY_SIGNATURE_FUTURE_S` | `300` / `30` | how far behind / ahead of the gateway clock a signed timestamp may be; ahead must not exceed behind |
+| `GATEWAY_SIGNATURE_PAST_S` / `GATEWAY_SIGNATURE_FUTURE_S` | `300` / `30` | how far behind / ahead of the gateway clock a signed timestamp may be; ahead must not exceed behind. Startup waits `FUTURE_S + 1` s (~31 s by default) so a future-stamped request captured before a restart cannot be replayed after it |
 | `GATEWAY_READS_PER_CALLER` | `3` | per caller: bodies read at once before the signature is checked (2 to 4); more gets 429 |
 | `GATEWAY_BODY_READ_TIMEOUT_S` / `GATEWAY_BODY_IDLE_TIMEOUT_S` | `10` / `5` | total time to read a body / longest gap between chunks; past either gets 408 |
 | `GATEWAY_MAX_TASKS_PER_KEY` | `100` | per caller: stored tasks; the oldest finished ones are dropped past this |
