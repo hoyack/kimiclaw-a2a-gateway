@@ -1,0 +1,457 @@
+name: image-smoke
+
+# PR-time image smoke: build locally on the runner and run the container.
+# Does not push. Lives in its own workflow so it does not rewrite or
+# duplicate docker-build.yml (including the ghcr-push-by-digest jobs from #4).
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Build image and smoke-test the running container
+        run: |
+          set -euo pipefail
+
+          IMAGE=kimiclaw-a2a-gateway:smoke
+          KEYS_DIR="${RUNNER_TEMP}/smoke-keys"
+          HOST_KEYS="${KEYS_DIR}/public.keys"
+          PRIV_KEY="${KEYS_DIR}/smoke.priv"
+          CONT_KEYS=/run/gateway/public.keys
+          NAME=kimiclaw-smoke-$$
+          HOST_MAIN=18000
+          HOST_PROBE=18001
+          MAIN=http://127.0.0.1:${HOST_MAIN}
+          PROBE=http://127.0.0.1:${HOST_PROBE}
+
+          pass() { printf 'PASS: %s\n' "$1"; }
+          fail() { printf 'FAIL: %s\n' "$1"; exit 1; }
+
+          http_code() {
+            local url="$1" out
+            out=$(curl -sS -o "${RUNNER_TEMP}/smoke-body" -w '%{http_code}' --max-time 2 "$url" || true)
+            printf '%s' "$out"
+          }
+
+          mkdir -m 700 -p "${KEYS_DIR}"
+          # Host-side keygen deps: cryptography==50.0.2 plus cffi/pycparser, hash-pinned, wheels only.
+          SMOKE_VENV="${RUNNER_TEMP}/smoke-venv"
+          python3 -m venv "${SMOKE_VENV}"
+          "${SMOKE_VENV}/bin/python" -m pip install --quiet --no-deps --require-hashes --only-binary :all: \
+            -r .github/smoke-requirements.txt
+          SMOKE_PY="${SMOKE_VENV}/bin/python"
+          "${SMOKE_PY}" -c 'import cryptography, sys; sys.exit(cryptography.__version__ != "50.0.2")' \
+            || fail "smoke venv cryptography is not 50.0.2"
+          pass "keygen deps installed with --require-hashes (cryptography 50.0.2)"
+          "${SMOKE_PY}" tools/new_keypair.py --private-key-file "${PRIV_KEY}" > "${KEYS_DIR}/pub.b64"
+          {
+            printf '%s\n' '# kimiclaw-public-keys v1'
+            "${SMOKE_PY}" tools/new_api_key.py --caller smoke --public-key-file "${KEYS_DIR}/pub.b64"
+          } > "${HOST_KEYS}"
+          chmod 644 "${HOST_KEYS}"
+          chmod 600 "${PRIV_KEY}" "${KEYS_DIR}/pub.b64"
+          # Never leave key material in the checkout or the build context.
+          case "${KEYS_DIR}" in
+            "${RUNNER_TEMP}"/*) ;;
+            *) fail "keys dir must be under RUNNER_TEMP, got ${KEYS_DIR}" ;;
+          esac
+
+          # #6 (rivet/hmac-signing) ships GATEWAY_REQUIRE_OPENCLAW; the v1 manifest sets it to "0".
+          git grep -q 'GATEWAY_REQUIRE_OPENCLAW' -- gateway '*.py' \
+            || fail "GATEWAY_REQUIRE_OPENCLAW is missing from this tree (expected from #6)"
+
+          docker build -t "${IMAGE}" .
+
+          # --- image filesystem / history: no .env or keys file baked in ---
+          # Only COPY/ADD lines: the base image history can mention apt keyrings, etc.
+          HIST=$(docker history --no-trunc --format '{{.CreatedBy}}' "${IMAGE}")
+          printf '%s\n' "${HIST}"
+          if printf '%s\n' "${HIST}" | grep -Ei '(^|[[:space:]])(COPY|ADD)[[:space:]]' | grep -Eiq '(\.env|[Kk]eys|\.key|[[:space:]][^[:space:]]+\.pem[[:space:]])'; then
+            fail "docker history COPY/ADD mentions a .env or keys file"
+          fi
+          pass "docker history COPY/ADD has no .env or keys file"
+
+          FS_TAR="${RUNNER_TEMP}/smoke-fs.tar"
+          CID_FS=$(docker create "${IMAGE}")
+          docker export "${CID_FS}" > "${FS_TAR}"
+          docker rm "${CID_FS}" >/dev/null
+          # Flag .env files anywhere, and key material under /app (the app workdir).
+          # Ignore site-packages paths that merely contain the substring "key".
+          if tar -tf "${FS_TAR}" | grep -E '(^|/)\.env($|\.)' ; then
+            fail "image filesystem contains a .env file"
+          fi
+          if tar -tf "${FS_TAR}" | grep -E '^(app/|\./app/)' | grep -Ei '(^|/)([^/]*keys[^/]*|\.env$|\.key$|\.pem$)$' ; then
+            fail "image filesystem has a keys/.env file under /app"
+          fi
+          rm -f "${FS_TAR}"
+          pass "image filesystem has no .env or keys file"
+
+          USER_NAME=$(docker inspect -f '{{.Config.User}}' "${IMAGE}")
+          if [ -z "${USER_NAME}" ] || [ "${USER_NAME}" = "root" ] || [ "${USER_NAME}" = "0" ] || [ "${USER_NAME}" = "0:0" ]; then
+            fail "docker inspect user is root or unset: '${USER_NAME}'"
+          fi
+          pass "docker inspect user is not root (${USER_NAME})"
+
+          UID_INSIDE=$(docker run --rm --entrypoint id "${IMAGE}" -u)
+          if [ "${UID_INSIDE}" != "10001" ]; then
+            fail "id -u inside the image is '${UID_INSIDE}', want 10001"
+          fi
+          pass "id -u inside the image is 10001"
+
+          # One trap for every container this job starts (all names start with ${NAME}).
+          cleanup() {
+            docker ps -aq --filter "name=^${NAME}" | xargs -r docker rm -f >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          # Serve/listen log lines from the gateway or uvicorn workers. uvicorn's own
+          # "Uvicorn running on" / "Started parent process" lines come from the --workers
+          # supervisor before any worker imports the app, so they are not counted here.
+          SERVE_RE='probe listening|main port is serving|uvicorn limit_concurrency=|Started server process|Application startup complete'
+
+          # --- never-serve checks ---
+          # never_serve LABEL LIMIT_S WANT [docker run opts ...] -- [command ...]
+          # Bastion's spec: runs detached with BOTH 8000 and 8001 published and
+          # GATEWAY_SIGNATURE_FUTURE_S=2 (a start that got through would serve within ~3s).
+          # A background `curl -s -o /dev/null -w '%{http_code}'` poll runs against each port for
+          # the container's whole life (started before `docker run`, stopped after it exits); any
+          # value other than 000 fails. That checks for an HTTP status, not a TCP connect, because
+          # a uvicorn --workers supervisor socket accepts connections without serving. Then: exit
+          # code non-zero, the refusal message WANT in the log, no serve log. Running past LIMIT_S
+          # is a hang and fails. The container is always removed (docker rm -f), hang or not.
+          NS_MAIN=18100
+          NS_PROBE=18101
+          ns_poll() {
+            local port="$1" out="$2" stop="$3"
+            while [ ! -e "${stop}" ]; do
+              curl -s -o /dev/null --max-time 1 -w "${port} %{http_code}\n" \
+                "http://127.0.0.1:${port}/healthz" >>"${out}" 2>/dev/null || true
+              sleep 0.1
+            done
+          }
+          never_serve() {
+            local label="$1" limit="$2" want="$3"; shift 3
+            local opts=() cmd=()
+            while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do opts+=("$1"); shift; done
+            if [ "$#" -gt 0 ]; then shift; fi
+            cmd=("$@")
+            local cname="${NAME}-${label}" log="${RUNNER_TEMP}/refuse-${label}.log"
+            local codes="${RUNNER_TEMP}/codes-${label}.txt" stop="${RUNNER_TEMP}/codes-${label}.stop"
+            local hung=0 running rc polls bad p_main p_probe
+            docker rm -f "${cname}" >/dev/null 2>&1 || true
+            rm -f "${stop}"
+            : >"${codes}"
+            ns_poll "${NS_MAIN}" "${codes}" "${stop}" & p_main=$!
+            ns_poll "${NS_PROBE}" "${codes}" "${stop}" & p_probe=$!
+            docker run -d --name "${cname}" --no-healthcheck \
+              -p "127.0.0.1:${NS_MAIN}:8000" -p "127.0.0.1:${NS_PROBE}:8001" \
+              -v "${HOST_KEYS}:${CONT_KEYS}:ro" \
+              -e GATEWAY_PUBLIC_KEYS_FILE="${CONT_KEYS}" \
+              -e GATEWAY_SIGNATURE_FUTURE_S=2 \
+              "${opts[@]}" "${IMAGE}" "${cmd[@]}" >/dev/null
+            local deadline=$((SECONDS + limit))
+            while :; do
+              running=$(docker inspect -f '{{.State.Running}}' "${cname}" 2>/dev/null || echo false)
+              [ "${running}" = "true" ] || break
+              if [ "${SECONDS}" -ge "${deadline}" ]; then hung=1; break; fi
+              sleep 0.2
+            done
+            # One more poll round after exit, then stop the pollers.
+            sleep 1.2
+            touch "${stop}"
+            wait "${p_main}" "${p_probe}" || true
+            rc=$(docker inspect -f '{{.State.ExitCode}}' "${cname}" 2>/dev/null || echo unknown)
+            docker logs "${cname}" >"${log}" 2>&1 || true
+            docker rm -f "${cname}" >/dev/null 2>&1 || true
+            polls=$(wc -l <"${codes}")
+            bad=$(awk '$2 != "000"' "${codes}" | sort | uniq -c | tr '\n' ';')
+            if [ "${hung}" = "1" ]; then
+              cat "${log}" || true
+              fail "${label}: still running after ${limit}s (hang = fail; container removed)"
+            fi
+            if [ -n "${bad}" ]; then
+              cat "${log}" || true
+              fail "${label}: HTTP status on a published port (count port code): ${bad}"
+            fi
+            if ! awk -v a="${NS_MAIN}" -v b="${NS_PROBE}" '$1==a{x=1} $1==b{y=1} END{exit !(x&&y)}' "${codes}"; then
+              fail "${label}: poller did not record both ports (${polls} polls)"
+            fi
+            if [ "${rc}" = "0" ] || [ "${rc}" = "unknown" ]; then
+              cat "${log}" || true
+              fail "${label}: should exit non-zero before serving (rc=${rc})"
+            fi
+            if grep -Eiq "${SERVE_RE}" "${log}"; then
+              cat "${log}" || true
+              fail "${label}: wrote serve/listen logs before exiting (rc=${rc})"
+            fi
+            if ! grep -Fq -- "${want}" "${log}"; then
+              cat "${log}" || true
+              fail "${label}: refusal message missing '${want}'"
+            fi
+            pass "${label}: exits non-zero (rc=${rc}) with '${want}', no serve log, every http_code on ${NS_MAIN}/${NS_PROBE} was 000 (${polls} polls)"
+          }
+
+          REFUSE_LAUNCHER='start with `python -m gateway`'
+          # Missing cap, and the command overridden to uvicorn app:app.
+          never_serve nocap 20 'KIMICLAW_LIMIT_CONCURRENCY is not set'
+          never_serve uvicorn-app 20 "${REFUSE_LAUNCHER}" \
+            -e KIMICLAW_LIMIT_CONCURRENCY=1024 -- uvicorn app:app --host 0.0.0.0 --port 8000
+
+          # CLI flags are not accepted; argparse exits non-zero (rc=2) before any listener starts.
+          # KIMICLAW_LIMIT_CONCURRENCY=1024 is set so the only reason to fail is the flag.
+          never_serve cli-workers 20 'unrecognized arguments' -e KIMICLAW_LIMIT_CONCURRENCY=1024 \
+            -- python -m gateway --host 0.0.0.0 --port 8000 --workers 2
+          never_serve cli-limit64 20 'unrecognized arguments' -e KIMICLAW_LIMIT_CONCURRENCY=1024 \
+            -- python -m gateway --host 0.0.0.0 --port 8000 --limit-concurrency 64
+          never_serve cli-limit64eq 20 'unrecognized arguments' -e KIMICLAW_LIMIT_CONCURRENCY=1024 \
+            -- python -m gateway --host 0.0.0.0 --port 8000 --limit-concurrency=64
+          never_serve cli-limit4096 20 'unrecognized arguments' -e KIMICLAW_LIMIT_CONCURRENCY=1024 \
+            -- python -m gateway --host 0.0.0.0 --port 8000 --limit-concurrency 4096
+
+          # Env-driven refusals with the stock CMD: out-of-range cap and WEB_CONCURRENCY=2.
+          # gateway/main.py: 64 <= KIMICLAW_LIMIT_CONCURRENCY <= 4096; gateway/config.py raises
+          # "WEB_CONCURRENCY must be 1" at import, which python -m gateway turns into exit 3.
+          never_serve cap63 20 'KIMICLAW_LIMIT_CONCURRENCY must be an integer from 64 to 4096' \
+            -e KIMICLAW_LIMIT_CONCURRENCY=63
+          never_serve cap4097 20 'KIMICLAW_LIMIT_CONCURRENCY must be an integer from 64 to 4096' \
+            -e KIMICLAW_LIMIT_CONCURRENCY=4097
+          never_serve webconc2 20 'WEB_CONCURRENCY must be 1' \
+            -e KIMICLAW_LIMIT_CONCURRENCY=1024 -e WEB_CONCURRENCY=2
+
+          # uvicorn --factory gateway.main:create_app, with and without --workers 2.
+          # --init: a uvicorn --workers supervisor as PID 1 cannot be signalled out
+          # (the kernel drops it), so run under tini. Past 30s is a hang and fails.
+          never_serve factory 30 "${REFUSE_LAUNCHER}" --init \
+            -e KIMICLAW_LIMIT_CONCURRENCY=1024 -e GATEWAY_REQUIRE_OPENCLAW=0 \
+            -- uvicorn --factory gateway.main:create_app --host 0.0.0.0 --port 8000
+          never_serve factory-w2 30 "${REFUSE_LAUNCHER}" --init \
+            -e KIMICLAW_LIMIT_CONCURRENCY=1024 -e GATEWAY_REQUIRE_OPENCLAW=0 \
+            -- uvicorn --factory gateway.main:create_app --host 0.0.0.0 --port 8000 --workers 2
+
+          # HEALTHCHECK follows a runtime GATEWAY_PROBE_PORT override (no hardcoded 8001).
+          docker run -d --name "${NAME}-hc9001" --no-healthcheck \
+            -v "${HOST_KEYS}:${CONT_KEYS}:ro" \
+            -e GATEWAY_PUBLIC_KEYS_FILE="${CONT_KEYS}" \
+            -e KIMICLAW_LIMIT_CONCURRENCY=1024 \
+            -e GATEWAY_REQUIRE_OPENCLAW=0 \
+            -e GATEWAY_PROBE_PORT=9001 \
+            "${IMAGE}" >/dev/null
+          HC_CMD9001=$(docker inspect -f '{{index .Config.Healthcheck.Test 1}}' "${IMAGE}")
+          HC_OK=0
+          for _ in $(seq 1 40); do
+            if docker exec "${NAME}-hc9001" sh -c "${HC_CMD9001}" >/dev/null 2>&1; then HC_OK=1; break; fi
+            sleep 0.25
+          done
+          HC_LOG=$(docker logs "${NAME}-hc9001" 2>&1 || true)
+          docker rm -f "${NAME}-hc9001" >/dev/null 2>&1 || true
+          if [ "${HC_OK}" != "1" ]; then
+            printf '%s\n' "${HC_LOG}"
+            fail "image HEALTHCHECK did not pass with GATEWAY_PROBE_PORT=9001"
+          fi
+          grep -q 'probe listening on 0.0.0.0:9001' <<<"${HC_LOG}" \
+            || { printf '%s\n' "${HC_LOG}"; fail "probe did not listen on 9001"; }
+          pass "HEALTHCHECK passes with GATEWAY_PROBE_PORT=9001 (probe listening on 9001)"
+
+          # --- run the real CMD ---
+          RUN_ARGS=(
+            -d --name "${NAME}" --no-healthcheck
+            -p "127.0.0.1:${HOST_MAIN}:8000"
+            -p "127.0.0.1:${HOST_PROBE}:8001"
+            -v "${HOST_KEYS}:${CONT_KEYS}:ro"
+            -e GATEWAY_PUBLIC_KEYS_FILE="${CONT_KEYS}"
+            -e KIMICLAW_LIMIT_CONCURRENCY=1024
+            -e GATEWAY_REQUIRE_OPENCLAW=0
+          )
+          docker run "${RUN_ARGS[@]}" "${IMAGE}"
+
+          # :8001/healthz returns 200 within ~2s (allow a little CI slack; fail well before the 31s hold).
+          HZ_CODE=""
+          START_TS=${SECONDS}
+          HZ_DEADLINE=$((SECONDS + 8))
+          while [ "${SECONDS}" -lt "${HZ_DEADLINE}" ]; do
+            HZ_CODE=$(http_code "${PROBE}/healthz")
+            if [ "${HZ_CODE}" = "200" ]; then
+              break
+            fi
+            if [ -n "$(docker inspect -f '{{.State.ExitCode}} {{.State.Running}}' "${NAME}")" ] && \
+               [ "$(docker inspect -f '{{.State.Running}}' "${NAME}")" != "true" ]; then
+              docker logs "${NAME}" || true
+              fail "container exited before /healthz came up (rc=$(docker inspect -f '{{.State.ExitCode}}' "${NAME}"))"
+            fi
+            sleep 0.2
+          done
+          HZ_ELAPSED=$((SECONDS - START_TS))
+          if [ "${HZ_CODE}" != "200" ]; then
+            docker logs "${NAME}" || true
+            fail ":8001/healthz was ${HZ_CODE:-none} after ${HZ_ELAPSED}s, want 200"
+          fi
+          if [ "${HZ_ELAPSED}" -gt 5 ]; then
+            fail ":8001/healthz was 200 after ${HZ_ELAPSED}s, expected within ~2s"
+          fi
+          pass ":8001/healthz returns 200 after ${HZ_ELAPSED}s"
+
+          PY_COUNT=$(docker exec "${NAME}" sh -c '
+            n=0
+            for comm in /proc/[0-9]*/comm; do
+              [ -r "$comm" ] || continue
+              c=$(cat "$comm")
+              if [ "$c" = "python" ] || [ "$c" = "python3" ]; then
+                n=$((n + 1))
+                cmd=$(tr "\0" " " < "${comm%comm}cmdline" 2>/dev/null || true)
+                echo "python pid ${comm} ${cmd}" >&2
+              fi
+            done
+            echo "$n"
+          ')
+          if [ "${PY_COUNT}" != "1" ]; then
+            docker exec "${NAME}" sh -c 'ls -l /proc/[0-9]*/comm; for c in /proc/[0-9]*/cmdline; do echo "== $c"; tr "\0" " " < "$c"; echo; done' || true
+            fail "expected exactly one python process, found ${PY_COUNT}"
+          fi
+          pass "exactly one python process in the container"
+
+          LOG=$(docker logs "${NAME}" 2>&1)
+          printf '%s\n' "${LOG}"
+          echo "${LOG}" | grep -q 'limit_concurrency=1024' || fail "log missing limit_concurrency=1024"
+          echo "${LOG}" | grep -q 'workers=1' || fail "log missing workers=1"
+          grep -q 'GATEWAY_REQUIRE_OPENCLAW=0: readiness ignores openclaw' <<<"${LOG}" \
+            || fail "log missing the GATEWAY_REQUIRE_OPENCLAW=0 warning"
+          pass "log contains limit_concurrency=1024, workers=1 and the GATEWAY_REQUIRE_OPENCLAW=0 warning"
+
+          # HEALTHCHECK: run the image's own healthcheck command inside the container (default probe port).
+          HC_TEST=$(docker inspect -f '{{json .Config.Healthcheck.Test}}' "${IMAGE}")
+          printf 'image Healthcheck.Test: %s\n' "${HC_TEST}"
+          case "${HC_TEST}" in
+            *'${GATEWAY_PROBE_PORT}'*) ;;
+            *) fail "HEALTHCHECK does not use \${GATEWAY_PROBE_PORT}: ${HC_TEST}" ;;
+          esac
+          HC_CMD=$(docker inspect -f '{{index .Config.Healthcheck.Test 1}}' "${IMAGE}")
+          docker exec "${NAME}" sh -c "${HC_CMD}" || fail "image HEALTHCHECK command failed on the default probe port"
+          pass "HEALTHCHECK uses \${GATEWAY_PROBE_PORT} and passes on the default probe port (8001)"
+
+          READY_CODE=$(http_code "${PROBE}/readyz")
+          if [ "${READY_CODE}" != "503" ]; then
+            fail ":8001/readyz was ${READY_CODE} during the hold, want 503"
+          fi
+          pass ":8001/readyz returns 503 during the hold (GATEWAY_REQUIRE_OPENCLAW=0)"
+
+          set +e
+          curl -sS -o /dev/null --max-time 1 "${MAIN}/healthz"
+          MAIN_RC=$?
+          set -e
+          if [ "${MAIN_RC}" -eq 0 ]; then
+            fail ":8000 served during the hold (expected refuse or fail)"
+          fi
+          pass ":8000 refuses or fails during the hold (curl rc=${MAIN_RC})"
+
+          RAND=$(python3 -c 'import secrets; print(secrets.token_hex(8))')
+          RAND_CODE=$(http_code "${PROBE}/${RAND}")
+          if [ "${RAND_CODE}" != "404" ]; then
+            fail ":8001/${RAND} was ${RAND_CODE}, want 404"
+          fi
+          pass ":8001/<random> returns 404"
+
+          GATEWAY_CODE=$(http_code "${PROBE}/.well-known/agent.json")
+          if [ "${GATEWAY_CODE}" != "404" ]; then
+            fail ":8001/.well-known/agent.json was ${GATEWAY_CODE}, want 404"
+          fi
+          pass "gateway route :8001/.well-known/agent.json returns 404"
+
+          # Main port should start serving after the ~31s startup hold.
+          MAIN_CODE=""
+          MAIN_START=${SECONDS}
+          MAIN_DEADLINE=$((SECONDS + 45))
+          while [ "${SECONDS}" -lt "${MAIN_DEADLINE}" ]; do
+            MAIN_CODE=$(http_code "${MAIN}/healthz")
+            if [ "${MAIN_CODE}" = "200" ]; then
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "${NAME}")" != "true" ]; then
+              docker logs "${NAME}" || true
+              fail "container exited before :8000 started serving"
+            fi
+            sleep 1
+          done
+          MAIN_ELAPSED=$((SECONDS - MAIN_START))
+          # MAIN_START is after the during-hold checks, a few seconds after process start.
+          # Total time from container start is roughly HZ_ELAPSED + MAIN_ELAPSED plus the checks in between.
+          if [ "${MAIN_CODE}" != "200" ]; then
+            docker logs "${NAME}" || true
+            fail ":8000 did not serve within 45s after the hold checks (last code ${MAIN_CODE:-none})"
+          fi
+          pass ":8000 serves after the hold (main /healthz 200, ${MAIN_ELAPSED}s after the during-hold checks)"
+
+          AFTER_READY=$(http_code "${PROBE}/readyz")
+          if [ "${AFTER_READY}" != "200" ]; then
+            fail ":8001/readyz was ${AFTER_READY} after the hold with GATEWAY_REQUIRE_OPENCLAW=0, want 200"
+          fi
+          pass ":8001/readyz returns 200 after the hold (GATEWAY_REQUIRE_OPENCLAW=0)"
+
+          # --- real requests to :8000 after the hold, signed per #6 (gateway/auth.py) ---
+          # .github/smoke/kc_request.py uses only cryptography + stdlib (tools/sign_request.py needs httpx).
+          KEY_ID=$(awk 'NR==2 {print $1}' "${HOST_KEYS}")
+          kc() { "${SMOKE_PY}" .github/smoke/kc_request.py --key-id "${KEY_ID}" --private-key-file "${PRIV_KEY}" "$@" "${MAIN}/"; }
+          SIGNED=$(kc --mode signed)
+          [ "${SIGNED}" = "200" ] || fail "signed GET / was ${SIGNED}, want 200"
+          pass "signed GET / returns 200"
+          UNSIGNED=$(kc --mode unsigned)
+          [ "${UNSIGNED}" = "401" ] || fail "unsigned GET / was ${UNSIGNED}, want 401"
+          pass "unsigned GET / returns 401"
+          FORGED=$(kc --mode forged)
+          [ "${FORGED}" = "401" ] || fail "forged (bad signature) GET / was ${FORGED}, want 401"
+          pass "forged (bad signature, registered key_id) GET / returns 401"
+          REPLAY=$(kc --mode replay | tr '\n' ' ')
+          [ "${REPLAY}" = "200 401 " ] || fail "replayed signed GET / was '${REPLAY}', want '200 401'"
+          pass "replayed signed GET / returns 200 then 401"
+
+          # --- serve run WITHOUT GATEWAY_REQUIRE_OPENCLAW: readyz stays 503 after the hold ---
+          # GATEWAY_SIGNATURE_FUTURE_S=2 shortens the hold to ~3s; the image has no openclaw.
+          NOOC="${NAME}-noopenclaw"
+          NOOC_MAIN=http://127.0.0.1:18200
+          NOOC_PROBE=http://127.0.0.1:18201
+          docker run -d --name "${NOOC}" --no-healthcheck \
+            -p "127.0.0.1:18200:8000" -p "127.0.0.1:18201:8001" \
+            -v "${HOST_KEYS}:${CONT_KEYS}:ro" \
+            -e GATEWAY_PUBLIC_KEYS_FILE="${CONT_KEYS}" \
+            -e KIMICLAW_LIMIT_CONCURRENCY=1024 \
+            -e GATEWAY_SIGNATURE_FUTURE_S=2 \
+            "${IMAGE}" >/dev/null
+          NOOC_CODE=""
+          NOOC_DEADLINE=$((SECONDS + 30))
+          while [ "${SECONDS}" -lt "${NOOC_DEADLINE}" ]; do
+            NOOC_CODE=$(http_code "${NOOC_MAIN}/healthz")
+            [ "${NOOC_CODE}" = "200" ] && break
+            if [ "$(docker inspect -f '{{.State.Running}}' "${NOOC}")" != "true" ]; then
+              docker logs "${NOOC}" || true
+              fail "no-openclaw run exited before :8000 served"
+            fi
+            sleep 0.5
+          done
+          NOOC_LOG=$(docker logs "${NOOC}" 2>&1 || true)
+          if [ "${NOOC_CODE}" != "200" ]; then
+            printf '%s\n' "${NOOC_LOG}"
+            fail "no-openclaw run: :8000 did not serve within 30s (last ${NOOC_CODE:-none})"
+          fi
+          grep -q 'main port is serving' <<<"${NOOC_LOG}" || { printf '%s\n' "${NOOC_LOG}"; fail "no-openclaw run: hold not over (no 'main port is serving')"; }
+          if grep -q 'GATEWAY_REQUIRE_OPENCLAW=0' <<<"${NOOC_LOG}"; then
+            printf '%s\n' "${NOOC_LOG}"
+            fail "no-openclaw run logged the GATEWAY_REQUIRE_OPENCLAW=0 warning but the var is unset"
+          fi
+          NOOC_READY=$(http_code "${NOOC_PROBE}/readyz")
+          docker rm -f "${NOOC}" >/dev/null 2>&1 || true
+          [ "${NOOC_READY}" = "503" ] || fail "no-openclaw run: :8001/readyz was ${NOOC_READY} after the hold, want 503"
+          pass "without GATEWAY_REQUIRE_OPENCLAW, :8001/readyz stays 503 after the hold (no openclaw in the image)"
+
+          echo "All image-smoke assertions passed."

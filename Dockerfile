@@ -1,4 +1,8 @@
-FROM python:3.13-slim
+# Multi-arch index digest for python:3.13-slim, resolved from Docker Hub
+# on 2026-11-13 22:21:37 CST (America/Chicago) via the registry API
+# (anonymous token from auth.docker.io; HEAD of the tag manifest with
+# Accept for the OCI index and docker manifest list; Docker-Content-Digest).
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -8,8 +12,12 @@ RUN useradd -r -u 10001 gateway && mkdir -p telemetry && chown gateway telemetry
 USER gateway
 # The gateway runs `openclaw agent --local` as a subprocess. The image does NOT include openclaw:
 # install it in a derived image or mount it onto PATH, otherwise /readyz returns 503 and tasks fail.
-# KIMICLAW_TOKEN and GATEWAY_* come from the runtime env (never baked in).
-EXPOSE 8000
-# Liveness only: /healthz is public. /readyz is not used here because it is 503 until openclaw is present.
-HEALTHCHECK CMD python -c "import urllib.request as u;u.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# KIMICLAW_TOKEN, KIMICLAW_LIMIT_CONCURRENCY and GATEWAY_* come from the runtime env (never baked in).
+EXPOSE 8000 8001
+# Liveness: probe-port /healthz is 200 as soon as the process is up (including the ~31s hold).
+# /readyz is 503 in the stock image until openclaw is present, so it is not the HEALTHCHECK target.
+# GATEWAY_PROBE_PORT defaults to 8001 (same default as the gateway). The shell-form HEALTHCHECK expands
+# ${GATEWAY_PROBE_PORT} at check time, so a runtime override moves the healthcheck with the probe listener.
+ENV GATEWAY_PROBE_PORT=8001
+HEALTHCHECK CMD python -c "import urllib.request as u;u.urlopen('http://127.0.0.1:${GATEWAY_PROBE_PORT}/healthz',timeout=3)"
+CMD ["python", "-m", "gateway", "--host", "0.0.0.0", "--port", "8000"]
