@@ -12,6 +12,9 @@ import os
 import time
 from urllib.parse import urlparse
 
+from gateway.env import _env_num
+
+
 from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult, PeriodicExportingMetricReader
@@ -19,9 +22,16 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, SpanExportResult
 
+def _log_path(value) -> str:
+    """Same cap as gateway.config.log_path, kept local so this module can load without keys."""
+    s = "".join(c if c.isprintable() else (f"\\x{ord(c):02x}" if ord(c) < 256 else f"\\u{ord(c):04x}")
+                for c in str(value)[:128])
+    return s[:128]
+
+
 TELEMETRY_DIR = os.environ.get("GATEWAY_TELEMETRY_DIR", "telemetry")
 OTLP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
-FILE_BYTES = int(float(os.environ.get("GATEWAY_TELEMETRY_FILE_MB", "10")) * 1_000_000)
+FILE_BYTES = int(_env_num("GATEWAY_TELEMETRY_FILE_MB", "10", float, gt=0) * 1_000_000)
 BACKUPS = 4
 
 tracer = trace.get_tracer("kimiclaw")
@@ -156,7 +166,7 @@ async def telemetry_middleware(request, call_next):
     """One "rpc" span per request. For SSE (message/stream) the span and duration close at stream end."""
     started = time.perf_counter()
     span = tracer.start_span("rpc", attributes={
-        "http.request.method": request.method, "url.path": request.url.path})
+        "http.request.method": request.method, "url.path": _log_path(request.url.path)})
     state = {"status": 500}
 
     def finish():
@@ -171,9 +181,9 @@ async def telemetry_middleware(request, call_next):
             span.end()
             return
         span.set_attribute("http.response.status_code", status)
-        ACCESS.info("%s %s %s", request.method, request.url.path, status)
+        ACCESS.info("%s %s %s", request.method, _log_path(request.url.path), status)
         with trace.use_span(span):
-            event("http_request", method=request.method, path=request.url.path, status=status,
+            event("http_request", method=request.method, path=_log_path(request.url.path), status=status,
                   duration_ms=round(ms, 1), key_id=getattr(request.state, "key_id", None),
                   **getattr(request.state, "ids", {}))
         span.end()

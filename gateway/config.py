@@ -16,6 +16,9 @@ logging.basicConfig(
 )
 LOG = logging.getLogger("kimiclaw")
 
+
+from gateway.env import _env_num
+
 MAX_LOG_ID = 128
 KEY_ID_RE = re.compile(r"[0-9a-f]{10}")  # exactly what tools/new_api_key.py mints (token_hex(5))
 CALLER_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
@@ -30,6 +33,11 @@ def log_safe(value) -> str:
         c if c.isprintable() else (f"\\x{ord(c):02x}" if ord(c) < 256 else f"\\u{ord(c):04x}")
         for c in s
     )
+
+
+def log_path(value) -> str:
+    """A request path for logs: log_safe, then cap at 128 characters."""
+    return log_safe(value)[:MAX_LOG_ID]
 
 
 def _load_token() -> str:
@@ -91,36 +99,36 @@ def load_public_keys(path: str) -> dict[str, tuple[str, Ed25519PublicKey]]:
 NOTIFY_URL = os.environ.get("GATEWAY_NOTIFY_URL", "").strip()
 TOKEN = _load_token() if NOTIFY_URL else ""  # outbound notify credential only; never accepted inbound
 PUBLIC_KEYS = load_public_keys(os.environ.get("GATEWAY_PUBLIC_KEYS_FILE", "").strip())
-SIGNATURE_PAST_S = int(os.environ.get("GATEWAY_SIGNATURE_PAST_S", "300"))
-SIGNATURE_FUTURE_S = int(os.environ.get("GATEWAY_SIGNATURE_FUTURE_S", "30"))
+SIGNATURE_PAST_S = _env_num("GATEWAY_SIGNATURE_PAST_S", "300", lo=0)
+SIGNATURE_FUTURE_S = _env_num("GATEWAY_SIGNATURE_FUTURE_S", "30", lo=0)
 if not 0 <= SIGNATURE_FUTURE_S <= SIGNATURE_PAST_S:
     raise RuntimeError("want 0 <= GATEWAY_SIGNATURE_FUTURE_S <= GATEWAY_SIGNATURE_PAST_S")
-MAX_NONCES_PER_CALLER = int(os.environ.get("GATEWAY_MAX_NONCES_PER_CALLER", "20000"))
-REQUESTS_PER_S = float(os.environ.get("GATEWAY_REQUESTS_PER_S", "5"))
-REQUESTS_BURST = int(os.environ.get("GATEWAY_REQUESTS_BURST", "10"))
-READS_PER_CALLER = int(os.environ.get("GATEWAY_READS_PER_CALLER", "3"))
-BODY_READ_TIMEOUT_S = float(os.environ.get("GATEWAY_BODY_READ_TIMEOUT_S", "10"))
-BODY_IDLE_TIMEOUT_S = float(os.environ.get("GATEWAY_BODY_IDLE_TIMEOUT_S", "5"))
+MAX_NONCES_PER_CALLER = _env_num("GATEWAY_MAX_NONCES_PER_CALLER", "20000", lo=1)
+REQUESTS_PER_S = _env_num("GATEWAY_REQUESTS_PER_S", "5", float, gt=0)
+REQUESTS_BURST = _env_num("GATEWAY_REQUESTS_BURST", "10", lo=1)
+READS_PER_CALLER = _env_num("GATEWAY_READS_PER_CALLER", "3")
+BODY_READ_TIMEOUT_S = _env_num("GATEWAY_BODY_READ_TIMEOUT_S", "10", float, gt=0)
+BODY_IDLE_TIMEOUT_S = _env_num("GATEWAY_BODY_IDLE_TIMEOUT_S", "5", float, gt=0)
 if not 2 <= READS_PER_CALLER <= 4:
     raise RuntimeError("GATEWAY_READS_PER_CALLER must be 2, 3 or 4")
 if not 0 < BODY_IDLE_TIMEOUT_S <= BODY_READ_TIMEOUT_S:
     raise RuntimeError("want 0 < GATEWAY_BODY_IDLE_TIMEOUT_S <= GATEWAY_BODY_READ_TIMEOUT_S")
-CREATE_PER_MIN = float(os.environ.get("GATEWAY_CREATE_PER_MIN", "10"))
-CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
-GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))
-CANCEL_PER_S = float(os.environ.get("GATEWAY_CANCEL_PER_S", "1"))
+CREATE_PER_MIN = _env_num("GATEWAY_CREATE_PER_MIN", "10", float, gt=0)
+CREATE_BURST = _env_num("GATEWAY_CREATE_BURST", "5", lo=1)
+GET_PER_S = _env_num("GATEWAY_GET_PER_S", "2", float, gt=0)
+CANCEL_PER_S = _env_num("GATEWAY_CANCEL_PER_S", "1", float, gt=0)
 MAX_BODY = 1_000_000
-MAX_INFLIGHT_PER_KEY = int(os.environ.get("GATEWAY_MAX_INFLIGHT_PER_KEY", "2"))
-MAX_PENDING = int(os.environ.get("GATEWAY_MAX_PENDING", "50"))
-MAX_TASKS_PER_KEY = int(os.environ.get("GATEWAY_MAX_TASKS_PER_KEY", "100"))
+MAX_INFLIGHT_PER_KEY = _env_num("GATEWAY_MAX_INFLIGHT_PER_KEY", "2", lo=1)
+MAX_PENDING = _env_num("GATEWAY_MAX_PENDING", "50", lo=1)
+MAX_TASKS_PER_KEY = _env_num("GATEWAY_MAX_TASKS_PER_KEY", "100", lo=1)
 PUBLIC_URL = os.environ.get("GATEWAY_PUBLIC_URL", "").strip() or "https://kimiclaw.hoyack.ai/"
 NOTIFY_AUTH_MODE = os.environ.get("GATEWAY_NOTIFY_AUTH_MODE", "raw").lower()
 NOTIFY_AUTH_USER = os.environ.get("GATEWAY_NOTIFY_AUTH_USER", "agent")
 NOTIFY_EVENTS = {e.strip() for e in os.environ.get(
     "GATEWAY_NOTIFY_EVENTS", "task_completed,task_failed").split(",") if e.strip()}
 NOTIFY_TIMEOUT = 10
-NOTIFY_FAIL_LIMIT = int(os.environ.get("GATEWAY_NOTIFY_FAIL_LIMIT", "5"))
-NOTIFY_COOLDOWN_S = int(os.environ.get("GATEWAY_NOTIFY_COOLDOWN_S", "900"))
+NOTIFY_FAIL_LIMIT = _env_num("GATEWAY_NOTIFY_FAIL_LIMIT", "5", lo=1)
+NOTIFY_COOLDOWN_S = _env_num("GATEWAY_NOTIFY_COOLDOWN_S", "900", lo=0)
 MAX_TEXT = 100_000
 AGENT_TIMEOUT = 560           # seconds, passed to openclaw
 AGENT_CONCURRENCY = 3         # concurrent agent turns

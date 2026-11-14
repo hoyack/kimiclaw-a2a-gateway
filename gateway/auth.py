@@ -17,7 +17,8 @@ from starlette.requests import ClientDisconnect
 from gateway.config import (BODY_IDLE_TIMEOUT_S, BODY_READ_TIMEOUT_S, CANCEL_PER_S, CREATE_BURST, CREATE_PER_MIN,
                             GET_PER_S, KEY_ID_RE, LOG, MAX_BODY, MAX_NONCES_PER_CALLER, READS_PER_CALLER,
                             REQUESTS_BURST, REQUESTS_PER_S, SIGNATURE_FUTURE_S, SIGNATURE_PAST_S, PUBLIC_KEYS,
-                            log_safe)
+                            log_safe, log_path)
+from gateway.env import _env_num
 
 PUBLIC_PATHS = {"/.well-known/agent.json", "/healthz", "/readyz"}
 HEADERS = ("x-kc-key-id", "x-kc-timestamp", "x-kc-nonce", "x-kc-signature", "x-kc-content-sha256")
@@ -31,7 +32,7 @@ READ_FAILURES = {"too_large": (413, "request body too large"), "read_deadline": 
                  "read_idle": (408, "request timeout"), "client_disconnected": (400, "client disconnected")}
 QUIET_READS = {"pool_full", "read_deadline", "read_idle"}  # 429/408: aggregate, no per-request log or trace
 _refusals: dict[str, dict] = {}  # pool_name -> {reasons, task}
-REFUSAL_LOG_S = float(os.environ.get("GATEWAY_REFUSAL_LOG_S", "1"))
+REFUSAL_LOG_S = _env_num("GATEWAY_REFUSAL_LOG_S", "1", float, lo=0)
 
 
 # rpc method -> (tokens per second, bucket size)
@@ -132,13 +133,20 @@ def unauthorized() -> JSONResponse:
     return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
-def emit_refusals(pool_name: str, reasons: dict[str, int]):
+def emit_refusals(pool_name: str, reasons: dict[str, int], path: str | None = None):
     count = sum(reasons.values())
     parts = ",".join(f"{k}:{v}" for k, v in sorted(reasons.items()))
+    suffix = f" path={log_path(path)}" if path else ""
     if pool_name == "precheck":
-        LOG.warning("auth refused count=%d reasons=%s", count, parts)
+        LOG.warning("auth refused count=%d reasons=%s%s", count, parts, suffix)
+    elif pool_name == "public":
+        LOG.info("public count=%d reasons=%s%s", count, parts, suffix)
+    elif pool_name == "http":
+        LOG.warning("http refused count=%d reasons=%s%s", count, parts, suffix)
+    elif pool_name == "limit":
+        LOG.warning("rate limited count=%d reasons=%s%s", count, parts, suffix)
     else:
-        LOG.warning("read refused pool=%s count=%d reasons=%s", pool_name, count, parts)
+        LOG.warning("read refused pool=%s count=%d reasons=%s%s", pool_name, count, parts, suffix)
 
 
 async def _flush_refusals(pool_name: str):
@@ -147,25 +155,40 @@ async def _flush_refusals(pool_name: str):
     if rec is None:
         return
     reasons, rec["reasons"] = rec["reasons"], {}
+    path, rec["path"] = rec.get("path"), None
     rec["task"] = None
     if reasons:
-        emit_refusals(pool_name, reasons)
+        emit_refusals(pool_name, reasons, path=path)
     if rec["reasons"] and rec["task"] is None:
         rec["task"] = asyncio.get_running_loop().create_task(_flush_refusals(pool_name))
 
 
-def note_refusal(request: Request, pool_name: str, reason: str):
-    """Quiet refusal: one aggregated log line per pool per interval, no per-request log, trace, or access log."""
-    request.state.quiet_read = True
-    rec = _refusals.setdefault(pool_name, {"reasons": {}, "task": None})
+def note_quiet(pool_name: str, reason: str, path: str | None = None):
+    """Count one event into the existing aggregated summary for this pool."""
+    rec = _refusals.setdefault(pool_name, {"reasons": {}, "task": None, "path": None})
     rec["reasons"][reason] = rec["reasons"].get(reason, 0) + 1
+    if path is not None:
+        rec["path"] = path
     if REFUSAL_LOG_S <= 0:
         reasons, rec["reasons"] = rec["reasons"], {}
+        sample, rec["path"] = rec.get("path"), None
         if reasons:
-            emit_refusals(pool_name, reasons)
+            emit_refusals(pool_name, reasons, path=sample)
         return
     if rec["task"] is None:
-        rec["task"] = asyncio.get_running_loop().create_task(_flush_refusals(pool_name))
+        try:
+            rec["task"] = asyncio.get_running_loop().create_task(_flush_refusals(pool_name))
+        except RuntimeError:
+            reasons, rec["reasons"] = rec["reasons"], {}
+            sample, rec["path"] = rec.get("path"), None
+            if reasons:
+                emit_refusals(pool_name, reasons, path=sample)
+
+
+def note_refusal(request: Request, pool_name: str, reason: str, path: str | None = None):
+    """Quiet refusal: one aggregated log line per pool per interval, no per-request log, trace, or access log."""
+    request.state.quiet_read = True
+    note_quiet(pool_name, reason, path=path)
 
 
 def quiet_unauthorized(request: Request, reason: str) -> JSONResponse:
@@ -176,9 +199,29 @@ def quiet_unauthorized(request: Request, reason: str) -> JSONResponse:
 # rpc method -> (tokens per second, bucket size) already defined above
 
 
+def _quiet_status_reason(request: Request, status: int) -> str | None:
+    if status == 404:
+        return "not_found"
+    if status == 405:
+        return "method_not_allowed"
+    if request.method == "OPTIONS":
+        return "options"
+    if request.url.path in PUBLIC_PATHS:
+        return "public"
+    return None
+
+
 async def signed_auth(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
-        return await call_next(request)
+        response = await call_next(request)
+        if response.status_code in (404, 405):
+            note_refusal(request, "http", _quiet_status_reason(request, response.status_code),
+                         path=request.url.path)
+        elif request.url.path in PUBLIC_PATHS:
+            note_refusal(request, "public", "ok", path=request.url.path)
+        else:
+            note_refusal(request, "http", "options", path=request.url.path)
+        return response
     values = [request.headers.getlist(h) for h in HEADERS]
     key_id, timestamp, nonce, signature, body_sha256 = (v[0] if v else "" for v in values)
     # 1. header shape
@@ -210,8 +253,8 @@ async def signed_auth(request: Request, call_next):
         return quiet_unauthorized(request, "replayed_nonce")
     wait = nonce_quota_wait(seen, expiry) or take((caller, ""), REQUESTS_PER_S, REQUESTS_BURST)
     if wait:
-        LOG.warning("rate limited key_id=%s caller=%s live_nonces=%d retry_after=%d", key_id, caller, len(seen), wait)
         request.state.key_id = key_id
+        note_refusal(request, "limit", "rate_limited", path=request.url.path)
         return rate_limited(wait)
     seen.add(nonce)
     heapq.heappush(expiry, (int(timestamp) + SIGNATURE_PAST_S, nonce))
@@ -237,5 +280,9 @@ async def signed_auth(request: Request, call_next):
     if got_sha != body_sha256:
         return quiet_unauthorized(request, "body_hash_mismatch")
     request.state.body = body
-    LOG.info("request key_id=%s caller=%s %s %s", key_id, log_safe(caller), request.method, log_safe(request.url.path))
-    return await call_next(request)
+    LOG.info("request key_id=%s caller=%s %s %s", key_id, log_safe(caller), request.method, log_path(request.url.path))
+    response = await call_next(request)
+    if response.status_code in (404, 405):
+        note_refusal(request, "http", _quiet_status_reason(request, response.status_code),
+                     path=request.url.path)
+    return response

@@ -3,6 +3,10 @@ import asyncio
 import os
 import re
 import time
+
+from gateway.launcher_guard import FACTORY_REFUSAL, launched, refuse_launcher, refuse_unsupported_import
+
+refuse_unsupported_import()
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,15 +24,15 @@ HEADER_TIMEOUT_MIN = 1
 HEADER_TIMEOUT_MAX = 30
 HEADER_TIMEOUT_DEFAULT = 5
 PROBE_PORT_DEFAULT = 8001
-_DIGITS = re.compile(r"^[0-9]+$")
+_DIGITS = re.compile(r"^[1-9][0-9]*$")
 
 
 def _env_int(name: str, raw, lo: int, hi: int, *, required: bool, default: int | None = None) -> int:
-    if raw is None or not str(raw).strip():
+    if raw is None or raw == "":
         if required:
             raise RuntimeError(f"{name} is not set (want an integer from {lo} to {hi})")
         return default
-    text = str(raw).strip()
+    text = raw if isinstance(raw, str) else str(raw)
     if not _DIGITS.fullmatch(text):
         raise RuntimeError(f"{name} must be an integer from {lo} to {hi}")
     n = int(text, 10)
@@ -65,6 +69,8 @@ async def lifespan(app):
 
 
 def create_app() -> FastAPI:
+    if not launched():
+        refuse_launcher(FACTORY_REFUSAL)
     app = FastAPI(title="Kimiclaw A2A Gateway", version="0.1.0", lifespan=lifespan,
                  telemetry={"tracing": False, "operation_spans": False, "metrics": False, "logs": False})
     telemetry.setup()

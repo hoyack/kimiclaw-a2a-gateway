@@ -331,7 +331,8 @@ def _signing_subprocess(prog, extra_env=None):
            "GATEWAY_GET_PER_S": "1000", "GATEWAY_CANCEL_PER_S": "1000",
            "GATEWAY_REFUSAL_LOG_S": "0", "KIMICLAW_LIMIT_CONCURRENCY": "1024"}
     env.update(extra_env or {})
-    r = subprocess.run([sys.executable, "-c", prog], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+    boot = "from gateway.launcher_guard import mark_launched; mark_launched()\n" + prog
+    r = subprocess.run([sys.executable, "-c", boot], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr[-2000:]
     return r.stdout
 
@@ -418,7 +419,8 @@ print([verified(key.public_key(), good, b"m"), verified(other, good, b"m")]
 """
     env = {**os.environ, "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "GATEWAY_SIGNATURE_FUTURE_S": "0",
            "KIMICLAW_LIMIT_CONCURRENCY": "1024"}
-    r = subprocess.run([sys.executable, "-c", prog], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+    boot = "from gateway.launcher_guard import mark_launched; mark_launched()\n" + prog
+    r = subprocess.run([sys.executable, "-c", boot], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr[-2000:]
     assert r.stdout.split("\n")[-2] == str([True] + [False] * 7)
 
@@ -444,7 +446,8 @@ print(codes)
            "GATEWAY_MAX_NONCES_PER_CALLER": "1",
            "GATEWAY_REQUESTS_PER_S": "0.0001", "GATEWAY_REQUESTS_BURST": "2",
            "KIMICLAW_LIMIT_CONCURRENCY": "1024"}
-    r = subprocess.run([sys.executable, "-c", prog], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+    boot = "from gateway.launcher_guard import mark_launched; mark_launched()\n" + prog
+    r = subprocess.run([sys.executable, "-c", boot], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr[-2000:]
     assert r.stdout.split("\n")[-2] == "[200, 429, 200]"
 
