@@ -541,6 +541,7 @@ def _assert_never_listens(cmd, ports, extra_env=None, timeout=8):
     "python -c hypercorn.main() -w 2",
     "python -c runpy.run_module uvicorn --workers 2",
     "python -muvicorn --workers 2",
+    "python -um uvicorn --workers 2",
     "symlinked uvicorn console script",
     "gunicorn -c python:tests.conftest gateway.main:create_app()",
 ])
@@ -561,6 +562,9 @@ def test_exotic_launch_forms_never_listen(kind, tmp_path):
                "app:app", "--workers", "2", "--host", "127.0.0.1", "--port", str(port)]
     elif kind == "python -muvicorn --workers 2":
         cmd = [sys.executable, "-muvicorn", "app:app", "--workers", "2",
+               "--host", "127.0.0.1", "--port", str(port)]
+    elif kind == "python -um uvicorn --workers 2":
+        cmd = [sys.executable, "-um", "uvicorn", "app:app", "--workers", "2",
                "--host", "127.0.0.1", "--port", str(port)]
     elif kind == "symlinked uvicorn console script":
         exe = _venv_script("uvicorn")
@@ -661,10 +665,17 @@ def test_official_launcher_rejects_bad_create_burst_without_traceback():
 @pytest.mark.parametrize("name,value,needle", [
     ("GATEWAY_REFUSAL_LOG_S", "-1", "GATEWAY_REFUSAL_LOG_S must be >= 0"),
     ("GATEWAY_TELEMETRY_FILE_MB", "0", "GATEWAY_TELEMETRY_FILE_MB must be > 0"),
+    ("GATEWAY_REQUESTS_PER_S", "nan", "GATEWAY_REQUESTS_PER_S must be a number"),
+    ("GATEWAY_REQUESTS_PER_S", "inf", "GATEWAY_REQUESTS_PER_S must be a number"),
+    ("GATEWAY_REQUESTS_PER_S", "0", "GATEWAY_REQUESTS_PER_S must be > 0"),
     ("GATEWAY_GET_PER_S", "nan", "GATEWAY_GET_PER_S must be a number"),
     ("GATEWAY_GET_PER_S", "inf", "GATEWAY_GET_PER_S must be a number"),
+    ("GATEWAY_GET_PER_S", "0", "GATEWAY_GET_PER_S must be > 0"),
     ("GATEWAY_CANCEL_PER_S", "nan", "GATEWAY_CANCEL_PER_S must be a number"),
     ("GATEWAY_CANCEL_PER_S", "inf", "GATEWAY_CANCEL_PER_S must be a number"),
+    ("GATEWAY_CANCEL_PER_S", "0", "GATEWAY_CANCEL_PER_S must be > 0"),
+    ("GATEWAY_REQUESTS_BURST", "0", "GATEWAY_REQUESTS_BURST must be >= 1"),
+    ("GATEWAY_CREATE_BURST", "0", "GATEWAY_CREATE_BURST must be >= 1"),
 ])
 def test_official_launcher_rejects_bad_numeric_env_without_traceback(name, value, needle):
     r = _run_official({**ENV, name: value})
@@ -1209,6 +1220,79 @@ def test_n_bad_chunked_probe_requests_count_as_exactly_n_malformed(tmp_path):
             if m:
                 total += int(m.group(1))
         assert total == n, (total, n, chunk)
+    finally:
+        p.terminate()
+        p.wait(10)
+
+
+def _headers_then_bad_chunk(port):
+    """Send a complete /healthz with chunked headers, wait for the response, then a bad chunk body."""
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.sendall(b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+        data = b""
+        s.settimeout(2)
+        while b"\r\n\r\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        head, _, rest = data.partition(b"\r\n\r\n")
+        cl = None
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                cl = int(line.split(b":", 1)[1].strip())
+        if cl is not None:
+            while len(rest) < cl:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                rest += chunk
+        try:
+            s.sendall(b"ZZZ\r\n")
+        except OSError:
+            pass
+        try:
+            s.settimeout(0.2)
+            while s.recv(4096):
+                pass
+        except OSError:
+            pass
+        return head.split(b"\r\n", 1)[0]
+
+
+def test_headers_then_bad_chunked_body_is_quiet_on_both_ports(tmp_path):
+    """A-5c: 200 requests per port (headers, wait for 200, then a bad chunk) stay quiet.
+
+    All loggers, including asyncio, must add 5 or fewer lines; malformed is counted once
+    per request; a signed request still returns 200 afterwards.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_REFUSAL_LOG_S": "2", "GATEWAY_HEADER_TIMEOUT_S": "30"})
+    log = tmp_path / "gateway.log"
+    main_port = int(base.rsplit(":", 1)[1])
+    probe_port = int(p.probe_base.rsplit(":", 1)[1])
+    n = 200
+    try:
+        for port in (main_port, probe_port):
+            mark = len(log.read_text())
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                statuses = list(pool.map(lambda _: _headers_then_bad_chunk(port), range(n)))
+            assert all(s.startswith(b"HTTP/1.1 200") for s in statuses), set(statuses)
+            time.sleep(2.3)
+            chunk = log.read_text()[mark:]
+            assert "Fatal error: protocol.data_received() call failed" not in chunk, chunk
+            assert "Traceback" not in chunk, chunk
+            lines = [ln for ln in chunk.splitlines() if ln.strip()]
+            assert len(lines) <= 5, (len(lines), lines)
+            import re
+            total = 0
+            for ln in chunk.splitlines():
+                m = re.search(r"\bmalformed:(\d+)", ln)
+                if m:
+                    total += int(m.group(1))
+            assert total == n, (total, n, chunk)
+        assert httpx.get(base + "/", auth=KEY, timeout=5).status_code == 200
     finally:
         p.terminate()
         p.wait(10)

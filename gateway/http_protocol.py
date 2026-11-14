@@ -1,4 +1,5 @@
 """H11 protocol with a request-header timeout (uvicorn 0.54.0 does not time out idle or partial-header connections)."""
+import h11
 from uvicorn.protocols.http.h11_impl import H11Protocol
 
 # Set by python -m gateway after the env is validated (seconds).
@@ -19,7 +20,18 @@ class HeaderTimeoutProtocol(H11Protocol):
 
     def data_received(self, data):
         cycle_before = self.cycle
-        super().data_received(data)
+        try:
+            super().data_received(data)
+        except h11.LocalProtocolError as exc:
+            # send_400_response after a keep-alive reply: h11 is already MUST_CLOSE.
+            if not str(exc).startswith("can't handle event type Response"):
+                raise
+            # The uvicorn.error filter already counted "Invalid HTTP request received."
+            # as malformed once; do not count again. Close so asyncio does not log
+            # "Fatal error: protocol.data_received() call failed" plus a traceback.
+            if self.transport is not None and not self.transport.is_closing():
+                self.transport.close()
+            return
         if self.cycle is not None and self.cycle is not cycle_before:
             self._cancel_header_timer()
 
