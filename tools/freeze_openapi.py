@@ -1,6 +1,8 @@
 """Regenerate openapi.yaml from the app. Needs any valid public keys file, e.g.:
     { echo '# kimiclaw-public-keys v1'; python tools/new_api_key.py --caller dev --mint | tail -1; } > /tmp/k && GATEWAY_PUBLIC_KEYS_FILE=/tmp/k python tools/freeze_openapi.py
 
+Optional argument: output path (default: openapi.yaml in the repo root).
+
 Importing this module does not write openapi.yaml and does not mark the process launched.
 """
 import os
@@ -18,13 +20,14 @@ def app(*_a, **_k):
 
 def main() -> None:
     sys.path.insert(0, ROOT)
-    import yaml
     from gateway.launcher_guard import mark_launched
+    mark_launched()
+    import yaml
     from gateway.main import create_app
 
-    mark_launched()
     application = create_app()
-    with open(os.path.join(ROOT, "openapi.yaml"), "w") as f:
+    dest = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "openapi.yaml")
+    with open(dest, "w") as f:
         yaml.safe_dump(application.openapi(), f, sort_keys=False, allow_unicode=True)
 
 

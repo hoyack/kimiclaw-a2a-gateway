@@ -12,6 +12,8 @@ import os
 import time
 from urllib.parse import urlparse
 
+from gateway.env import _env_num
+
 
 from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
@@ -29,7 +31,7 @@ def _log_path(value) -> str:
 
 TELEMETRY_DIR = os.environ.get("GATEWAY_TELEMETRY_DIR", "telemetry")
 OTLP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
-FILE_BYTES = int(float(os.environ.get("GATEWAY_TELEMETRY_FILE_MB", "10")) * 1_000_000)
+FILE_BYTES = int(_env_num("GATEWAY_TELEMETRY_FILE_MB", "10", float, gt=0) * 1_000_000)
 BACKUPS = 4
 
 tracer = trace.get_tracer("kimiclaw")

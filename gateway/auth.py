@@ -18,6 +18,7 @@ from gateway.config import (BODY_IDLE_TIMEOUT_S, BODY_READ_TIMEOUT_S, CANCEL_PER
                             GET_PER_S, KEY_ID_RE, LOG, MAX_BODY, MAX_NONCES_PER_CALLER, READS_PER_CALLER,
                             REQUESTS_BURST, REQUESTS_PER_S, SIGNATURE_FUTURE_S, SIGNATURE_PAST_S, PUBLIC_KEYS,
                             log_safe, log_path)
+from gateway.env import _env_num
 
 PUBLIC_PATHS = {"/.well-known/agent.json", "/healthz", "/readyz"}
 HEADERS = ("x-kc-key-id", "x-kc-timestamp", "x-kc-nonce", "x-kc-signature", "x-kc-content-sha256")
@@ -31,7 +32,7 @@ READ_FAILURES = {"too_large": (413, "request body too large"), "read_deadline": 
                  "read_idle": (408, "request timeout"), "client_disconnected": (400, "client disconnected")}
 QUIET_READS = {"pool_full", "read_deadline", "read_idle"}  # 429/408: aggregate, no per-request log or trace
 _refusals: dict[str, dict] = {}  # pool_name -> {reasons, task}
-REFUSAL_LOG_S = float(os.environ.get("GATEWAY_REFUSAL_LOG_S", "1"))
+REFUSAL_LOG_S = _env_num("GATEWAY_REFUSAL_LOG_S", "1", float, lo=0)
 
 
 # rpc method -> (tokens per second, bucket size)

@@ -440,6 +440,7 @@ def _assert_launch_refused(kind, argv, extra_env=None):
     ("uvicorn", ["--factory", "gateway.__main__:create_app"], None),
     ("uvicorn", ["--factory", "gateway.__main__:create_app", "--workers", "2"], None),
     ("gunicorn", ["-k", "uvicorn.workers.UvicornWorker", "gateway.__main__:create_app()"], None),
+    ("gunicorn", ["-c", "python:tests.conftest", "-k", "uvicorn.workers.UvicornWorker", "gateway.main:create_app()"], None),
     ("hypercorn", ["gateway.__main__:create_app()"], None),
     ("uvicorn", ["tools.freeze_openapi:app"], None),
     ("py-uvicorn", ["-u", _venv_script("uvicorn"), "app:app", "--workers", "2"], None),
@@ -464,6 +465,7 @@ def _assert_launch_refused(kind, argv, extra_env=None):
     "gateway.__main__:create_app --factory",
     "gateway.__main__:create_app --factory --workers 2",
     "gunicorn UvicornWorker gateway.__main__:create_app()",
+    "gunicorn -c python:tests.conftest gateway.main:create_app()",
     "hypercorn gateway.__main__:create_app()",
     "uvicorn tools.freeze_openapi:app",
     "python -u $(which uvicorn) --workers 2",
@@ -481,6 +483,102 @@ def test_unsupported_uvicorn_launches_are_refused(kind, argv, extra_env):
     if kind in ("console", "py-uvicorn") and not os.path.exists(_venv_script("uvicorn")):
         pytest.skip("uvicorn console script is not installed")
     _assert_launch_refused(kind, argv, extra_env)
+
+
+# The gateway's own line. Supervisors may still print "Uvicorn running" / "Listening at"
+# / "Running on" before refused workers exit; that is not a serve (CTO: exit 0 but never serve).
+_GATEWAY_SERVING = "main port is serving on"
+
+
+def _http_response_from(port):
+    """True if anything on the port completed an HTTP response (the app served)."""
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}/", auth=KEY, timeout=0.2)
+        r.read()
+        return True
+    except httpx.HTTPError:
+        pass
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=0.2)
+        r.read()
+        return True
+    except httpx.HTTPError:
+        return False
+
+
+def _assert_never_listens(cmd, ports, extra_env=None, timeout=8):
+    """While the process runs, nothing serves on the given ports and the gateway never starts.
+
+    Does not assert the exit code: some exotic forms exit 0 after the workers refuse.
+    A supervisor may bind and log "Uvicorn running" / "Listening at" before workers
+    refuse; connect() alone is not a serve. No new argv parsing is added to hide those lines.
+    """
+    env = {**ENV, **(extra_env or {})}
+    proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    served = False
+    try:
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None and time.monotonic() < deadline:
+            if any(_http_response_from(p) for p in ports):
+                served = True
+                break
+            time.sleep(0.05)
+        if proc.poll() is None:
+            proc.kill()
+        stdout, stderr = proc.communicate(timeout=3)
+    except Exception:
+        proc.kill()
+        raise
+    out = (stderr or "") + (stdout or "")
+    assert not served, out
+    assert not any(_http_response_from(p) for p in ports), out
+    assert _GATEWAY_SERVING not in out, out
+    return out
+
+
+@pytest.mark.parametrize("kind", [
+    "python -c uvicorn.main() --workers 2",
+    "python -c hypercorn.main() -w 2",
+    "python -c runpy.run_module uvicorn --workers 2",
+    "python -muvicorn --workers 2",
+    "symlinked uvicorn console script",
+    "gunicorn -c python:tests.conftest gateway.main:create_app()",
+])
+def test_exotic_launch_forms_never_listen(kind, tmp_path):
+    """Accepted: exit 0 but never serve (CTO). No new argv parsing in the guard."""
+    from conftest import free_port
+    port, probe = free_port(), free_port()
+    env = {"GATEWAY_PROBE_PORT": str(probe)}
+    if kind == "python -c uvicorn.main() --workers 2":
+        cmd = [sys.executable, "-c", "import uvicorn; uvicorn.main()",
+               "app:app", "--workers", "2", "--host", "127.0.0.1", "--port", str(port)]
+    elif kind == "python -c hypercorn.main() -w 2":
+        pytest.importorskip("hypercorn")
+        cmd = [sys.executable, "-c", "from hypercorn.__main__ import main; raise SystemExit(main())",
+               "gateway.__main__:create_app()", "-w", "2", "-b", f"127.0.0.1:{port}"]
+    elif kind == "python -c runpy.run_module uvicorn --workers 2":
+        cmd = [sys.executable, "-c", "import runpy; runpy.run_module('uvicorn', run_name='__main__')",
+               "app:app", "--workers", "2", "--host", "127.0.0.1", "--port", str(port)]
+    elif kind == "python -muvicorn --workers 2":
+        cmd = [sys.executable, "-muvicorn", "app:app", "--workers", "2",
+               "--host", "127.0.0.1", "--port", str(port)]
+    elif kind == "symlinked uvicorn console script":
+        exe = _venv_script("uvicorn")
+        if not os.path.exists(exe):
+            pytest.skip("uvicorn console script is not installed")
+        link = tmp_path / "uvicorn"
+        link.symlink_to(exe)
+        cmd = [str(link), "app:app", "--workers", "2", "--host", "127.0.0.1", "--port", str(port)]
+    elif kind == "gunicorn -c python:tests.conftest gateway.main:create_app()":
+        pytest.importorskip("gunicorn")
+        exe = _venv_script("gunicorn")
+        if not os.path.exists(exe):
+            pytest.skip(f"{exe} is not installed")
+        cmd = [exe, "-c", "python:tests.conftest", "-k", "uvicorn.workers.UvicornWorker",
+               "gateway.main:create_app()", "-b", f"127.0.0.1:{port}"]
+    else:
+        raise ValueError(kind)
+    _assert_never_listens(cmd, (port, probe), extra_env=env)
 
 
 def test_import_app_under_bash_does_not_signal_the_shell():
@@ -558,6 +656,31 @@ def test_official_launcher_rejects_bad_create_burst_without_traceback():
     r = _run_official({**ENV, "GATEWAY_CREATE_BURST": "abc"})
     out = r.stderr + r.stdout
     assert r.returncode != 0 and "GATEWAY_CREATE_BURST must be an integer" in out and "Traceback" not in out, out
+
+
+@pytest.mark.parametrize("name,value,needle", [
+    ("GATEWAY_REFUSAL_LOG_S", "-1", "GATEWAY_REFUSAL_LOG_S must be >= 0"),
+    ("GATEWAY_TELEMETRY_FILE_MB", "0", "GATEWAY_TELEMETRY_FILE_MB must be > 0"),
+    ("GATEWAY_GET_PER_S", "nan", "GATEWAY_GET_PER_S must be a number"),
+    ("GATEWAY_GET_PER_S", "inf", "GATEWAY_GET_PER_S must be a number"),
+    ("GATEWAY_CANCEL_PER_S", "nan", "GATEWAY_CANCEL_PER_S must be a number"),
+    ("GATEWAY_CANCEL_PER_S", "inf", "GATEWAY_CANCEL_PER_S must be a number"),
+])
+def test_official_launcher_rejects_bad_numeric_env_without_traceback(name, value, needle):
+    r = _run_official({**ENV, name: value})
+    out = r.stderr + r.stdout
+    assert r.returncode != 0 and needle in out and "Traceback" not in out, out
+
+
+def test_freeze_openapi_script_matches_committed_yaml(tmp_path):
+    committed = Path(ROOT, "openapi.yaml").read_bytes()
+    dest = tmp_path / "openapi.yaml"
+    r = subprocess.run(
+        [sys.executable, "tools/freeze_openapi.py", str(dest)],
+        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr + r.stdout
+    assert dest.read_bytes() == committed
+    assert Path(ROOT, "openapi.yaml").read_bytes() == committed
 
 
 def test_importing_freeze_openapi_does_not_write_openapi_yaml():
@@ -1062,6 +1185,30 @@ def test_a_thousand_bad_chunked_requests_on_each_port_are_quiet(tmp_path):
         assert "Traceback" not in chunk, chunk
         lines = [ln for ln in chunk.splitlines() if ln.strip()]
         assert len(lines) <= 5, (len(lines), lines)
+    finally:
+        p.terminate()
+        p.wait(10)
+
+
+def test_n_bad_chunked_probe_requests_count_as_exactly_n_malformed(tmp_path):
+    """One bad-chunked probe request is counted once: N requests give malformed:N."""
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_REFUSAL_LOG_S": "1", "GATEWAY_HEADER_TIMEOUT_S": "30"})
+    log = tmp_path / "gateway.log"
+    probe_port = int(p.probe_base.rsplit(":", 1)[1])
+    n = 50
+    payload = b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\n"
+    try:
+        mark = len(log.read_text())
+        _raw_requests(probe_port, payload, n)
+        time.sleep(1.3)
+        chunk = log.read_text()[mark:]
+        import re
+        total = 0
+        for ln in chunk.splitlines():
+            m = re.search(r"\bmalformed:(\d+)", ln)
+            if m:
+                total += int(m.group(1))
+        assert total == n, (total, n, chunk)
     finally:
         p.terminate()
         p.wait(10)

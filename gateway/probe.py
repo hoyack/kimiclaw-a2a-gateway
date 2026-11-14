@@ -32,9 +32,9 @@ async def _send(send, status: int, body: dict):
     except (h11.LocalProtocolError, RuntimeError) as exc:
         if not _already_sent(exc):
             raise
-        from gateway.auth import note_quiet
+        # uvicorn already logged "Invalid HTTP request received.", which the
+        # protocol filter counts as malformed; do not count this swallow again.
         note_incomplete_drop()
-        note_quiet("http", "malformed")
 
 
 def note_incomplete_drop() -> None:

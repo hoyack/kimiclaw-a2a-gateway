@@ -23,7 +23,7 @@ Docker: the committed Dockerfile CMD is still `["uvicorn", "app:app", "--host", 
 
 CMD must be `["python", "-m", "gateway"]` (optionally `--host 0.0.0.0 --port 8000`). That is the only supported launcher: it pins `workers=1` and `ws=none` (so a websocket upgrade cannot bypass the header timer), applies `KIMICLAW_LIMIT_CONCURRENCY`, starts the probe listener immediately, and arms the request-header timeout. Do not pass `--limit-concurrency` or `--workers`. `uvicorn app:app` and `uvicorn --factory gateway.main:create_app` are refused.
 
-Do not run uvicorn, gunicorn, or hypercorn as PID 1 (for example as a container entrypoint without a supervisor). The kernel drops default-action signals sent to PID 1, so a refused `uvicorn --workers 2` process exits 0 after two refusal lines, `uvicorn --reload` hangs, and gunicorn halts with exit code 3. In every case the process never serves. The supported CMD is `["python", "-m", "gateway"]`.
+Do not run uvicorn, gunicorn, or hypercorn as PID 1 (for example as a container entrypoint without a supervisor). The kernel drops default-action signals sent to PID 1, so a refused `uvicorn --workers 2` process exits 0 after two refusal lines, `uvicorn --reload` hangs, gunicorn halts with exit code 3, and `hypercorn -w 2` exits 0. In every case the process never serves. The supported CMD is `["python", "-m", "gateway"]`.
 
 Publish two ports:
 

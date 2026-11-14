@@ -6,9 +6,12 @@ import httpx, pytest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 from gateway.launcher_guard import mark_launched  # noqa: E402
-mark_launched()
 from sign_request import Signer, load_private_key  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402
+
+
+def pytest_configure(config):
+    mark_launched()
 
 TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN: outbound notify credential only
 CALLERS = {"a1a1a1a1a1": "alice", "b2b2b2b2b2": "bob", "a1a1a1a1a3": "alice"}  # a1a1a1a1a3: alice's rotation key
