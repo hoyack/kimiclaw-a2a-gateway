@@ -12,7 +12,7 @@ from conftest import KEY, KEYS_FILE, ROOT, start_gateway
 from sign_request import signed_headers
 
 ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_", "WEB_"))},
-       "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE}
+       "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "KIMICLAW_LIMIT_CONCURRENCY": "1024"}
 
 
 def py(prog, **env):
@@ -101,3 +101,39 @@ def test_oversized_content_length_is_refused_before_the_body_is_read(base):
         s.sendall((f"POST / HTTP/1.1\r\nHost: x\r\n{signed}"
                    "Content-Type: application/json\r\nContent-Length: 2000000\r\n\r\n").encode())
         assert s.recv(200).startswith(b"HTTP/1.1 413")
+
+
+@pytest.mark.parametrize("value,needle", [
+    (None, "KIMICLAW_LIMIT_CONCURRENCY is not set"),
+    ("", "KIMICLAW_LIMIT_CONCURRENCY is not set"),
+    ("nope", "must be an integer"),
+    ("128.0", "must be an integer"),
+    ("63", "from 64 to 4096"),
+    ("4097", "from 64 to 4096"),
+])
+def test_refuses_to_start_without_a_valid_concurrency_cap(value, needle):
+    env = {k: v for k, v in ENV.items() if k != "KIMICLAW_LIMIT_CONCURRENCY"}
+    if value is not None:
+        env["KIMICLAW_LIMIT_CONCURRENCY"] = value
+    r = subprocess.run([sys.executable, "-c", "import gateway.main"], cwd=ROOT, env=env,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode != 0 and needle in r.stderr
+
+
+def test_a_valid_concurrency_cap_is_passed_to_uvicorn_and_logged(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {"KIMICLAW_LIMIT_CONCURRENCY": "64"})
+    try:
+        log = (tmp_path / "gateway.log").read_text()
+        assert "uvicorn limit_concurrency=64" in log
+        port = int(base.rsplit(":", 1)[1])
+        held = []
+        for _ in range(64):
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            s.sendall(b"GET /healthz HTTP/1.1\r\nHost: x\r\n")  # incomplete, stays open
+            held.append(s)
+        r = httpx.get(base + "/healthz", timeout=5)
+        assert r.status_code == 503, r.status_code
+        [s.close() for s in held]
+        assert httpx.get(base + "/healthz", timeout=5).status_code == 200
+    finally:
+        p.terminate(); p.wait(5)

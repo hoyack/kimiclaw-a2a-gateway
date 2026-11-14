@@ -173,7 +173,7 @@ def start_app(app_dir, n8n_port, extra=None):
                                                                              serialization.PublicFormat.Raw)
         f.write("# kimiclaw-public-keys v1\n")
         f.write(f"{SIGNER.key_id} golden {base64.urlsafe_b64encode(raw).rstrip(b'=').decode()}\n")
-    env.update(KIMICLAW_TOKEN=TOKEN, GATEWAY_PUBLIC_KEYS_FILE=keys,
+    env.update(KIMICLAW_TOKEN=TOKEN, KIMICLAW_LIMIT_CONCURRENCY="1024", GATEWAY_PUBLIC_KEYS_FILE=keys,
                GATEWAY_CREATE_PER_MIN="100000", GATEWAY_CREATE_BURST="1000", GATEWAY_GET_PER_S="1000",
                GATEWAY_CANCEL_PER_S="1000", GATEWAY_REQUESTS_PER_S="100000", GATEWAY_REQUESTS_BURST="100000", PATH=os.path.join(HERE, "fakebin") + os.pathsep + env["PATH"],
                HOME=tempfile.mkdtemp(prefix="golden-"),

@@ -23,17 +23,18 @@ def test_healthz_readyz(gw_factory):
     assert c.get("/readyz").json() == {"status": "ready"}  # fake openclaw is on PATH
 
 
-def test_healthz_public_minimal_readyz_protected(gw_factory):
+def test_healthz_and_readyz_are_public_and_skip_auth(gw_factory):
     import httpx
     base = str(gw_factory().base_url)
     for h in ({}, {"X-KC-Key-Id": "a1a1a1a1a1", "X-KC-Signature": "0" * 64}):
         r = httpx.get(base + "/healthz", headers=h)
         assert (r.status_code, r.json()) == (200, {"status": "ok"})
         r = httpx.get(base + "/readyz", headers=h)
-        assert (r.status_code, r.json()) == (401, {"error": "unauthorized"})
-    for m in ("POST", "PUT", "DELETE"):  # only GET /healthz exists; other methods are not a back door
+        assert (r.status_code, r.json()) == (200, {"status": "ready"})
+    for m in ("POST", "PUT", "DELETE"):  # only GET /healthz and GET /readyz exist; other methods are not a back door
         assert httpx.request(m, base + "/healthz").status_code == 405
-    for p in ("/healthz/", "/healthz/x", "/openapi.json", "/redoc"):
+        assert httpx.request(m, base + "/readyz").status_code == 405
+    for p in ("/healthz/", "/healthz/x", "/readyz/", "/readyz/x", "/openapi.json", "/redoc"):
         r = httpx.get(base + p)
         assert (r.status_code, r.json()) == (401, {"error": "unauthorized"})
 
@@ -155,7 +156,7 @@ def _boot_fails(tmp_path, token_env):
     app = tmp_path / "app"
     shutil.copytree(ROOT, app, ignore=shutil.ignore_patterns(".venv", ".git", ".env", "telemetry", "__pycache__"))
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
-    env.update({"GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, **token_env})
+    env.update({"GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "KIMICLAW_LIMIT_CONCURRENCY": "1024", **token_env})
     r = subprocess.run([sys.executable, "-c", "import app"], cwd=app, env=env, capture_output=True, text=True, timeout=60)
     return r
 

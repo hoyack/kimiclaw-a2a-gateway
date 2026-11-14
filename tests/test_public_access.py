@@ -47,6 +47,7 @@ def test_agent_card_and_healthz_stay_open_while_a_key_is_limited(start):
     assert post(base, GET).status_code == 429
     for h in ({}, {"Authorization": "Bearer wrong"}):
         assert httpx.get(base + "/healthz", headers=h).json() == {"status": "ok"}
+        assert httpx.get(base + "/readyz", headers=h).status_code == 200
         assert httpx.get(base + "/.well-known/agent.json", headers=h).status_code == 200
 
 
@@ -179,9 +180,10 @@ def test_key_id_and_reason_are_logged_never_a_private_key_or_signature(start, tm
     out = (tmp_path / "gateway.log").read_text()
     logs = (tdir / "logs.jsonl").read_text()
     assert "key_id=a1a1a1a1a1 caller=alice POST /" in out
-    assert "unauthorized reason=unknown_key key_id=eeeeeeeeee" in out
-    assert "unauthorized reason=bad_signature key_id=a1a1a1a1a1" in out
-    assert '"key_id": "a1a1a1a1a1"' in logs and '"key_id": "invalid:eeeeeeeeee"' in logs
+    assert "auth refused" in out and "unknown_key:" in out and "bad_signature:" in out
+    assert "key_id=eeeeeeeeee" not in out
+    assert '"key_id": "a1a1a1a1a1"' in logs
+    assert "eeeeeeeeee" not in logs
     for text in (out, logs):
         assert all(sec not in text for sec in PRIVATE_KEYS.values())
         assert ok.request.headers["x-kc-signature"] not in text and bad.request.headers["x-kc-signature"] not in text
@@ -268,53 +270,184 @@ def _b64(raw: bytes) -> str:
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
-def _weak_cases():
-    from gateway.pubkey import P, SMALL_ORDER
+# Independent Ed25519 arithmetic for E-1 vectors (RFC 8032 constants and formulas).
+# Never imported from gateway.pubkey.
+_P = 2**255 - 19
+_D = (-121665 * pow(121666, -1, _P)) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+_K = (2 * _D) % _P
+
+
+def _ext_add(p, q):
+    x1, y1, z1, t1 = p
+    x2, y2, z2, t2 = q
+    a = (y1 - x1) * (y2 - x2) % _P
+    b = (y1 + x1) * (y2 + x2) % _P
+    c = _K * t1 * t2 % _P
+    d = 2 * z1 * z2 % _P
+    e, f, g, h = (b - a) % _P, (d - c) % _P, (d + c) % _P, (b + a) % _P
+    return e * f % _P, g * h % _P, f * g % _P, e * h % _P
+
+
+def _ext_mul(pt, n):
+    acc = (0, 1, 1, 0)
+    addend = pt
+    while n:
+        if n & 1:
+            acc = _ext_add(acc, addend)
+        addend = _ext_add(addend, addend)
+        n >>= 1
+    return acc
+
+
+def _decode_oncurve(raw: bytes):
+    """RFC 8032 §5.1.3, on-curve only (small-order points are allowed here so tests can build them)."""
+    if len(raw) != 32:
+        return None
+    y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+    if y >= _P:
+        return None
+    x_0 = raw[31] >> 7
+    u = (y * y - 1) % _P
+    v = (_D * y * y + 1) % _P
+    x = (u * pow(v, 3, _P) * pow(u * pow(v, 7, _P), (_P - 5) // 8, _P)) % _P
+    vx2 = (v * x * x) % _P
+    if vx2 == (_P - u) % _P:
+        x = (x * _I) % _P
+        vx2 = (v * x * x) % _P
+    if vx2 != u or (x == 0 and x_0):
+        return None
+    if x_0:
+        x = _P - x
+    return (x, y, 1, x * y % _P)
+
+
+def _encode_point(pt) -> bytes:
+    x, y, z, _t = pt
+    inv = pow(z, -1, _P)
+    xa, ya = x * inv % _P, y * inv % _P
+    out = bytearray(ya.to_bytes(32, "little"))
+    if xa & 1:
+        out[31] |= 0x80
+    return bytes(out)
+
+
+def _sqrt(a):
+    """Square root on p = 5 (mod 8)."""
+    x = pow(a, (_P + 3) // 8, _P)
+    if (x * x) % _P == a:
+        return x
+    x = (x * _I) % _P
+    if (x * x) % _P == a:
+        return x
+    raise ValueError("not a square")
+
+
+def _torsion_points():
+    """The 8 points of the ed25519 8-torsion subgroup, built from the curve equation (no module import).
+
+    An order-8 point satisfies 2P = (x, 0) (order 4), so y² = -x² and x² = (1 + sqrt(1+d)) / d.
+    """
+    disc = _sqrt((1 + _D) % _P)
+    u = ((1 + disc) * pow(_D, -1, _P)) % _P
+    x = _sqrt(u)
+    y = (_I * x) % _P
+    gen = (x, y, 1, x * y % _P)
+    return [_ext_mul(gen, i) for i in range(8)]
+
+
+def _honest_point():
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    raw = (Ed25519PrivateKey.generate().public_key()
+           .public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw))
+    pt = _decode_oncurve(raw)
+    assert pt is not None
+    return pt, raw
+
+
+def _build_weak_cases():
     cases = []
-    labels = {
-        (0).to_bytes(32, "little"): "all-zero",
-        (1).to_bytes(32, "little"): "identity",
-        (P - 1).to_bytes(32, "little"): "y-equals-p-minus-1",
-        P.to_bytes(32, "little"): "noncanonical-y-equals-p",
-        (P + 1).to_bytes(32, "little"): "noncanonical-y-equals-p-plus-1",
-    }
-    for raw in sorted(SMALL_ORDER, key=bytes.hex):
-        cases.append((labels.get(raw, f"small-order-{raw[:4].hex()}"), raw))
+    torsion = _torsion_points()
+    assert len(torsion) == 8
+    # 8T is the identity
+    ident = torsion[0]
+    assert ident[0] == 0 and ident[1] == ident[2]
+    for i, pt in enumerate(torsion):
+        raw = _encode_point(pt)
+        label = "identity" if i == 0 else f"torsion-{i}"
+        cases.append((label, raw))
         signed = raw[:31] + bytes([raw[31] | 0x80])
         if signed != raw:
-            cases.append((labels.get(raw, f"small-order-{raw[:4].hex()}") + "-sign-bit", signed))
-    cases.append(("noncanonical-y-equals-p-plus-2", (P + 2).to_bytes(32, "little")))
+            cases.append((label + "-sign-bit", signed))
+        y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
+        if y + _P < (1 << 255):
+            noncanon = bytearray((y + _P).to_bytes(32, "little"))
+            noncanon[31] = (noncanon[31] & 0x7F) | (raw[31] & 0x80)
+            cases.append((label + "-noncanonical", bytes(noncanon)))
     cases.append(("off-curve-y-equals-2", (2).to_bytes(32, "little")))
+    cases.append(("off-curve-y-equals-3", (3).to_bytes(32, "little")))
+    honest, _ = _honest_point()
+    for i, pt in enumerate(torsion[1:], 1):
+        cases.append((f"mixed-honest-plus-torsion-{i}", _encode_point(_ext_add(honest, pt))))
     return cases
 
 
-@pytest.mark.parametrize("label,raw", _weak_cases(), ids=[c[0] for c in _weak_cases()])
-def test_a_weak_ed25519_public_key_is_refused_at_load(tmp_path, label, raw):
+WEAK_CASES = _build_weak_cases()
+
+
+def _refuse_at_load_and_tool(tmp_path, raw):
     encoded = _b64(raw)
     r = boot(tmp_path, HEADER + f"aaaaaaaaaa mallory {encoded}\n")
-    assert r.returncode != 0 and "GATEWAY_PUBLIC_KEYS_FILE line 2:" in r.stderr, label
+    assert r.returncode != 0 and "GATEWAY_PUBLIC_KEYS_FILE line 2:" in r.stderr
     assert encoded[:16] not in r.stderr and "mallory" not in r.stderr
+    tool = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "new_api_key.py"),
+                           "--caller", "mallory", "--public-key=" + encoded],
+                          capture_output=True, text=True)
+    assert tool.returncode != 0 and encoded not in tool.stderr and encoded not in tool.stdout
+    return encoded
 
 
-def test_a_forged_request_under_a_weak_key_is_refused_because_the_key_never_loads(start, tmp_path):
-    encoded = _b64(bytes(32))
-    weak = tmp_path / "weak.txt"
-    weak.write_text(HEADER + f"aaaaaaaaaa mallory {encoded}\n"); weak.chmod(0o600)
-    assert boot(tmp_path, keys_file=weak).returncode != 0
-    # identity / S=0 would verify any message if this key had loaded; it must not be served
+@pytest.mark.parametrize("label,raw", WEAK_CASES, ids=[c[0] for c in WEAK_CASES])
+def test_a_weak_ed25519_public_key_is_refused_at_load(tmp_path, label, raw):
+    _refuse_at_load_and_tool(tmp_path, raw)
+
+
+def test_a_forged_request_under_each_weak_key_class_is_refused_because_the_key_never_loads(start, tmp_path):
+    """OpenSSL would accept some of these (the identity verifies any message). They must never be served."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    identity = _encode_point(_torsion_points()[0])
+    openssl = Ed25519PublicKey.from_public_bytes(identity)
+    try:
+        openssl.verify(b"\x00" * 64, b"any message")  # some OpenSSL builds accept the identity
+    except Exception:
+        pass  # newer OpenSSL may already reject it; the loader must still refuse
+
     base = start()
-    h = {"X-KC-Key-Id": "aaaaaaaaaa", "X-KC-Timestamp": str(int(time.time())),
-         "X-KC-Nonce": "n" * 24, "X-KC-Signature": "0" * 128, "Content-Type": "application/json"}
-    r = httpx.post(base + "/", content=b"{}", headers=h)
-    assert r.status_code == 401 and r.json() == {"error": "unauthorized"}
-    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "new_api_key.py"),
-                        "--caller", "mallory", "--public-key=" + encoded],
-                       capture_output=True, text=True)
-    assert r.returncode != 0 and encoded not in r.stderr and encoded not in r.stdout
+    # one of each class, plus every mixed key, is enough for the request-path check
+    # (load/tool refusal is covered for every vector by test_a_weak_ed25519_public_key_is_refused_at_load)
+    picked, classes = set(), []
+    for label, raw in WEAK_CASES:
+        kind = "mixed" if label.startswith("mixed-") else label.split("-")[0]
+        if kind == "mixed" or kind not in picked:
+            classes.append((label, raw))
+            picked.add(kind)
+    kinds = {"mixed" if k.startswith("mixed-") else k.split("-")[0] for k, _ in classes}
+    assert {"identity", "torsion", "off"} <= kinds
+    assert any(k.startswith("mixed-") for k, _ in classes)
+    for label, raw in classes:
+        _refuse_at_load_and_tool(tmp_path, raw)
+        h = {"X-KC-Key-Id": "aaaaaaaaaa", "X-KC-Timestamp": str(int(time.time())),
+             "X-KC-Nonce": "n" * 24, "X-KC-Content-SHA256": "0" * 64,
+             "X-KC-Signature": "0" * 128, "Content-Type": "application/json"}
+        r = httpx.post(base + "/", content=b"{}", headers=h)
+        assert r.status_code == 401 and r.json() == {"error": "unauthorized"}, label
+        assert _b64(raw) not in r.text
 
 
 @pytest.mark.parametrize("key_id", [
     "aaaaaaaa", "a1a1a1a1a", "a1a1a1a1a1a", "A1A1A1A1A1", "testkey01", "012345678g",
+    "kc_a1a1a1a1", "kc_0123456789",
 ])
 def test_the_loader_accepts_only_the_10_lowercase_hex_key_id_the_tool_mints(tmp_path, key_id):
     r = boot(tmp_path, HEADER + f"{key_id} alice {S1}\n")

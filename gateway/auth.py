@@ -1,13 +1,16 @@
 """Ed25519-signed requests (X-KC-* headers, callers' public keys from GATEWAY_PUBLIC_KEYS_FILE) and per-key token buckets."""
 import asyncio
+import contextvars
 import hashlib
 import heapq
+import logging
 import math
+import os
 import re
 import time
 
 from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -18,19 +21,34 @@ from gateway.config import (BODY_IDLE_TIMEOUT_S, BODY_READ_TIMEOUT_S, CANCEL_PER
                             REQUESTS_BURST, REQUESTS_PER_S, SIGNATURE_FUTURE_S, SIGNATURE_PAST_S, PUBLIC_KEYS,
                             log_safe)
 
-PUBLIC_PATHS = {"/.well-known/agent.json", "/healthz"}
-HEADERS = ("x-kc-key-id", "x-kc-timestamp", "x-kc-nonce", "x-kc-signature")
+PUBLIC_PATHS = {"/.well-known/agent.json", "/healthz", "/readyz"}
+HEADERS = ("x-kc-key-id", "x-kc-timestamp", "x-kc-nonce", "x-kc-signature", "x-kc-content-sha256")
 TIMESTAMP_RE = re.compile(r"[0-9]{1,12}")
 NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 SIGNATURE_RE = re.compile(r"[0-9a-f]{128}")
-DUMMY_KEY = Ed25519PrivateKey.generate().public_key()  # unknown key_ids pay for the same verify as a wrong signature
+CONTENT_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 STARTED_S = int(time.time())  # nonces don't survive a restart; reject timestamps at or before STARTED_S + FUTURE_S
-MAX_UNKNOWN_READS = 32
-_reads: dict[str, int] = {}  # pre-auth body reads in progress: "" = unknown key_ids (shared), else per caller
+_reads: dict[str, int] = {}  # in-progress body reads per caller (only after a valid signature)
 READ_FAILURES = {"too_large": (413, "request body too large"), "read_deadline": (408, "request timeout"),
                  "read_idle": (408, "request timeout"), "client_disconnected": (400, "client disconnected")}
-QUIET_READS = {"pool_full", "read_deadline", "read_idle"}  # 503/429/408: aggregate, no per-request log or trace
+QUIET_READS = {"pool_full", "read_deadline", "read_idle"}  # 429/408: aggregate, no per-request log or trace
 _refusals: dict[str, dict] = {}  # pool_name -> {reasons, task}
+REFUSAL_LOG_S = float(os.environ.get("GATEWAY_REFUSAL_LOG_S", "1"))
+_quiet_log = contextvars.ContextVar("kc_quiet_log", default=False)
+
+
+class _SkipQuietAccess(logging.Filter):
+    """Drop uvicorn access-log lines for quiet refusals (precheck 401s and pool 429/408)."""
+
+    def filter(self, record):
+        return not _quiet_log.get()
+
+
+def install_access_log_filter():
+    log = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _SkipQuietAccess) for f in log.filters):
+        log.addFilter(_SkipQuietAccess())
+
 
 # rpc method -> (tokens per second, bucket size)
 LIMITS = {
@@ -65,10 +83,9 @@ def nonce_quota_wait(seen: set[str], expiry: list[tuple[int, str]]) -> int:
     return max(1, math.ceil(expiry[0][0] - time.time()))
 
 
-async def hash_body(request: Request, keep: bool) -> tuple[str, bytearray] | str:
-    """(sha256 hex, body) hashed chunk by chunk; the bytes are kept only if keep, so an unknown key_id costs one chunk
-    of memory. Else a READ_FAILURES reason: over MAX_BODY, past the total deadline, idle too long between chunks, or
-    the client went away."""
+async def hash_body(request: Request) -> tuple[str, bytearray] | str:
+    """(sha256 hex, body) hashed chunk by chunk. Else a READ_FAILURES reason: over MAX_BODY, past the total
+    deadline, idle too long between chunks, or the client went away."""
     length = request.headers.get("content-length", "")
     if length.isdigit() and int(length) > MAX_BODY:
         return "too_large"
@@ -87,8 +104,7 @@ async def hash_body(request: Request, keep: bool) -> tuple[str, bytearray] | str
                 if size > MAX_BODY:
                     return "too_large"
                 digest.update(chunk)
-                if keep:
-                    body += chunk
+                body += chunk
     except TimeoutError:
         return "read_deadline"
     except ClientDisconnect:
@@ -127,22 +143,22 @@ def rate_limited(wait: int) -> JSONResponse:
     return JSONResponse({"error": "rate limited"}, status_code=429, headers={"Retry-After": str(wait)})
 
 
-def unauthorized(request: Request, key_id: str, reason: str) -> JSONResponse:
-    """A header value that isn't shaped like a key_id is never logged (it could be a misplaced private key)."""
-    shown = key_id if KEY_ID_RE.fullmatch(key_id) else ("malformed" if key_id else "-")
-    LOG.warning("unauthorized reason=%s key_id=%s path=%s", reason, shown, log_safe(request.url.path))
-    request.state.key_id = f"invalid:{shown}" if key_id else "none"
+def unauthorized() -> JSONResponse:
+    """Byte-identical generic 401 for every pre-body and body-hash refusal."""
     return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
 def emit_refusals(pool_name: str, reasons: dict[str, int]):
     count = sum(reasons.values())
     parts = ",".join(f"{k}:{v}" for k, v in sorted(reasons.items()))
-    LOG.warning("read refused pool=%s count=%d reasons=%s", pool_name, count, parts)
+    if pool_name == "precheck":
+        LOG.warning("auth refused count=%d reasons=%s", count, parts)
+    else:
+        LOG.warning("read refused pool=%s count=%d reasons=%s", pool_name, count, parts)
 
 
 async def _flush_refusals(pool_name: str):
-    await asyncio.sleep(1)
+    await asyncio.sleep(max(0.0, REFUSAL_LOG_S))
     rec = _refusals.get(pool_name)
     if rec is None:
         return
@@ -155,62 +171,60 @@ async def _flush_refusals(pool_name: str):
 
 
 def note_refusal(request: Request, pool_name: str, reason: str):
-    """503/429/408 from the read pools: one log line per pool per second, no per-request trace."""
+    """Quiet refusal: one aggregated log line per pool per interval, no per-request log, trace, or access log."""
     request.state.quiet_read = True
+    _quiet_log.set(True)
     rec = _refusals.setdefault(pool_name, {"reasons": {}, "task": None})
     rec["reasons"][reason] = rec["reasons"].get(reason, 0) + 1
+    if REFUSAL_LOG_S <= 0:
+        reasons, rec["reasons"] = rec["reasons"], {}
+        if reasons:
+            emit_refusals(pool_name, reasons)
+        return
     if rec["task"] is None:
         rec["task"] = asyncio.get_running_loop().create_task(_flush_refusals(pool_name))
+
+
+def quiet_unauthorized(request: Request, reason: str) -> JSONResponse:
+    note_refusal(request, "precheck", reason)
+    return unauthorized()
+
+
+# rpc method -> (tokens per second, bucket size) already defined above
 
 
 async def signed_auth(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
         return await call_next(request)
     values = [request.headers.getlist(h) for h in HEADERS]
-    key_id, timestamp, nonce, signature = (v[0] if v else "" for v in values)
+    key_id, timestamp, nonce, signature, body_sha256 = (v[0] if v else "" for v in values)
+    # 1. header shape
     if any(len(v) > 1 for v in values):
-        return unauthorized(request, key_id, "duplicate_header")
-    if not (key_id and timestamp and nonce and signature):
-        return unauthorized(request, key_id, "missing_header")
+        return quiet_unauthorized(request, "duplicate_header")
+    if not (key_id and timestamp and nonce and signature and body_sha256):
+        return quiet_unauthorized(request, "missing_header")
     if not (KEY_ID_RE.fullmatch(key_id) and TIMESTAMP_RE.fullmatch(timestamp) and NONCE_RE.fullmatch(nonce)
-            and SIGNATURE_RE.fullmatch(signature)):
-        return unauthorized(request, key_id, "malformed_header")
+            and SIGNATURE_RE.fullmatch(signature) and CONTENT_SHA256_RE.fullmatch(body_sha256)):
+        return quiet_unauthorized(request, "malformed_header")
+    # 2. timestamp window and restart rule (before any key lookup)
     if not -SIGNATURE_FUTURE_S <= time.time() - int(timestamp) <= SIGNATURE_PAST_S:
-        return unauthorized(request, key_id, "stale_timestamp")
+        return quiet_unauthorized(request, "stale_timestamp")
     if int(timestamp) <= STARTED_S + SIGNATURE_FUTURE_S:
-        return unauthorized(request, key_id, "stale_after_restart")
-    caller, key = PUBLIC_KEYS.get(key_id, (None, DUMMY_KEY))
-    pool = caller or ""
-    pool_name = "caller" if caller else "unknown"
+        return quiet_unauthorized(request, "stale_after_restart")
+    # 3. key lookup. Unknown key_ids are refused here; there is no dummy verify.
+    found = PUBLIC_KEYS.get(key_id)
+    if found is None:
+        return quiet_unauthorized(request, "unknown_key")
+    caller, key = found
     request.state.key_id = f"unverified:{key_id}"
-    if _reads.get(pool, 0) >= (READS_PER_CALLER if caller else MAX_UNKNOWN_READS):
-        note_refusal(request, pool_name, "pool_full")
-        if caller:
-            return rate_limited(1)
-        return JSONResponse({"error": "busy"}, status_code=503, headers={"Retry-After": "1"})
-    _reads[pool] = _reads.get(pool, 0) + 1
-    try:
-        hashed = await hash_body(request, keep=caller is not None)
-    finally:
-        _reads[pool] -= 1
-    if isinstance(hashed, str):
-        if hashed in QUIET_READS:
-            note_refusal(request, pool_name, hashed)
-        else:
-            LOG.warning("read failed pool=%s reason=%s key_id=%s", pool_name, hashed, key_id)
-        status, error = READ_FAILURES[hashed]
-        return JSONResponse({"error": error}, status_code=status)
-    body_sha256, body = hashed
     message = canonical(request.method, request.scope["raw_path"], request.scope["query_string"], timestamp, nonce,
                         body_sha256, key_id)
-    matches = verified(key, signature, message)
-    if caller is None:
-        return unauthorized(request, key_id, "unknown_key")
-    if not matches:
-        return unauthorized(request, key_id, "bad_signature")
+    if not verified(key, signature, message):
+        return quiet_unauthorized(request, "bad_signature")
+    # nonce is consumed at verification; quota and the general bucket follow a valid verify
     seen, expiry = live_nonces(caller)
     if nonce in seen:
-        return unauthorized(request, key_id, "replayed_nonce")
+        return quiet_unauthorized(request, "replayed_nonce")
     wait = nonce_quota_wait(seen, expiry) or take((caller, ""), REQUESTS_PER_S, REQUESTS_BURST)
     if wait:
         LOG.warning("rate limited key_id=%s caller=%s live_nonces=%d retry_after=%d", key_id, caller, len(seen), wait)
@@ -220,6 +234,25 @@ async def signed_auth(request: Request, call_next):
     heapq.heappush(expiry, (int(timestamp) + SIGNATURE_PAST_S, nonce))
     request.state.key_id = key_id
     request.state.caller = caller
+    # 4. only a verified request may take this caller's reserved read slot
+    if _reads.get(caller, 0) >= READS_PER_CALLER:
+        note_refusal(request, "caller", "pool_full")
+        return rate_limited(1)
+    _reads[caller] = _reads.get(caller, 0) + 1
+    try:
+        hashed = await hash_body(request)
+    finally:
+        _reads[caller] -= 1
+    if isinstance(hashed, str):
+        if hashed in QUIET_READS:
+            note_refusal(request, "caller", hashed)
+        else:
+            LOG.warning("read failed pool=caller reason=%s key_id=%s", hashed, key_id)
+        status, error = READ_FAILURES[hashed]
+        return JSONResponse({"error": error}, status_code=status)
+    got_sha, body = hashed
+    if got_sha != body_sha256:
+        return quiet_unauthorized(request, "body_hash_mismatch")
     request.state.body = body
     LOG.info("request key_id=%s caller=%s %s %s", key_id, log_safe(caller), request.method, log_safe(request.url.path))
     return await call_next(request)

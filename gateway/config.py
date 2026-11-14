@@ -81,7 +81,7 @@ def load_public_keys(path: str) -> dict[str, tuple[str, Ed25519PublicKey]]:
         if key is None or not KEY_ID_RE.fullmatch(parts[0]) or not CALLER_RE.fullmatch(parts[1]) or parts[0] in keys:
             raise RuntimeError(f"GATEWAY_PUBLIC_KEYS_FILE line {n}: want unique `<key_id> <caller> <public_key>` "
                                "(key_id: 10 lowercase hex; caller: up to 32 of A-Z a-z 0-9 _; "
-                               "public_key: 32-byte canonical on-curve Ed25519 key of order > 8, unpadded base64url)")
+                               "public_key: 32-byte canonical on-curve Ed25519 key in the prime-order subgroup, unpadded base64url)")
         keys[parts[0]] = (parts[1], key)
     if not keys:
         raise RuntimeError("GATEWAY_PUBLIC_KEYS_FILE has no keys")

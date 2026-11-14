@@ -1,4 +1,5 @@
 import atexit, base64, os, secrets, shutil, socket, subprocess, sys, tempfile, threading, time
+os.environ.setdefault("KIMICLAW_LIMIT_CONCURRENCY", "1024")
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx, pytest
 
@@ -22,7 +23,8 @@ OTHER_KEY = Signer("b2b2b2b2b2", PRIVATE_KEYS["b2b2b2b2b2"])
 LIMITS_OFF = {"GATEWAY_CREATE_PER_MIN": "100000", "GATEWAY_CREATE_BURST": "1000",
               "GATEWAY_REQUESTS_PER_S": "100000", "GATEWAY_REQUESTS_BURST": "100000",
               "GATEWAY_GET_PER_S": "1000", "GATEWAY_CANCEL_PER_S": "1000",
-              "GATEWAY_SIGNATURE_FUTURE_S": "2"}
+              "GATEWAY_SIGNATURE_FUTURE_S": "2", "GATEWAY_REFUSAL_LOG_S": "0.05",
+              "KIMICLAW_LIMIT_CONCURRENCY": "1024"}
 
 
 

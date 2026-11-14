@@ -43,7 +43,7 @@ openapi.yaml               frozen API contract (served spec must match; see test
 | GET | `/` | signed | service info |
 | POST | `/` | signed | JSON-RPC: `message/send`, `message/stream`, `tasks/get`, `tasks/cancel`. 429 + `Retry-After` over the caller's rate limit |
 | GET | `/healthz` | public | **new**: liveness, returns only `{"status":"ok"}` (no version/config) |
-| GET | `/readyz` | signed | **new**: 200 if `openclaw` is on PATH, else 503 |
+| GET | `/readyz` | public | **new**: 200 if `openclaw` is on PATH, else 503; handled before auth or read pools |
 
 | GET | `/docs`, `/openapi.json` | signed | Swagger UI and spec |
 
@@ -65,13 +65,14 @@ From Python: `httpx.Client(base_url="https://kimiclaw.hoyack.ai", auth=Signer(ke
 
 ## Request signing
 
-Every request except `GET /.well-known/agent.json` and `GET /healthz` carries four headers:
+Every request except `GET /.well-known/agent.json`, `GET /healthz` and `GET /readyz` carries five headers:
 
 | Header | Value |
 |---|---|
-| `X-KC-Key-Id` | the caller's key_id (10 lowercase hex chars) |
+| `X-KC-Key-Id` | the caller's key_id (exactly 10 lowercase hex characters, as `tools/new_api_key.py` mints; not `kc_<hex>`) |
 | `X-KC-Timestamp` | unix time in whole seconds, decimal |
 | `X-KC-Nonce` | 16 to 64 chars of `A-Z a-z 0-9 - _`, new for every request (e.g. 24 random bytes, base64url) |
+| `X-KC-Content-SHA256` | lowercase hex sha256 of the body bytes exactly as sent (sha256 of empty for GET); this is also line 5 of the canonical string |
 | `X-KC-Signature` | the Ed25519 signature of the canonical string, made with the caller's private key: 64 bytes as 128 lowercase hex chars |
 
 The gateway holds only public keys, so nothing it stores can be used to sign. Hex was picked over base64url because it
@@ -95,43 +96,18 @@ signs the line `/?wait=false&b=2`, and sending `/?b=2&wait=false` with that sign
 (not sorted) means the order of repeated keys such as `?wait=true&wait=false` is signed too, with no
 duplicate-key rule to get wrong. This is the reviewed design from the HMAC rounds and is kept for Ed25519. A proxy in front of the gateway must not rewrite the path, the query or the body.
 
-The gateway checks, in order: each of the four headers present exactly once (a repeated `X-KC-*` header is rejected)
-and well formed, the timestamp at most 300 s behind its clock and at most 30 s ahead (`GATEWAY_SIGNATURE_PAST_S`,
-`GATEWAY_SIGNATURE_FUTURE_S`) and later than the start second plus `GATEWAY_SIGNATURE_FUTURE_S`, then a slot for reading the body (see
-below), the body is at most 1 MB (else 413), read within the deadlines below (else 408) and hashed chunk by chunk (its
-bytes are kept only when the key_id is known, so an unknown key_id costs one chunk of memory), then the Ed25519 signature
-over the bytes it received, before any JSON parsing. An unknown key_id is verified against a random dummy public key,
-so it costs the same as a wrong signature and gets the same response. A signature that isn't 128 lowercase hex chars is
-rejected as malformed, and a verify failure of any kind is a plain 401, never an exception. Only a request whose signature verifies has its nonce checked and
-recorded. A nonce already used by the same caller within the window is rejected (401). Next, the caller's nonce quota
-must have room (else 429, with no bucket token spent). Then every signed request, including `GET /`, `/docs` and
-unknown JSON-RPC methods, pays the caller's general token bucket (`GATEWAY_REQUESTS_PER_S`, default 5/s, burst
-`GATEWAY_REQUESTS_BURST` 10); when it is empty the caller gets 429 and no nonce is kept. Only then is the nonce
-stored. The per-method limits below apply on top.
+The gateway verifies the signature from headers alone, before it reads the body. Checks run in this order: each of the five headers present exactly once (a repeated `X-KC-*` header is rejected) and well formed (`X-KC-Content-SHA256` is exactly 64 lowercase hex characters); the timestamp at most 300 s behind its clock and at most 30 s ahead (`GATEWAY_SIGNATURE_PAST_S`, `GATEWAY_SIGNATURE_FUTURE_S`) and later than the start second plus `GATEWAY_SIGNATURE_FUTURE_S`; then the key lookup; then the Ed25519 verify over the canonical string that uses the hash from the header (line 5). An unknown `key_id` is refused at lookup with no dummy verify and no body read. A signature that isn't 128 lowercase hex chars is rejected as malformed, and a verify failure of any kind is a plain 401, never an exception. Only a request whose signature verifies has its nonce checked and recorded. A nonce already used by the same caller within the window is rejected (401). Next, the caller's nonce quota must have room (else 429, with no bucket token spent). Then every signed request, including `GET /`, `/docs` and unknown JSON-RPC methods, pays the caller's general token bucket (`GATEWAY_REQUESTS_PER_S`, default 5/s, burst `GATEWAY_REQUESTS_BURST` 10); when it is empty the caller gets 429 and no nonce is kept. Only then is the nonce stored. The per-method limits below apply on top.
 
-Bodies are read before the signature can be checked, so reads are pooled by the key_id they claim:
+Only a request that has already verified enters that caller's reserved read pool. There is no unauthenticated pre-auth pool and no shared unknown-key pool: missing, duplicate or malformed headers, an unknown `key_id`, a timestamp outside the window or caught by the restart rule, a replayed nonce, and a bad signature are all refused with a byte-identical generic 401, without taking a slot, reading the body, writing a per-request log or trace, or emitting an access-log line. Those refusals go into one aggregated log line per second (`auth refused count=N reasons=missing_header:N,...`).
 
-- key_ids not in the keys file share one pool of 32 reads; over that, `503 {"error": "busy"}` with `Retry-After: 1`.
-- Each known caller has its own pool of `GATEWAY_READS_PER_CALLER` reads (default 3, allowed 2 to 4, checked at
-  startup); over that, that caller gets `429 {"error": "rate limited"}` with `Retry-After: 1`. Its slow or forged
-  uploads never touch another caller's pool or the unknown pool.
-- Every read has a total deadline (`GATEWAY_BODY_READ_TIMEOUT_S`, default 10 s) and a limit on the gap between chunks
-  (`GATEWAY_BODY_IDLE_TIMEOUT_S`, default 5 s); past either the request gets `408 {"error": "request timeout"}`. A
-  client that disconnects mid-body gets nothing back and no traceback is logged. The slot is freed whatever happens.
-- 503, 429 and 408 from the read pools (pool_full, read_deadline, read_idle) are not logged or traced per
-  request. One aggregated line per pool per second records the count and reasons
-  (`read refused pool=<unknown|caller> count=N reasons=pool_full:N,...`). Per-request logs remain for 413
-  (`too_large`) and a client disconnect (`client_disconnected`).
+- Each known caller has its own reserved pool of `GATEWAY_READS_PER_CALLER` reads (default 3, allowed 2 to 4, checked at startup). Only that caller's verified requests can use those slots. Over the floor, that caller gets `429 {"error": "rate limited"}` with `Retry-After: 1`. One caller cannot take another caller's reserved slots.
+- The body is then streamed under `MAX_BODY` (1 MB, else 413) with a total deadline (`GATEWAY_BODY_READ_TIMEOUT_S`, default 10 s) and a limit on the gap between chunks (`GATEWAY_BODY_IDLE_TIMEOUT_S`, default 5 s); past either the request gets `408 {"error": "request timeout"}`. As it streams, the body is hashed; if that hash does not match `X-KC-Content-SHA256`, the response is the same generic 401 (`body_hash_mismatch`). A client that disconnects mid-body gets nothing back and no traceback is logged. The slot is always freed in `finally`.
+- 429 and 408 from the read pools (pool_full, read_deadline, read_idle) are not logged or traced per request, and they do not write an access-log line. One aggregated line per pool per second records the count and reasons (`read refused pool=caller count=N reasons=pool_full:N,...`). Per-request logs remain for 413 (`too_large`) and a client disconnect (`client_disconnected`).
+- `GET /healthz` and `GET /readyz` (and `GET /.well-known/agent.json`) are handled before any auth or pool logic and never compete for slots.
 
-Peak RSS stays within tens of MB however many 1 MB unauthenticated bodies arrive, slow uploads with junk key_ids can
-no longer 503 a real caller, and since every read ends within 10 s, held reads can't block shutdown for longer than
-that. key_ids are not secret (they travel in every request), but they must be unguessable: someone who has a caller's
-key_id can fill that caller's small pool and get it 429s. They are 40 random bits from `secrets` and must only be
-issued by `tools/new_api_key.py` (10 lowercase hex characters; callers never choose a key_id). The caller should mint the keypair with `tools/new_keypair.py`. A per-IP connection cap belongs at the edge, not in the gateway.
+Unauthenticated floods therefore cannot fill a caller's pool or force a 503 on a signed request. key_ids are not secret (they travel in every request) and an immediate 401 for an unknown `key_id` is a timing oracle for whether that id is loaded; the id format is only 10 lowercase hex characters (40 bits from `secrets`, issued only by `tools/new_api_key.py`; callers never choose a key_id; the loader does not accept `kc_<hex>`). A per-IP connection cap belongs at the edge, not in the gateway.
 
-Any rejection is `401 {"error": "unauthorized"}`. The reason (`duplicate_header`, `missing_header`, `malformed_header`, `stale_timestamp`, `stale_after_restart`,
-`unknown_key`, `bad_signature`, `replayed_nonce`) goes to the log with the key_id. A header value that isn't shaped like
-a key_id is logged as `malformed`, never verbatim (it could be a misplaced private key), and signatures are never logged.
+Any of the header, timestamp, key, signature, nonce-replay or body-hash refusals is `401 {"error": "unauthorized"}`, with the same status, body, headers and Content-Length. The reason (`duplicate_header`, `missing_header`, `malformed_header`, `stale_timestamp`, `stale_after_restart`, `unknown_key`, `bad_signature`, `replayed_nonce`, `body_hash_mismatch`) goes only to the aggregated log, without a key_id. A header value that isn't shaped like a key_id is never logged verbatim (it could be a misplaced private key), and signatures are never logged.
 
 Nonces are kept in process memory per caller, each until its timestamp leaves the window, and at most
 `GATEWAY_MAX_NONCES_PER_CALLER` (default 20,000) per caller. The general bucket keeps a caller far below that
@@ -157,8 +133,8 @@ can add a line can add a caller.
 Startup is refused, with an error that names only the line number, if the file is missing, empty or malformed, if the
 first line isn't the format header, if a key_id isn't exactly 10 lowercase hex characters (the format
 `tools/new_api_key.py` mints; callers never choose a key_id), if a key_id repeats, if a caller name isn't 1 to 32 of
-`A-Z a-z 0-9 _`, if a public key isn't a canonical 32-byte on-curve Ed25519 key of order greater than 8 (all-zero,
-the identity, other small-order points, non-canonical y, and off-curve encodings are refused), or if the file is writable by its group or others. The old
+`A-Z a-z 0-9 _`, if a public key isn't a canonical 32-byte on-curve Ed25519 key in the prime-order subgroup (all-zero,
+the identity, other torsion points, non-canonical y, off-curve encodings, and honest-plus-torsion mixed points are refused), or if the file is writable by its group or others. The old
 `GATEWAY_SIGNING_KEYS_FILE` (HMAC secrets) is no longer read; setting it at all, even together with
 `GATEWAY_PUBLIC_KEYS_FILE`, refuses startup. A 32-byte HMAC secret would otherwise parse as an Ed25519 public key, so
 the format header is required to stop an old secrets file being loaded. The caller generates the keypair; the operator
@@ -224,7 +200,8 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | `GATEWAY_REQUESTS_PER_S` / `GATEWAY_REQUESTS_BURST` | `5` / `10` | per caller: every signed request (any path or method), checked before its nonce is stored; empty gets 429 |
 | `GATEWAY_MAX_NONCES_PER_CALLER` | `20000` | per caller: live nonces kept for replay checks; more gets 429 until the oldest expires |
 | `GATEWAY_SIGNATURE_PAST_S` / `GATEWAY_SIGNATURE_FUTURE_S` | `300` / `30` | how far behind / ahead of the gateway clock a signed timestamp may be; ahead must not exceed behind. Startup waits `FUTURE_S + 1` s (~31 s by default) so a future-stamped request captured before a restart cannot be replayed after it |
-| `GATEWAY_READS_PER_CALLER` | `3` | per caller: bodies read at once before the signature is checked (2 to 4); more gets 429 |
+| `KIMICLAW_LIMIT_CONCURRENCY` | required (no default) | uvicorn's `--limit-concurrency`; an integer from 64 to 4096, fail closed if missing or out of range. Recommended 1024. The Dockerfile CMD does not pass this flag; the app reads the env and binds it when started as `uvicorn app:app` |
+| `GATEWAY_READS_PER_CALLER` | `3` | per caller: reserved body-read slots for already-verified requests (2 to 4); more gets 429 |
 | `GATEWAY_BODY_READ_TIMEOUT_S` / `GATEWAY_BODY_IDLE_TIMEOUT_S` | `10` / `5` | total time to read a body / longest gap between chunks; past either gets 408 |
 | `GATEWAY_MAX_TASKS_PER_KEY` | `100` | per caller: stored tasks; the oldest finished ones are dropped past this |
 | `GATEWAY_TELEMETRY_FILE_MB` | `10` | size of each telemetry file; 5 files each for traces, metrics and logs (150 MB total) |

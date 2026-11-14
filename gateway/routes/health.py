@@ -1,4 +1,4 @@
-"""New in this refactor: liveness and readiness probes (/healthz is public and returns only {"status":"ok"}; /readyz needs a signed request)."""
+"""Liveness and readiness probes. Both are public and are handled before auth or read-pool logic."""
 import shutil
 
 from fastapi import APIRouter
@@ -12,7 +12,7 @@ async def healthz():
     return {"status": "ok"}
 
 
-@router.get("/readyz")
+@router.get("/readyz", openapi_extra={"security": []})
 async def readyz():
     if shutil.which("openclaw") is None:
         return JSONResponse({"status": "not ready", "reason": "openclaw binary not found on PATH"}, status_code=503)

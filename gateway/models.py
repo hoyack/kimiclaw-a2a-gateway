@@ -7,9 +7,10 @@ from gateway.config import PUBLIC_URL, SIGNATURE_FUTURE_S, SIGNATURE_PAST_S
 
 SECURITY_SCHEMES = {"kcEd25519": {
     "type": "apiKey", "in": "header", "name": "X-KC-Signature",
-    "description": "Ed25519 request signing. Send X-KC-Key-Id, X-KC-Timestamp (unix seconds), X-KC-Nonce and "
+    "description": "Ed25519 request signing. Send X-KC-Key-Id, X-KC-Timestamp (unix seconds), X-KC-Nonce, "
+                   "X-KC-Content-SHA256 (lowercase hex sha256 of the body, empty body for GET) and "
                    "X-KC-Signature: lowercase hex Ed25519 signature, made with your private key, over METHOD, path plus raw query as sent, "
-                   "timestamp, nonce, hex sha256(body) and key_id, joined by newlines. A timestamp may be at most "
+                   "timestamp, nonce, the same body sha256 and key_id, joined by newlines. A timestamp may be at most "
                    f"{SIGNATURE_PAST_S} s old or {SIGNATURE_FUTURE_S} s ahead; a nonce is accepted once.",
 }}
 

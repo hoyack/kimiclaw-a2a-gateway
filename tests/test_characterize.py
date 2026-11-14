@@ -35,7 +35,7 @@ SIGNED_SHAPE = {"X-KC-Key-Id": "a1a1a1a1a1", "X-KC-Timestamp": str(int(time.time
 def test_unauthorized(gw_factory, h):
     c = gw_factory()
     for m, p in (("GET", "/"), ("POST", "/"), ("GET", "/docs"), ("GET", "/nope"),
-                 ("GET", "/readyz"), ("GET", "/openapi.json")):
+                 ("GET", "/openapi.json")):
         r = httpx.request(m, str(c.base_url) + p, headers=h)
         assert (r.status_code, r.json()) == (401, {"error": "unauthorized"})
 

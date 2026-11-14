@@ -1,5 +1,5 @@
-"""Pre-auth body reads: unknown key_ids share one 32-slot pool, each known caller has its own small pool, and every
-read has a total deadline and a per-chunk idle timeout (408). Slow or junk reads must never 503 a real caller."""
+"""Verified body reads: each caller has a reserved pool of GATEWAY_READS_PER_CALLER slots. Unauthenticated
+requests never take a slot. Every read has a total deadline and a per-chunk idle timeout (408)."""
 import os
 import secrets
 import socket
@@ -28,14 +28,20 @@ def gw(tmp_path):
             p.terminate(); p.wait(10)
 
 
-def stall(port, key_id, private_key=None, sent=b"", length=1000):
-    """A POST whose headers are well formed and signed (with a throwaway private key unless given) but whose body stops
-    after `sent` bytes of the `length` promised."""
+def stall(port, key_id, private_key, sent=b"", length=1000):
+    """A POST signed with the caller's private key whose body stops after `sent` bytes of `length` promised."""
     body = sent + b"x" * (length - len(sent))
-    h = signed_headers(key_id, private_key or secrets.token_urlsafe(32), "POST", b"/", b"", body)
+    h = signed_headers(key_id, private_key, "POST", b"/", b"", body)
     head = "POST / HTTP/1.1\r\nHost: x\r\n" + "".join(f"{k}: {v}\r\n" for k, v in h.items())
     s = socket.create_connection(("127.0.0.1", port), timeout=30)
     s.sendall((head + f"Content-Type: application/json\r\nContent-Length: {length}\r\n\r\n").encode() + sent)
+    return s
+
+
+def unsigned_stall(port, sent=b"", length=1000):
+    s = socket.create_connection(("127.0.0.1", port), timeout=30)
+    s.sendall((f"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+               f"Content-Length: {length}\r\n\r\n").encode() + sent)
     return s
 
 
@@ -52,19 +58,16 @@ def get(base, key):
     return httpx.post(base + "/", content=GET, auth=key, headers={"Content-Type": "application/json"}, timeout=10)
 
 
-def test_with_32_unknown_key_reads_held_valid_callers_get_200_at_once(gw):
-    _, base, port, log = gw(**SHORT)
-    held = [stall(port, "eeeeeeeeee") for _ in range(32)]
+def test_healthz_and_readyz_never_compete_for_read_slots(gw):
+    _, base, port, _ = gw(**SHORT)
+    held = [stall(port, KEY.key_id, KEY.private_key, sent=b"x" * 10) for _ in range(3)]
     time.sleep(0.3)
-    extra = stall(port, "eeeeeeeeee")
-    assert status(extra, 1) == 503
-    for key in (KEY, OTHER_KEY):
-        started = time.monotonic()
-        assert get(base, key).status_code == 200 and time.monotonic() - started < 1
-    assert [status(s) for s in held] == [408] * 32
-    time.sleep(1.1)
-    text = log.read_text()
-    assert "read refused pool=unknown count=" in text and "pool_full:" in text
+    assert get(base, KEY).status_code == 429
+    for path in ("/healthz", "/readyz"):
+        r = httpx.get(base + path, timeout=2)
+        assert r.status_code == 200, (path, r.status_code, r.text)
+    assert [status(s) for s in held] == [408] * 3
+    assert get(base, KEY).status_code == 200
 
 
 def test_a_slow_upload_on_caller_a_does_not_affect_caller_b(gw):
@@ -76,53 +79,66 @@ def test_a_slow_upload_on_caller_a_does_not_affect_caller_b(gw):
     assert [get(base, OTHER_KEY).status_code for _ in range(3)] == [200] * 3
     assert [status(s) for s in held] == [408] * 3
     assert get(base, KEY).status_code == 200
-    time.sleep(1.1)
+    time.sleep(0.3)
     text = log.read_text()
     assert "read refused pool=caller count=" in text and "pool_full:" in text
 
 
-def test_a_flood_with_a_real_key_id_but_not_its_private_key_only_fills_that_callers_pool(gw):
+def test_a_flood_of_unsigned_or_unknown_or_forged_requests_uses_zero_slots(gw):
+    """Alice's reserved floor stays intact: junk requests 401 with no slot, her in-flight verified reads still 429 her."""
     _, base, port, _ = gw(**SHORT)
-    flood = [stall(port, KEY.key_id) for _ in range(20)]
-    time.sleep(0.5)
-    assert sorted(status(s, 0.5) or 0 for s in flood[3:]) == [429] * 17
+    held = [stall(port, KEY.key_id, KEY.private_key, sent=b"x" * 10) for _ in range(3)]
+    time.sleep(0.3)
+    codes, retry = [], []
+    def one(h):
+        r = httpx.post(base + "/", content=GET, headers=h, timeout=5)
+        codes.append(r.status_code)
+        if "retry-after" in r.headers:
+            retry.append(r.headers["retry-after"])
+    # unsigned
+    one({"Content-Type": "application/json"})
+    # unknown key_id
+    one({**signed_headers("eeeeeeeeee", KEY.private_key, "POST", b"/", b"", GET), "Content-Type": "application/json"})
+    # alice's real key_id without her private key
+    for _ in range(20):
+        one({**signed_headers(KEY.key_id, secrets.token_urlsafe(32), "POST", b"/", b"", GET),
+             "Content-Type": "application/json"})
+    assert set(codes) == {401} and retry == []
+    # alice's reserve is still held by the three slow uploads
+    r = get(base, KEY)
+    assert (r.status_code, r.headers["retry-after"]) == (429, "1")
     assert [get(base, OTHER_KEY).status_code for _ in range(5)] == [200] * 5
-    unknown = httpx.post(base + "/", content=GET, auth=type(KEY)("eeeeeeeeee", KEY.private_key))
-    assert unknown.status_code == 401
-    assert [status(s) for s in flood[:3]] == [408] * 3
+    assert [status(s) for s in held] == [408] * 3
+    assert get(base, KEY).status_code == 200
 
 
-def test_100_aborted_reads_in_each_pool_leak_no_slots(gw):
+def test_100_aborted_verified_reads_leak_no_slots(gw):
     _, base, port, log = gw()
-    for key_id, private_key in (("eeeeeeeeee", None), (KEY.key_id, KEY.private_key)):
-        for _ in range(100):
-            s = stall(port, key_id, private_key, sent=b"x" * 10)
-            s.close()
+    for _ in range(100):
+        s = stall(port, KEY.key_id, KEY.private_key, sent=b"x" * 10)
+        s.close()
     time.sleep(1)
-    unknown = [stall(port, "eeeeeeeeee") for _ in range(32)]
     mine = [stall(port, KEY.key_id, KEY.private_key) for _ in range(3)]
     time.sleep(0.3)
-    assert [status(s, 0.05) for s in unknown + mine] == [None] * 35
-    assert status(stall(port, "eeeeeeeeee"), 1) == 503
+    assert [status(s, 0.05) for s in mine] == [None] * 3
     assert status(stall(port, KEY.key_id, KEY.private_key), 1) == 429
     assert get(base, OTHER_KEY).status_code == 200
-    time.sleep(1.1)
+    time.sleep(0.3)
     text = log.read_text()
-    for pool in ("unknown", "caller"):
-        n = text.count(f"read failed pool={pool} reason=client_disconnected")
-        for ln in text.splitlines():
-            if f"read refused pool={pool} count=" in ln:
-                n += int(ln.split("count=", 1)[1].split()[0])
-        assert n >= 100, (pool, n)
+    n = text.count("read failed pool=caller reason=client_disconnected")
+    for ln in text.splitlines():
+        if "read refused pool=caller count=" in ln:
+            n += int(ln.split("count=", 1)[1].split()[0])
+    assert n >= 100, n
     assert "Traceback" not in text
 
 
-def test_a_stalled_read_gets_408_at_the_idle_timeout_and_a_trickle_at_the_deadline(gw):
+def test_a_stalled_verified_read_gets_408_at_the_idle_timeout_and_a_trickle_at_the_deadline(gw):
     _, base, port, log = gw(**SHORT)
     started = time.monotonic()
-    assert status(stall(port, "eeeeeeeeee")) == 408
+    assert status(stall(port, KEY.key_id, KEY.private_key)) == 408
     assert 1.3 < time.monotonic() - started < 2.5
-    s = stall(port, KEY.key_id, KEY.private_key, sent=b"x")
+    s = stall(port, OTHER_KEY.key_id, OTHER_KEY.private_key, sent=b"x")
     started = time.monotonic()
     for _ in range(4):
         time.sleep(1)
@@ -132,16 +148,16 @@ def test_a_stalled_read_gets_408_at_the_idle_timeout_and_a_trickle_at_the_deadli
             break
     assert status(s) == 408
     assert 2.5 < time.monotonic() - started < 4.5
-    time.sleep(1.1)
+    time.sleep(0.3)
     text = log.read_text()
-    assert "read refused pool=unknown count=" in text and "read_idle:" in text
-    assert "read refused pool=caller count=" in text and "read_deadline:" in text
+    assert "read refused pool=caller count=" in text
+    assert "read_idle:" in text and "read_deadline:" in text
     assert get(base, KEY).status_code == 200
 
 
 def test_shutdown_is_not_blocked_by_held_reads(gw):
     p, _, port, _ = gw(**SHORT)
-    held = [stall(port, "eeeeeeeeee") for _ in range(32)] + [stall(port, KEY.key_id) for _ in range(3)]
+    held = [stall(port, KEY.key_id, KEY.private_key) for _ in range(3)]
     time.sleep(0.3)
     started = time.monotonic()
     p.terminate(); p.wait(15)
@@ -152,27 +168,27 @@ def test_shutdown_is_not_blocked_by_held_reads(gw):
 def test_a_flood_of_read_refusals_is_aggregated_to_one_log_line_per_pool_per_second_and_leaves_no_traces(gw, tmp_path):
     tdir = tmp_path / "tel"
     p, base, port, log = gw(GATEWAY_TELEMETRY_DIR=str(tdir), **SHORT)
-    held = [stall(port, "eeeeeeeeee") for _ in range(32)] + [stall(port, KEY.key_id, KEY.private_key) for _ in range(3)]
+    held = [stall(port, KEY.key_id, KEY.private_key) for _ in range(3)]
     time.sleep(0.2)
     started = time.monotonic()
     codes = []
     for _ in range(120):
-        codes.append(status(stall(port, "eeeeeeeeee"), 1))
         codes.append(status(stall(port, KEY.key_id, KEY.private_key), 1))
-    # held reads hit the idle timeout and become 408
-    assert [status(s) for s in held] == [408] * 35
+        codes.append(httpx.post(base + "/", content=GET, timeout=2).status_code)  # unsigned 401
+    assert [status(s) for s in held] == [408] * 3
     elapsed = time.monotonic() - started
-    time.sleep(1.1)
+    time.sleep(0.3)
     p.terminate(); p.wait(5)
     text = log.read_text()
-    unknown = [ln for ln in text.splitlines() if "read refused pool=unknown count=" in ln]
     caller = [ln for ln in text.splitlines() if "read refused pool=caller count=" in ln]
-    assert unknown and caller
-    assert all("key_id=" not in ln for ln in unknown + caller)
-    assert "reason=pool_full key_id=" not in text and "reason=read_idle key_id=" not in text
+    pre = [ln for ln in text.splitlines() if "auth refused count=" in ln]
+    assert caller and pre
+    assert all("key_id=" not in ln for ln in caller + pre)
+    assert "unauthorized reason=" not in text
     slack = 2
-    assert len(unknown) <= elapsed + slack and len(caller) <= elapsed + slack, (len(unknown), len(caller), elapsed)
-    assert codes.count(503) + codes.count(429) >= 200
+    # 0.05 s flush in tests, plus held-read 408s; bound the number of aggregate lines loosely
+    assert len(caller) <= elapsed / 0.05 + slack + 5, (len(caller), elapsed)
+    assert codes.count(429) >= 100 and codes.count(401) >= 100
     traces = tdir / "traces.jsonl"
     raw = traces.read_text() if traces.exists() else ""
     import json
@@ -181,18 +197,15 @@ def test_a_flood_of_read_refusals_is_aggregated_to_one_log_line_per_pool_per_sec
         if not ln.strip():
             continue
         doc = json.loads(ln)
-        attrs = {a["key"]: a.get("value", a) for a in doc.get("attributes", [])} if isinstance(doc.get("attributes"), list) else doc.get("attributes") or {}
-        # otel to_json uses a list of {key, value}
-        val = None
         if isinstance(doc.get("attributes"), list):
             for a in doc["attributes"]:
                 if a.get("key") == "http.response.status_code":
                     val = a.get("value")
                     if isinstance(val, dict):
                         val = val.get("intValue") or val.get("value")
-        if val is not None:
-            statuses.append(int(val))
-    assert not any(s in (408, 429, 503) for s in statuses), statuses
+                    if val is not None:
+                        statuses.append(int(val))
+    assert not any(s in (401, 408, 429, 503) for s in statuses), statuses
 
 
 @pytest.mark.skipif(not os.environ.get("KC_SUSTAINED_S"), reason="set KC_SUSTAINED_S=30 to run the sustained flood")
@@ -201,12 +214,17 @@ def test_sustained_unknown_key_flood_never_503s_a_valid_caller(gw):
     _, base, port, _ = gw()
     stop = time.monotonic() + seconds
     attacker, lock = {}, threading.Lock()
-    def keep_one_slot():
+    def keep_flooding():
         while time.monotonic() < stop:
-            code = status(stall(port, "eeeeeeeeee"), 30)
+            try:
+                h = {**signed_headers("eeeeeeeeee", KEY.private_key, "POST", b"/", b"", GET),
+                     "Content-Type": "application/json"}
+                code = httpx.post(base + "/", content=GET, headers=h, timeout=5).status_code
+            except httpx.HTTPError as e:
+                code = type(e).__name__
             with lock:
                 attacker[code] = attacker.get(code, 0) + 1
-    threads = [threading.Thread(target=keep_one_slot, daemon=True) for _ in range(32)]
+    threads = [threading.Thread(target=keep_flooding, daemon=True) for _ in range(32)]
     [t.start() for t in threads]
     time.sleep(0.5)
     valid = {}
@@ -216,4 +234,4 @@ def test_sustained_unknown_key_flood_never_503s_a_valid_caller(gw):
         time.sleep(0.5)
     [t.join(15) for t in threads]
     print(f"\nsustained {seconds:.0f}s: valid caller {valid}; attacker {attacker}")
-    assert set(valid) == {200} and attacker.get(408, 0) >= 32
+    assert set(valid) == {200} and set(attacker) <= {401} and attacker.get(401, 0) >= 32

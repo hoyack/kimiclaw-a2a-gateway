@@ -36,6 +36,7 @@ def signed_headers(key_id: str, private_key: str, method: str, raw_path: bytes, 
     nonce = nonce or secrets.token_urlsafe(24)
     message = canonical(method.upper(), raw_path, query, timestamp, nonce, body, key_id)
     return {"X-KC-Key-Id": key_id, "X-KC-Timestamp": timestamp, "X-KC-Nonce": nonce,
+            "X-KC-Content-SHA256": hashlib.sha256(body).hexdigest(),
             "X-KC-Signature": load_private_key(private_key).sign(message).hex()}
 
 
