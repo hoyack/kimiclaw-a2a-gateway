@@ -5,6 +5,8 @@ import httpx, pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+from gateway.launcher_guard import mark_launched  # noqa: E402
+mark_launched()
 from sign_request import Signer, load_private_key  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402
 

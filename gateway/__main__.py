@@ -3,16 +3,29 @@ import argparse
 import asyncio
 import logging
 import signal
+import sys
 import time
 
-from uvicorn import Config, Server
-
-from gateway.config import LOG
-from gateway.http_protocol import HeaderTimeoutProtocol
 from gateway.launcher_guard import mark_launched
-from gateway.main import create_app, header_timeout_s, limit_concurrency, probe_port
-from gateway.probe import probe_app
-from gateway.routes.health import require_openclaw, set_main_serving
+
+mark_launched()
+
+
+def _exit_with(exc: BaseException) -> None:
+    sys.stderr.write(f"{exc}\n")
+    raise SystemExit(2) from None
+
+
+try:
+    from uvicorn import Config, Server
+
+    from gateway.config import LOG
+    from gateway.http_protocol import HeaderTimeoutProtocol
+    from gateway.main import create_app, header_timeout_s, limit_concurrency, probe_port
+    from gateway.probe import probe_app
+    from gateway.routes.health import require_openclaw, set_main_serving
+except RuntimeError as exc:
+    _exit_with(exc)
 
 
 # Exact uvicorn.error templates from uvicorn/protocols/http/h11_impl.py (no user data).
@@ -23,6 +36,9 @@ _UVICORN_PROTOCOL_COUNTED = {
 }
 _UVICORN_PROTOCOL_DROP = frozenset({
     *_UVICORN_PROTOCOL_COUNTED,
+    # Follow-on after uvicorn already sent a 400 and probe._send swallowed the failed send.
+    "ASGI callable returned without completing response.",
+    "ASGI callable returned without starting response.",
     'No supported WebSocket library detected. Please use "pip install \'uvicorn[standard]\'", or install \'websockets\' or \'wsproto\' manually.',
 })
 
@@ -124,11 +140,14 @@ def main(argv=None):
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
-    cap = limit_concurrency()
-    timeout = header_timeout_s()
-    probe = probe_port()
-    if args.port == probe:
-        raise RuntimeError("GATEWAY_PROBE_PORT must differ from the main port")
+    try:
+        cap = limit_concurrency()
+        timeout = header_timeout_s()
+        probe = probe_port()
+        if args.port == probe:
+            raise RuntimeError("GATEWAY_PROBE_PORT must differ from the main port")
+    except RuntimeError as exc:
+        _exit_with(exc)
     asyncio.run(serve(args.host, args.port, probe, cap, timeout))
 
 

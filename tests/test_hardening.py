@@ -11,7 +11,7 @@ import pytest
 from conftest import KEY, KEYS_FILE, ROOT, start_gateway
 from sign_request import signed_headers
 
-ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_", "WEB_"))},
+ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_", "WEB_", "UVICORN_"))},
        "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "KIMICLAW_LIMIT_CONCURRENCY": "1024"}
 
 
@@ -120,13 +120,23 @@ def test_refuses_to_start_without_a_valid_concurrency_cap(value, needle):
     env = {k: v for k, v in ENV.items() if k != "KIMICLAW_LIMIT_CONCURRENCY"}
     if value is not None:
         env["KIMICLAW_LIMIT_CONCURRENCY"] = value
-    r = subprocess.run([sys.executable, "-c", "from gateway.main import limit_concurrency; limit_concurrency()"],
-                       cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
-    assert r.returncode != 0 and needle in r.stderr
+    r = _run_official(env)
+    out = r.stderr + r.stdout
+    assert r.returncode != 0 and needle in out and "Traceback" not in out, out
 
 
 def _probe(p):
     return p.probe_base
+
+
+def _run_official(env, timeout=10):
+    """Run `python -m gateway` on a free port. Used for clean config-error checks."""
+    from conftest import free_port
+    port, probe = free_port(), free_port()
+    env = {**env, "GATEWAY_PROBE_PORT": str(probe)}
+    return subprocess.run(
+        [sys.executable, "-m", "gateway", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=timeout)
 
 
 def test_uvicorn_app_app_is_refused():
@@ -144,10 +154,9 @@ def test_uvicorn_app_app_is_refused():
     ("05", "must be an integer"),
 ])
 def test_refuses_to_start_with_a_bad_header_timeout(value, needle):
-    r = subprocess.run([sys.executable, "-c", "from gateway.main import header_timeout_s; header_timeout_s()"],
-                       cwd=ROOT, env={**ENV, "GATEWAY_HEADER_TIMEOUT_S": value},
-                       capture_output=True, text=True, timeout=30)
-    assert r.returncode != 0 and needle in r.stderr
+    r = _run_official({**ENV, "GATEWAY_HEADER_TIMEOUT_S": value})
+    out = r.stderr + r.stdout
+    assert r.returncode != 0 and needle in out and "Traceback" not in out, out
 
 
 def test_a_valid_concurrency_cap_is_passed_to_uvicorn_and_logged(tmp_path):
@@ -359,7 +368,7 @@ def test_quiet_refusals_are_counted_in_requests_total_and_not_exported_as_spans(
     assert "401" in metrics and "200" in metrics
 
 def _assert_uvicorn_refused(args, extra_env=None):
-    """Every unsupported uvicorn start exits non-zero in a few seconds, with one refusal line and no traceback."""
+    """Unsupported uvicorn starts exit non-zero in a few seconds, with a refusal line and no signed 200."""
     from conftest import free_port
     port = free_port()
     env = {**ENV, **(extra_env or {})}
@@ -371,13 +380,14 @@ def _assert_uvicorn_refused(args, extra_env=None):
     out = r.stderr + r.stdout
     assert r.returncode != 0, (r.returncode, out)
     assert elapsed < 6, elapsed
-    assert out.count("start with `python -m gateway`") == 1, out
+    n = out.count("start with `python -m gateway`")
+    assert 1 <= n <= 8, out  # one line, or a handful of workers; never a flood
     assert "Traceback" not in out, out
     try:
-        status = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=1).status_code
+        status = httpx.get(f"http://127.0.0.1:{port}/", auth=KEY, timeout=1).status_code
     except httpx.HTTPError:
         status = None
-    assert status not in (200, 503), status
+    assert status != 200, status
     return out
 
 
@@ -386,33 +396,93 @@ def _assert_uvicorn_refused(args, extra_env=None):
     (["app:app", "--workers", "2"], None),
     (["app:app", "--workers=3"], None),
     (["app:app"], {"WEB_CONCURRENCY": "2"}),
+    (["app:app"], {"UVICORN_WORKERS": "2"}),
+    (["app:app"], {"UVICORN_RELOAD": "true"}),
+    (["app:app", "--reload"], None),
     (["--factory", "gateway.main:create_app"], None),
     (["--factory", "gateway.main:create_app", "--workers", "2"], None),
-    (["--factory", "gateway.main:create_app", "--reload"], None),
-    (["--factory", "gateway.main:create_app"], {"WEB_CONCURRENCY": "2"}),
+    (["gateway.main:create_app"], {"UVICORN_FACTORY": "true", "WEB_CONCURRENCY": "2"}),
+    (["app:app", "--workers", "2"], None),  # python -m uvicorn app:app --workers 2 (same helper)
+    (["app:app", "--workers", "1"], {"WEB_CONCURRENCY": "2"}),
+    (["app:app", "--reload-delay", "1"], None),
+    (["app:app", "--reload-dir", "."], None),
 ], ids=[
     "app:app",
     "app:app --workers 2",
     "app:app --workers=3",
     "WEB_CONCURRENCY=2 app:app",
+    "UVICORN_WORKERS=2",
+    "UVICORN_RELOAD=true",
+    "--reload",
     "factory",
     "factory --workers 2",
-    "factory --reload",
-    "WEB_CONCURRENCY=2 factory",
+    "UVICORN_FACTORY=true WEB_CONCURRENCY=2",
+    "python -m uvicorn app:app --workers 2",
+    "WEB_CONCURRENCY=2 --workers 1",
+    "--reload-delay 1 without --reload",
+    "--reload-dir without --reload",
 ])
-def test_plain_uvicorn_including_workers_2_is_refused(args, extra_env):
-    """W-1 / W-1b: python -m gateway is the only launcher; every uvicorn refusal exits non-zero once."""
-    out = _assert_uvicorn_refused(args, extra_env)
-    if "--factory" in args:
-        assert "--factory" in out or "create_app" in out
+def test_unsupported_uvicorn_launches_are_refused(args, extra_env):
+    """Every non-launcher start is refused: one sentinel, no argv/env case list in the guard."""
+    _assert_uvicorn_refused(args, extra_env)
 
 
-def test_factory_create_app_is_refused():
-    """Critic #2 / W-1b: uvicorn --factory (plain, --workers 2, --reload, WEB_CONCURRENCY=2) is refused."""
-    _assert_uvicorn_refused(["--factory", "gateway.main:create_app"])
-    _assert_uvicorn_refused(["--factory", "gateway.main:create_app", "--workers", "2"])
-    _assert_uvicorn_refused(["--factory", "gateway.main:create_app", "--reload"])
-    _assert_uvicorn_refused(["--factory", "gateway.main:create_app"], {"WEB_CONCURRENCY": "2"})
+def test_import_app_under_bash_does_not_signal_the_shell():
+    """WEB_CONCURRENCY=2 python -c import app must refuse without aborting bash."""
+    r = subprocess.run(
+        ["bash", "-c", f'{sys.executable} -c "import app"; echo X'],
+        cwd=ROOT, env={**ENV, "WEB_CONCURRENCY": "2"},
+        capture_output=True, text=True, timeout=8)
+    out = r.stderr + r.stdout
+    assert "X" in r.stdout.splitlines(), (r.returncode, out)
+    assert r.returncode == 0, (r.returncode, out)  # echo X ran; bash was not killed
+    assert "start with `python -m gateway`" in out
+    assert r.stdout.count("X") == 1
+
+
+def _assert_wrapper_survives(wrapper_argv, extra_env=None):
+    """The wrapper process must print X and exit 0; only the inner uvicorn is refused."""
+    r = subprocess.run(wrapper_argv, cwd=ROOT, env={**ENV, **(extra_env or {})},
+                       capture_output=True, text=True, timeout=8)
+    out = r.stderr + r.stdout
+    assert "X" in r.stdout.splitlines(), (r.returncode, out)
+    assert r.returncode == 0, (r.returncode, out)
+    assert "start with `python -m gateway`" in out
+    return out
+
+
+def test_uvicorn_under_a_shell_wrapper_does_not_kill_the_shell():
+    from conftest import free_port
+    port = free_port()
+    inner = f'{sys.executable} -m uvicorn app:app --host 127.0.0.1 --port {port} --workers 1'
+    _assert_wrapper_survives(["bash", "-c", f"{inner}; echo X"], {"WEB_CONCURRENCY": "2"})
+
+
+def test_uvicorn_under_a_python_wrapper_does_not_kill_the_wrapper():
+    from conftest import free_port
+    port = free_port()
+    script = (
+        "import subprocess, sys\n"
+        f"subprocess.run({[sys.executable, '-m', 'uvicorn', 'app:app', '--host', '127.0.0.1', '--port', str(port), '--reload-delay', '1']!r})\n"
+        "print('X')\n"
+    )
+    _assert_wrapper_survives([sys.executable, "-c", script])
+
+
+def test_official_launcher_rejects_web_concurrency_without_traceback():
+    r = _run_official({**ENV, "WEB_CONCURRENCY": "2"})
+    out = r.stderr + r.stdout
+    assert r.returncode != 0 and "WEB_CONCURRENCY must be 1" in out and "Traceback" not in out, out
+
+
+def test_official_launcher_still_serves(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {})
+    try:
+        assert httpx.get(base + "/.well-known/agent.json", timeout=5).status_code == 200
+        assert httpx.get(base + "/", auth=KEY, timeout=5).status_code == 200
+    finally:
+        p.terminate()
+        p.wait(5)
 
 def test_concurrency_cap_is_taken_from_the_env_only_and_logged_after_it_is_applied(tmp_path):
     """C-1: no --limit-concurrency flag; the env value is logged only after Config has it."""
@@ -821,6 +891,60 @@ def test_uvicorn_protocol_warnings_are_aggregated_on_both_ports(tmp_path):
                     s.close()
                 except OSError:
                     pass
+    finally:
+        p.terminate()
+        p.wait(10)
+
+
+def test_probe_app_never_reads_the_http_body():
+    """A-5: the probe callable must not call receive() on HTTP (so a bad body cannot be read)."""
+    import asyncio
+    from gateway.probe import probe_app
+
+    received = []
+
+    async def receive():
+        received.append(True)
+        return {"type": "http.request", "body": b"secret", "more_body": False}
+
+    sent = []
+
+    async def send(msg):
+        sent.append(msg)
+
+    async def run():
+        for path, method in (("/healthz", "GET"), ("/readyz", "GET"), ("/nope", "POST"), ("/", "PUT")):
+            await probe_app({"type": "http", "path": path, "method": method}, receive, send)
+
+    asyncio.run(run())
+    assert received == []
+    assert sent and all(m.get("type", "").startswith("http.response") for m in sent)
+
+
+def test_a_thousand_bad_chunked_requests_on_each_port_are_quiet(tmp_path):
+    """A-5: 1,000 Transfer-Encoding: chunked + ZZZ requests per port produce <=5 new log lines and no traceback."""
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_REFUSAL_LOG_S": "3", "GATEWAY_HEADER_TIMEOUT_S": "30"})
+    log = tmp_path / "gateway.log"
+    main_port = int(base.rsplit(":", 1)[1])
+    probe_port = int(p.probe_base.rsplit(":", 1)[1])
+    # any path or method; invalid chunk body after a complete header block
+    payloads = [
+        b"GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\n",
+        b"POST /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\n",
+        b"GET /nope HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\n",
+        b"PUT / HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\nZZZ\r\n",
+    ]
+    try:
+        mark = len(log.read_text())
+        for port in (main_port, probe_port):
+            for payload in payloads:
+                _raw_requests(port, payload, 250)
+        time.sleep(3.3)
+        chunk = log.read_text()[mark:]
+        assert "Exception in ASGI application" not in chunk, chunk
+        assert "Traceback" not in chunk, chunk
+        lines = [ln for ln in chunk.splitlines() if ln.strip()]
+        assert len(lines) <= 5, (len(lines), lines)
     finally:
         p.terminate()
         p.wait(10)

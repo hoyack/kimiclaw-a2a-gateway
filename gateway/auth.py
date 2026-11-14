@@ -139,7 +139,7 @@ def emit_refusals(pool_name: str, reasons: dict[str, int], path: str | None = No
     if pool_name == "precheck":
         LOG.warning("auth refused count=%d reasons=%s%s", count, parts, suffix)
     elif pool_name == "public":
-        LOG.warning("public count=%d reasons=%s%s", count, parts, suffix)
+        LOG.info("public count=%d reasons=%s%s", count, parts, suffix)
     elif pool_name == "http":
         LOG.warning("http refused count=%d reasons=%s%s", count, parts, suffix)
     elif pool_name == "limit":
