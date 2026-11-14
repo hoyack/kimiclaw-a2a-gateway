@@ -124,13 +124,24 @@ jobs:
 
           # --- never-serve checks ---
           # never_serve LABEL LIMIT_S WANT [docker run opts ...] -- [command ...]
-          # Runs detached with 8000/8001 published and GATEWAY_SIGNATURE_FUTURE_S=2 (a start that
-          # got through would serve within ~3s). While the container runs (and once after it
-          # exits), curl to both published ports must get no HTTP response. Then: exit code
-          # non-zero, the refusal message WANT in the log, no serve log. Running past LIMIT_S
+          # Bastion's spec: runs detached with BOTH 8000 and 8001 published and
+          # GATEWAY_SIGNATURE_FUTURE_S=2 (a start that got through would serve within ~3s).
+          # A background `curl -s -o /dev/null -w '%{http_code}'` poll runs against each port for
+          # the container's whole life (started before `docker run`, stopped after it exits); any
+          # value other than 000 fails. That checks for an HTTP status, not a TCP connect, because
+          # a uvicorn --workers supervisor socket accepts connections without serving. Then: exit
+          # code non-zero, the refusal message WANT in the log, no serve log. Running past LIMIT_S
           # is a hang and fails. The container is always removed (docker rm -f), hang or not.
           NS_MAIN=18100
           NS_PROBE=18101
+          ns_poll() {
+            local port="$1" out="$2" stop="$3"
+            while [ ! -e "${stop}" ]; do
+              curl -s -o /dev/null --max-time 1 -w "${port} %{http_code}\n" \
+                "http://127.0.0.1:${port}/healthz" >>"${out}" 2>/dev/null || true
+              sleep 0.1
+            done
+          }
           never_serve() {
             local label="$1" limit="$2" want="$3"; shift 3
             local opts=() cmd=()
@@ -138,8 +149,13 @@ jobs:
             if [ "$#" -gt 0 ]; then shift; fi
             cmd=("$@")
             local cname="${NAME}-${label}" log="${RUNNER_TEMP}/refuse-${label}.log"
-            local served="" hung=0 curls=0 curls_running=0 running port rc
+            local codes="${RUNNER_TEMP}/codes-${label}.txt" stop="${RUNNER_TEMP}/codes-${label}.stop"
+            local hung=0 running rc polls bad p_main p_probe
             docker rm -f "${cname}" >/dev/null 2>&1 || true
+            rm -f "${stop}"
+            : >"${codes}"
+            ns_poll "${NS_MAIN}" "${codes}" "${stop}" & p_main=$!
+            ns_poll "${NS_PROBE}" "${codes}" "${stop}" & p_probe=$!
             docker run -d --name "${cname}" --no-healthcheck \
               -p "127.0.0.1:${NS_MAIN}:8000" -p "127.0.0.1:${NS_PROBE}:8001" \
               -v "${HOST_KEYS}:${CONT_KEYS}:ro" \
@@ -149,27 +165,29 @@ jobs:
             local deadline=$((SECONDS + limit))
             while :; do
               running=$(docker inspect -f '{{.State.Running}}' "${cname}" 2>/dev/null || echo false)
-              for port in "${NS_MAIN}" "${NS_PROBE}"; do
-                curls=$((curls + 1))
-                if [ "${running}" = "true" ]; then curls_running=$((curls_running + 1)); fi
-                if curl -sS -o /dev/null --max-time 1 "http://127.0.0.1:${port}/healthz" 2>/dev/null; then
-                  served="${served} ${port}"
-                fi
-              done
               [ "${running}" = "true" ] || break
               if [ "${SECONDS}" -ge "${deadline}" ]; then hung=1; break; fi
               sleep 0.2
             done
+            # One more poll round after exit, then stop the pollers.
+            sleep 1.2
+            touch "${stop}"
+            wait "${p_main}" "${p_probe}" || true
             rc=$(docker inspect -f '{{.State.ExitCode}}' "${cname}" 2>/dev/null || echo unknown)
             docker logs "${cname}" >"${log}" 2>&1 || true
             docker rm -f "${cname}" >/dev/null 2>&1 || true
+            polls=$(wc -l <"${codes}")
+            bad=$(awk '$2 != "000"' "${codes}" | sort | uniq -c | tr '\n' ';')
             if [ "${hung}" = "1" ]; then
               cat "${log}" || true
               fail "${label}: still running after ${limit}s (hang = fail; container removed)"
             fi
-            if [ -n "${served}" ]; then
+            if [ -n "${bad}" ]; then
               cat "${log}" || true
-              fail "${label}: got an HTTP response on published port(s)${served}"
+              fail "${label}: HTTP status on a published port (count port code): ${bad}"
+            fi
+            if ! awk -v a="${NS_MAIN}" -v b="${NS_PROBE}" '$1==a{x=1} $1==b{y=1} END{exit !(x&&y)}' "${codes}"; then
+              fail "${label}: poller did not record both ports (${polls} polls)"
             fi
             if [ "${rc}" = "0" ] || [ "${rc}" = "unknown" ]; then
               cat "${log}" || true
@@ -183,7 +201,7 @@ jobs:
               cat "${log}" || true
               fail "${label}: refusal message missing '${want}'"
             fi
-            pass "${label}: exits non-zero (rc=${rc}) with '${want}', no serve log, no HTTP response on ${NS_MAIN}/${NS_PROBE} (${curls} curls, ${curls_running} while running)"
+            pass "${label}: exits non-zero (rc=${rc}) with '${want}', no serve log, every http_code on ${NS_MAIN}/${NS_PROBE} was 000 (${polls} polls)"
           }
 
           REFUSE_LAUNCHER='start with `python -m gateway`'
