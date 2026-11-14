@@ -97,9 +97,9 @@ signs the line `/?wait=false&b=2`, and sending `/?b=2&wait=false` with that sign
 duplicate-key rule to get wrong. A proxy in front of the gateway must not rewrite the path, the query or the body.
 
 The gateway checks, in order: each of the four headers present exactly once (a repeated `X-KC-*` header is rejected)
-and well formed, the timestamp is within 300 s of its clock (either direction) and later than the second the process started in,
-then a slot for reading the body (at most 32 bodies are read at once before authentication; over that the request gets
-`503 {"error": "busy"}` with `Retry-After: 1`), the body is at most 1 MB (else 413) and is hashed chunk by chunk (its
+and well formed, the timestamp at most 300 s behind its clock and at most 30 s ahead (`GATEWAY_SIGNATURE_PAST_S`,
+`GATEWAY_SIGNATURE_FUTURE_S`) and later than the second the process started in, then a slot for reading the body (see
+below), the body is at most 1 MB (else 413), read within the deadlines below (else 408) and hashed chunk by chunk (its
 bytes are kept only when the key_id is known, so an unknown key_id costs one chunk of memory), then the signature, compared in constant time over the bytes
 it received, before any JSON parsing. An unknown key_id is checked against a random dummy secret, so it costs the same
 as a wrong signature and gets the same response. Only a request whose signature verifies has its nonce checked and
@@ -109,25 +109,40 @@ unknown JSON-RPC methods, pays the caller's general token bucket (`GATEWAY_REQUE
 `GATEWAY_REQUESTS_BURST` 10); when it is empty the caller gets 429 and no nonce is kept. Only then is the nonce
 stored. The per-method limits below apply on top.
 
-The 32-slot cap bounds memory (peak RSS stays within tens of MB however many 1 MB unauthenticated bodies arrive) at
-the cost of availability under a flood: while slow uploads hold every slot, other callers get 503 and should retry.
-Connection and upload-timeout limits in front of the gateway are the place to blunt that.
+Bodies are read before the signature can be checked, so reads are pooled by the key_id they claim:
 
-Any rejection is `401 {"error": "unauthorized"}`. The reason (`duplicate_header`, `missing_header`, `malformed_header`, `stale_timestamp`, `stale-after-restart`,
+- key_ids not in the keys file share one pool of 32 reads; over that, `503 {"error": "busy"}` with `Retry-After: 1`.
+- Each known caller has its own pool of `GATEWAY_READS_PER_CALLER` reads (default 3, allowed 2 to 4, checked at
+  startup); over that, that caller gets `429 {"error": "rate limited"}` with `Retry-After: 1`. Its slow or forged
+  uploads never touch another caller's pool or the unknown pool.
+- Every read has a total deadline (`GATEWAY_BODY_READ_TIMEOUT_S`, default 10 s) and a limit on the gap between chunks
+  (`GATEWAY_BODY_IDLE_TIMEOUT_S`, default 5 s); past either the request gets `408 {"error": "request timeout"}`. A
+  client that disconnects mid-body gets nothing back and no traceback is logged. The slot is freed whatever happens.
+- Refused and failed reads are logged as `read refused pool=<unknown|caller> reason=pool_full key_id=...` or
+  `read failed pool=... reason=<too_large|read_deadline|read_idle|client_disconnected> key_id=...`.
+
+Peak RSS stays within tens of MB however many 1 MB unauthenticated bodies arrive, slow uploads with junk key_ids can
+no longer 503 a real caller, and since every read ends within 10 s, held reads can't block shutdown for longer than
+that. key_ids are not secret (they travel in every request), but they must be unguessable: someone who has a caller's
+key_id can fill that caller's small pool and get it 429s. They are 40 random bits from `secrets` and must only be
+issued by `tools/new_api_key.py`. A per-IP connection cap belongs at the edge, not in the gateway.
+
+Any rejection is `401 {"error": "unauthorized"}`. The reason (`duplicate_header`, `missing_header`, `malformed_header`, `stale_timestamp`, `stale_after_restart`,
 `unknown_key`, `bad_signature`, `replayed_nonce`) goes to the log with the key_id. A header value that isn't shaped like
 a key_id is logged as `malformed`, never verbatim, and the secret and the signature are never logged.
 
 Nonces are kept in process memory per caller, each until its timestamp leaves the window, and at most
 `GATEWAY_MAX_NONCES_PER_CALLER` (default 20,000) per caller. The general bucket keeps a caller far below that
-(5/s × 600 s + 10 ≈ 3,010), so the cap is a backstop. A caller at its cap gets `429 {"error": "rate limited"}` with
+(5/s × 330 s + 10 ≈ 1,660), so the cap is a backstop. A caller at its cap gets `429 {"error": "rate limited"}` with
 `Retry-After` set to when its oldest nonce expires. Only that caller is affected: other callers keep getting 200 and
 never 401. Memory is bounded by callers × cap. Per-process state is sound because the
-gateway runs one worker. A restart forgets the nonces, so the gateway also rejects (401, reason `stale-after-restart`)
+gateway runs one worker. A restart forgets the nonces, so the gateway also rejects (401, reason `stale_after_restart`)
 any timestamp from the second it started in or earlier, and holds startup until the next second begins before it
-serves. **The skew allowance is zero:** nothing signed before a restart is accepted after it, even when the restart
-takes under a second, and startup takes up to 1 s longer. The cost: right after a restart, requests signed just before
-it, or by a caller whose clock runs slow, get 401 for as many seconds as the clock lags. Callers should re-sign and
-retry. `Authorization: Bearer` keys are no longer accepted.
+serves (startup takes up to 1 s longer). That covers every request timestamped before the restart. What remains: a
+request timestamped up to 30 s in the future (`GATEWAY_SIGNATURE_FUTURE_S`), captured before a restart, can be
+replayed once after it until its timestamp falls behind the restart second, so at most 30 s after it was signed. The
+cost: right after a restart, requests signed just before it get 401, and a caller whose clock lags by N seconds gets
+401 for N seconds after each restart. Callers should re-sign and retry. `Authorization: Bearer` keys are no longer accepted.
 
 ### Caller keys
 
@@ -185,6 +200,9 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | `GATEWAY_MAX_PENDING` | `50` | all callers: running or queued tasks; more gets 429 |
 | `GATEWAY_REQUESTS_PER_S` / `GATEWAY_REQUESTS_BURST` | `5` / `10` | per caller: every signed request (any path or method), checked before its nonce is stored; empty gets 429 |
 | `GATEWAY_MAX_NONCES_PER_CALLER` | `20000` | per caller: live nonces kept for replay checks; more gets 429 until the oldest expires |
+| `GATEWAY_SIGNATURE_PAST_S` / `GATEWAY_SIGNATURE_FUTURE_S` | `300` / `30` | how far behind / ahead of the gateway clock a signed timestamp may be; ahead must not exceed behind |
+| `GATEWAY_READS_PER_CALLER` | `3` | per caller: bodies read at once before the signature is checked (2 to 4); more gets 429 |
+| `GATEWAY_BODY_READ_TIMEOUT_S` / `GATEWAY_BODY_IDLE_TIMEOUT_S` | `10` / `5` | total time to read a body / longest gap between chunks; past either gets 408 |
 | `GATEWAY_MAX_TASKS_PER_KEY` | `100` | per caller: stored tasks; the oldest finished ones are dropped past this |
 | `GATEWAY_TELEMETRY_FILE_MB` | `10` | size of each telemetry file; 5 files each for traces, metrics and logs (150 MB total) |
 | `GATEWAY_PUBLIC_URL` | `https://kimiclaw.hoyack.ai/` | `url` published in `/.well-known/agent.json` (e.g. `https://a2a.hoyack.ai/`) |

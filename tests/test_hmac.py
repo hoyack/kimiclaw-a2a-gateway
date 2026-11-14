@@ -62,7 +62,7 @@ def test_query_is_signed_exactly_as_sent_so_reordering_breaks_it(gw):
     ("altered query", {"path": "/?wait=true", "sign_path": "/?wait=false"}, "bad_signature"),
     ("query dropped", {"path": "/", "sign_path": "/?wait=false"}, "bad_signature"),
     ("stale timestamp", {"skew": -301}, "stale_timestamp"),
-    ("future timestamp", {"skew": 301}, "stale_timestamp"),
+    ("future timestamp", {"skew": 31}, "stale_timestamp"),
     ("unknown key", {"key": Signer("testkey09", KEY.secret)}, "unknown_key"),
     ("uppercase signature", {"X-KC-Signature": "A" * 64}, "malformed_header"),
     ("short signature", {"X-KC-Signature": "0" * 63}, "malformed_header"),
@@ -92,7 +92,7 @@ def test_missing_any_header_is_401(gw, header):
 
 
 def test_timestamp_inside_the_window_is_accepted(gw):
-    for skew in (0, 290):
+    for skew in (0, 25):
         assert send(gw[0], skew=skew)[0] == 200
 
 
@@ -242,7 +242,26 @@ def test_a_request_and_nonce_captured_before_a_restart_are_rejected_after_it(tmp
         assert (r.status_code, r.json()) == UNAUTHORIZED
         assert httpx.post(base + "/", content=GET, auth=KEY).status_code == 200
         time.sleep(0.1)
-        assert "unauthorized reason=stale-after-restart key_id=testkey01" in (tmp_path / "gateway.log").read_text()
+        assert "unauthorized reason=stale_after_restart key_id=testkey01" in (tmp_path / "gateway.log").read_text()
+    finally:
+        p.terminate(); p.wait(5)
+
+
+def test_a_request_240s_ahead_is_401_now_and_after_a_restart(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {})
+    ahead = str(int(time.time()) + 240)
+    h = {**signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", GET, timestamp=ahead),
+         "Content-Type": "application/json"}
+    stale = "unauthorized reason=stale_timestamp key_id=testkey01"
+    assert httpx.post(base + "/", content=GET, headers=h).status_code == 401
+    time.sleep(0.1)
+    assert stale in (tmp_path / "gateway.log").read_text()
+    p.terminate(); p.wait(5)
+    p, base, _ = start_gateway(tmp_path, {})
+    try:
+        assert httpx.post(base + "/", content=GET, headers=h).status_code == 401
+        time.sleep(0.1)
+        assert stale in (tmp_path / "gateway.log").read_text()
     finally:
         p.terminate(); p.wait(5)
 
@@ -310,26 +329,11 @@ def test_concurrent_1mb_bodies_with_unknown_keys_keep_memory_bounded(tmp_path):
         before = vm(p.pid, "VmRSS")
         threads, codes = flood(base, 300, body, trickle=True)
         time.sleep(1)
-        assert httpx.post(base + "/", content=GET, auth=OTHER_KEY).status_code in (200, 503)
+        assert httpx.post(base + "/", content=GET, auth=OTHER_KEY).status_code == 200
         [t.join() for t in threads]
         peak = vm(p.pid, "VmHWM")
         assert set(codes) <= {401, 503} and 401 in codes and 503 in codes, set(codes)
         assert peak - before < 60, f"RSS {before} -> peak {peak} MB"
         assert httpx.post(base + "/", content=GET, auth=OTHER_KEY).status_code == 200
-    finally:
-        p.terminate(); p.wait(5)
-
-
-def test_preauth_read_cap_is_503_with_retry_after(tmp_path):
-    p, base, _ = start_gateway(tmp_path, {})
-    try:
-        threads, codes = flood(base, 40, b"x" * 500_000, trickle=True)
-        time.sleep(0.5)
-        r = httpx.post(base + "/", content=GET, auth=OTHER_KEY)
-        assert (r.status_code, r.json(), r.headers["retry-after"]) == (503, {"error": "busy"}, "1")
-        [t.join() for t in threads]
-        assert codes.count(401) == 32 and codes.count(503) == 8, codes
-        assert httpx.post(base + "/", content=GET, auth=OTHER_KEY).status_code == 200
-        assert "busy pre-auth body reads=32 key_id=testkey02" in (tmp_path / "gateway.log").read_text()
     finally:
         p.terminate(); p.wait(5)

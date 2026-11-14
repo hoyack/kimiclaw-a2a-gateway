@@ -1,4 +1,5 @@
 """HMAC-signed requests (X-KC-* headers, per-caller secrets from GATEWAY_SIGNING_KEYS_FILE) and per-key token buckets."""
+import asyncio
 import hashlib
 import heapq
 import hmac
@@ -9,9 +10,11 @@ import time
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from starlette.requests import ClientDisconnect
 
-from gateway.config import (CANCEL_PER_S, CREATE_BURST, CREATE_PER_MIN, GET_PER_S, KEY_ID_RE, LOG, MAX_BODY,
-                            MAX_NONCES_PER_CALLER, REQUESTS_BURST, REQUESTS_PER_S, SIGNATURE_SKEW_S, SIGNING_KEYS,
+from gateway.config import (BODY_IDLE_TIMEOUT_S, BODY_READ_TIMEOUT_S, CANCEL_PER_S, CREATE_BURST, CREATE_PER_MIN,
+                            GET_PER_S, KEY_ID_RE, LOG, MAX_BODY, MAX_NONCES_PER_CALLER, READS_PER_CALLER,
+                            REQUESTS_BURST, REQUESTS_PER_S, SIGNATURE_FUTURE_S, SIGNATURE_PAST_S, SIGNING_KEYS,
                             log_safe)
 
 PUBLIC_PATHS = {"/.well-known/agent.json", "/healthz"}
@@ -21,8 +24,10 @@ NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
 DUMMY_SECRET = secrets.token_bytes(32)  # unknown key_ids pay for the same HMAC + compare as a wrong signature
 STARTED_S = int(time.time())  # nonces don't survive a restart, so nothing signed in or before this second is accepted
-MAX_PREAUTH_READS = 32
-_reading = 0
+MAX_UNKNOWN_READS = 32
+_reads: dict[str, int] = {}  # pre-auth body reads in progress: "" = unknown key_ids (shared), else per caller
+READ_FAILURES = {"too_large": (413, "request body too large"), "read_deadline": (408, "request timeout"),
+                 "read_idle": (408, "request timeout"), "client_disconnected": (400, "client disconnected")}
 
 # rpc method -> (tokens per second, bucket size)
 LIMITS = {
@@ -57,21 +62,34 @@ def nonce_quota_wait(seen: set[str], expiry: list[tuple[int, str]]) -> int:
     return max(1, math.ceil(expiry[0][0] - time.time()))
 
 
-async def hash_body(request: Request, keep: bool) -> tuple[str, bytearray] | None:
+async def hash_body(request: Request, keep: bool) -> tuple[str, bytearray] | str:
     """(sha256 hex, body) hashed chunk by chunk; the bytes are kept only if keep, so an unknown key_id costs one chunk
-    of memory. None if Content-Length or the bytes read pass MAX_BODY."""
+    of memory. Else a READ_FAILURES reason: over MAX_BODY, past the total deadline, idle too long between chunks, or
+    the client went away."""
     length = request.headers.get("content-length", "")
     if length.isdigit() and int(length) > MAX_BODY:
-        return None
+        return "too_large"
     digest, body, size = hashlib.sha256(), bytearray(), 0
-    async for chunk in request.stream():
-        size += len(chunk)
-        if size > MAX_BODY:
-            return None
-        digest.update(chunk)
-        if keep:
-            body += chunk
-    return digest.hexdigest(), body
+    chunks = request.stream().__aiter__()
+    try:
+        async with asyncio.timeout(BODY_READ_TIMEOUT_S):
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(anext(chunks), BODY_IDLE_TIMEOUT_S)
+                except StopAsyncIteration:
+                    return digest.hexdigest(), body
+                except TimeoutError:
+                    return "read_idle"
+                size += len(chunk)
+                if size > MAX_BODY:
+                    return "too_large"
+                digest.update(chunk)
+                if keep:
+                    body += chunk
+    except TimeoutError:
+        return "read_deadline"
+    except ClientDisconnect:
+        return "client_disconnected"
 
 
 def retry_after(caller: str, method: str) -> int:
@@ -118,24 +136,28 @@ async def signed_auth(request: Request, call_next):
     if not (KEY_ID_RE.fullmatch(key_id) and TIMESTAMP_RE.fullmatch(timestamp) and NONCE_RE.fullmatch(nonce)
             and SIGNATURE_RE.fullmatch(signature)):
         return unauthorized(request, key_id, "malformed_header")
-    if abs(time.time() - int(timestamp)) > SIGNATURE_SKEW_S:
+    if not -SIGNATURE_FUTURE_S <= time.time() - int(timestamp) <= SIGNATURE_PAST_S:
         return unauthorized(request, key_id, "stale_timestamp")
     if int(timestamp) <= STARTED_S:
-        return unauthorized(request, key_id, "stale-after-restart")
+        return unauthorized(request, key_id, "stale_after_restart")
     caller, secret = SIGNING_KEYS.get(key_id, (None, DUMMY_SECRET))
-    global _reading
-    if _reading >= MAX_PREAUTH_READS:
-        LOG.warning("busy pre-auth body reads=%d key_id=%s", _reading, key_id)
-        request.state.key_id = f"unverified:{key_id}"
+    pool = caller or ""
+    pool_name = "caller" if caller else "unknown"
+    request.state.key_id = f"unverified:{key_id}"
+    if _reads.get(pool, 0) >= (READS_PER_CALLER if caller else MAX_UNKNOWN_READS):
+        LOG.warning("read refused pool=%s reason=pool_full key_id=%s", pool_name, key_id)
+        if caller:
+            return rate_limited(1)
         return JSONResponse({"error": "busy"}, status_code=503, headers={"Retry-After": "1"})
-    _reading += 1
+    _reads[pool] = _reads.get(pool, 0) + 1
     try:
         hashed = await hash_body(request, keep=caller is not None)
     finally:
-        _reading -= 1
-    if hashed is None:
-        request.state.key_id = f"unverified:{key_id}"
-        return JSONResponse({"error": "request body too large"}, status_code=413)
+        _reads[pool] -= 1
+    if isinstance(hashed, str):
+        LOG.warning("read failed pool=%s reason=%s key_id=%s", pool_name, hashed, key_id)
+        status, error = READ_FAILURES[hashed]
+        return JSONResponse({"error": error}, status_code=status)
     body_sha256, body = hashed
     message = canonical(request.method, request.scope["raw_path"], request.scope["query_string"], timestamp, nonce,
                         body_sha256, key_id)
@@ -153,7 +175,7 @@ async def signed_auth(request: Request, call_next):
         request.state.key_id = key_id
         return rate_limited(wait)
     seen.add(nonce)
-    heapq.heappush(expiry, (int(timestamp) + SIGNATURE_SKEW_S, nonce))
+    heapq.heappush(expiry, (int(timestamp) + SIGNATURE_PAST_S, nonce))
     request.state.key_id = key_id
     request.state.caller = caller
     request.state.body = body

@@ -90,10 +90,20 @@ def load_signing_keys(path: str) -> dict[str, tuple[str, bytes]]:
 NOTIFY_URL = os.environ.get("GATEWAY_NOTIFY_URL", "").strip()
 TOKEN = _load_token() if NOTIFY_URL else ""  # outbound notify credential only; never accepted inbound
 SIGNING_KEYS = load_signing_keys(os.environ.get("GATEWAY_SIGNING_KEYS_FILE", "").strip())
-SIGNATURE_SKEW_S = 300
+SIGNATURE_PAST_S = int(os.environ.get("GATEWAY_SIGNATURE_PAST_S", "300"))
+SIGNATURE_FUTURE_S = int(os.environ.get("GATEWAY_SIGNATURE_FUTURE_S", "30"))
+if not 0 <= SIGNATURE_FUTURE_S <= SIGNATURE_PAST_S:
+    raise RuntimeError("want 0 <= GATEWAY_SIGNATURE_FUTURE_S <= GATEWAY_SIGNATURE_PAST_S")
 MAX_NONCES_PER_CALLER = int(os.environ.get("GATEWAY_MAX_NONCES_PER_CALLER", "20000"))
 REQUESTS_PER_S = float(os.environ.get("GATEWAY_REQUESTS_PER_S", "5"))
 REQUESTS_BURST = int(os.environ.get("GATEWAY_REQUESTS_BURST", "10"))
+READS_PER_CALLER = int(os.environ.get("GATEWAY_READS_PER_CALLER", "3"))
+BODY_READ_TIMEOUT_S = float(os.environ.get("GATEWAY_BODY_READ_TIMEOUT_S", "10"))
+BODY_IDLE_TIMEOUT_S = float(os.environ.get("GATEWAY_BODY_IDLE_TIMEOUT_S", "5"))
+if not 2 <= READS_PER_CALLER <= 4:
+    raise RuntimeError("GATEWAY_READS_PER_CALLER must be 2, 3 or 4")
+if not 0 < BODY_IDLE_TIMEOUT_S <= BODY_READ_TIMEOUT_S:
+    raise RuntimeError("want 0 < GATEWAY_BODY_IDLE_TIMEOUT_S <= GATEWAY_BODY_READ_TIMEOUT_S")
 CREATE_PER_MIN = float(os.environ.get("GATEWAY_CREATE_PER_MIN", "10"))
 CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
 GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))

@@ -3,14 +3,14 @@ import json
 import uuid
 from datetime import datetime, timezone
 
-from gateway.config import PUBLIC_URL
+from gateway.config import PUBLIC_URL, SIGNATURE_FUTURE_S, SIGNATURE_PAST_S
 
 SECURITY_SCHEMES = {"kcHmac": {
     "type": "apiKey", "in": "header", "name": "X-KC-Signature",
     "description": "HMAC-SHA256 request signing. Send X-KC-Key-Id, X-KC-Timestamp (unix seconds), X-KC-Nonce and "
                    "X-KC-Signature: hex HMAC-SHA256, keyed with your secret, over METHOD, path plus raw query as sent, "
-                   "timestamp, nonce, hex sha256(body) and key_id, joined by newlines. Timestamps must be within 300 s; "
-                   "a nonce is accepted once.",
+                   "timestamp, nonce, hex sha256(body) and key_id, joined by newlines. A timestamp may be at most "
+                   f"{SIGNATURE_PAST_S} s old or {SIGNATURE_FUTURE_S} s ahead; a nonce is accepted once.",
 }}
 
 AGENT_CARD = {
