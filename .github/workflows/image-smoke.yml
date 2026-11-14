@@ -135,6 +135,37 @@ jobs:
           fi
           pass "starting with the command overridden to uvicorn app:app exits non-zero (rc=${UV_RC})"
 
+          # CLI flags are not accepted; argparse exits non-zero (locally rc=2, not 1)
+          # before any listener starts. KIMICLAW_LIMIT_CONCURRENCY=1024 is set so the
+          # only reason to fail is the flag. Assert non-zero and no serve/listen logs,
+          # not an exact rc=1 (argparse uses 2).
+          refuse_cli() {
+            local label="$1"; shift
+            local log="${RUNNER_TEMP}/refuse-${label}.log"
+            set +e
+            timeout 20 docker run --rm --name "${NAME}-${label}" --no-healthcheck \
+              -v "${HOST_KEYS}:${CONT_KEYS}:ro" \
+              -e GATEWAY_PUBLIC_KEYS_FILE="${CONT_KEYS}" \
+              -e KIMICLAW_LIMIT_CONCURRENCY=1024 \
+              "${IMAGE}" python -m gateway --host 0.0.0.0 --port 8000 "$@" \
+              >"${log}" 2>&1
+            local rc=$?
+            set -e
+            if [ "${rc}" -eq 0 ] || [ "${rc}" -eq 124 ]; then
+              cat "${log}" || true
+              fail "python -m gateway --host 0.0.0.0 --port 8000 $* should exit non-zero before serving (rc=${rc})"
+            fi
+            if grep -Eiq 'probe listening|main port is serving|uvicorn limit_concurrency=' "${log}"; then
+              cat "${log}" || true
+              fail "python -m gateway --host 0.0.0.0 --port 8000 $* wrote serve/listen logs before exiting (rc=${rc})"
+            fi
+            pass "python -m gateway --host 0.0.0.0 --port 8000 $* exits non-zero and does not start serving (rc=${rc})"
+          }
+          refuse_cli workers --workers 2
+          refuse_cli limit64 --limit-concurrency 64
+          refuse_cli limit64eq --limit-concurrency=64
+          refuse_cli limit4096 --limit-concurrency 4096
+
           # --- run the real CMD ---
           RUN_ARGS=(
             -d --name "${NAME}" --no-healthcheck
