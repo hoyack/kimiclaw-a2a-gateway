@@ -1,4 +1,8 @@
-FROM python:3.13-slim
+# Multi-arch index digest for python:3.13-slim, resolved from Docker Hub
+# on 2026-11-13 22:21:37 CST (America/Chicago) via the registry API
+# (anonymous token from auth.docker.io; HEAD of the tag manifest with
+# Accept for the OCI index and docker manifest list; Docker-Content-Digest).
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
