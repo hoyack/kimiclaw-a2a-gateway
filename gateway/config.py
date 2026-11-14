@@ -32,6 +32,11 @@ def log_safe(value) -> str:
     )
 
 
+def log_path(value) -> str:
+    """A request path for logs: log_safe, then cap at 128 characters."""
+    return log_safe(value)[:MAX_LOG_ID]
+
+
 def _load_token() -> str:
     """Env var first, then .env. Needed only when GATEWAY_NOTIFY_URL is set; then missing or empty fails at startup
     with a clear message (never the value)."""

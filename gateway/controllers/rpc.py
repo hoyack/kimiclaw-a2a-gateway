@@ -1,11 +1,12 @@
 """JSON-RPC 2.0 dispatcher for POST / (A2A methods)."""
 import asyncio
 import json
+import shutil
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from gateway.auth import rate_limited, retry_after
+from gateway.auth import note_refusal, rate_limited, retry_after
 from gateway.config import AGENT_TIMEOUT, LOG, log_safe
 from gateway.models import now, rpc_error
 from gateway.services.task_store import BUSY, owned_task, start_task, tasks
@@ -52,11 +53,17 @@ async def handle_rpc(request: Request):
         return JSONResponse(rpc_error(req_id, -32602, "params must be an object"))
     retry = retry_after(request.state.caller, method)
     if retry:
+        note_refusal(request, "limit", "rate_limited", path=request.url.path)
         return rate_limited(retry)
+
+    if method in ("message/send", "message/stream") and shutil.which("openclaw") is None:
+        LOG.error("agent unavailable")
+        return JSONResponse(rpc_error(req_id, -32000, "agent unavailable"), status_code=503)
 
     if method == "message/send":
         started = await start_task(req_id, params, None, request.state.caller)
         if started is BUSY:
+            note_refusal(request, "limit", "busy", path=request.url.path)
             return rate_limited(BUSY_RETRY_S)
         if "error" in started:
             return JSONResponse(started)
@@ -83,6 +90,7 @@ async def handle_rpc(request: Request):
         queue = asyncio.Queue()
         started = await start_task(req_id, params, queue, request.state.caller)
         if started is BUSY:
+            note_refusal(request, "limit", "busy", path=request.url.path)
             return rate_limited(BUSY_RETRY_S)
         if "error" in started:
             return JSONResponse(started)

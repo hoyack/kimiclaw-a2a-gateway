@@ -21,7 +21,7 @@ Docker: the committed Dockerfile CMD is still `["uvicorn", "app:app", "--host", 
 
 ## Deploy contract
 
-CMD must be `["python", "-m", "gateway"]` (optionally `--host 0.0.0.0 --port 8000`). That is the only supported launcher: it pins `workers=1`, applies `KIMICLAW_LIMIT_CONCURRENCY`, starts the probe listener immediately, and arms the request-header timeout. Do not pass `--limit-concurrency` or `--workers`.
+CMD must be `["python", "-m", "gateway"]` (optionally `--host 0.0.0.0 --port 8000`). That is the only supported launcher: it pins `workers=1` and `ws=none` (so a websocket upgrade cannot bypass the header timer), applies `KIMICLAW_LIMIT_CONCURRENCY`, starts the probe listener immediately, and arms the request-header timeout. Do not pass `--limit-concurrency` or `--workers`. `uvicorn app:app` and `uvicorn --factory gateway.main:create_app` are refused.
 
 Publish two ports:
 
@@ -33,7 +33,7 @@ Publish two ports:
 Kubernetes probes must use the probe port, not 8000:
 
 - **Startup and liveness:** `GET :8001/healthz`. Returns 200 `{"status":"up"}` as soon as the process is up, **including during the startup hold** of `GATEWAY_SIGNATURE_FUTURE_S + 1` seconds (~31 s by default). The probe listener is bound before that hold begins. Bodies carry no version, config or caller data.
-- **Readiness:** `GET :8001/readyz`. Returns 503 `{"status":"starting"}` during the hold and 200 `{"status":"ready"}` once the main port is serving. If `GATEWAY_REQUIRE_OPENCLAW` is on (the default: only the exact string `0` turns it off) and `openclaw` is not on PATH, it stays 503 `{"status":"not ready"}`. The v1 manifest sets `GATEWAY_REQUIRE_OPENCLAW=0` so the stock image becomes ready without OpenClaw (`message/send` will still fail until it is installed); the openclaw release turns the flag back on.
+- **Readiness:** `GET :8001/readyz`. Returns 503 `{"status":"starting"}` during the hold and 200 `{"status":"ready"}` once the main port is serving. If `GATEWAY_REQUIRE_OPENCLAW` is on (the default: only the exact string `0` turns it off) and `openclaw` is not on PATH, it stays 503 `{"status":"not ready"}`. The v1 manifest sets `GATEWAY_REQUIRE_OPENCLAW=0` so the stock image becomes ready without OpenClaw (`message/send` will still fail until it is installed); the openclaw release turns the flag back on. Even with the flag at `0`, a signed `message/send` or `message/stream` fails closed with a generic HTTP 503 (`{"jsonrpc":"2.0",... "message":"agent unavailable"}`) if `openclaw` is missing; the body and logs do not name the binary or a path.
 
 Move the image HEALTHCHECK from `:8000/healthz` to `:8001/healthz`. Publish 8001 as well as 8000.
 
@@ -43,9 +43,9 @@ Required / relevant env:
 
 | Name | Default | Notes |
 | --- | --- | --- |
-| `KIMICLAW_LIMIT_CONCURRENCY` | required | integer 64–4096, digits only (`^[0-9]+$`) |
-| `GATEWAY_PROBE_PORT` | `8001` | 1–65535, must differ from the main port |
-| `GATEWAY_HEADER_TIMEOUT_S` | `5` | 1–30, digits only |
+| `KIMICLAW_LIMIT_CONCURRENCY` | required | integer 64–4096, `^[1-9][0-9]*$` only (no whitespace, no leading zeros) |
+| `GATEWAY_PROBE_PORT` | `8001` | 1–65535, `^[1-9][0-9]*$` only, must differ from the main port |
+| `GATEWAY_HEADER_TIMEOUT_S` | `5` | 1–30, `^[1-9][0-9]*$` only (no whitespace, no leading zeros) |
 | `GATEWAY_REQUIRE_OPENCLAW` | on (unset) | only the exact string `0` turns it off. v1 manifest sets `0`; the openclaw release turns it back on |
 | `GATEWAY_PUBLIC_KEYS_FILE` | required | see README |
 | `GATEWAY_SIGNATURE_FUTURE_S` | `30` | hold is this plus 1 second |

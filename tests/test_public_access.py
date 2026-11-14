@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from conftest import KEY, OTHER_KEY, ROOT, PRIVATE_KEYS, TOKEN, Signer, public_key, start_gateway, write_keys_file
+from sign_request import signed_headers
 
 GET = {"jsonrpc": "2.0", "id": "1", "method": "tasks/get", "params": {"id": "nope"}}
 SEND = {"jsonrpc": "2.0", "id": "1", "method": "message/send",
@@ -419,7 +420,7 @@ def test_a_weak_ed25519_public_key_is_refused_at_load(tmp_path, label, raw):
 
 
 def test_an_honest_plus_torsion_key_is_refused_at_startup_and_gets_401_on_a_good_gateway(start, tmp_path):
-    """E-1b: a public key that is an honest point plus a torsion point never loads; a request signed by the honest key is 401 on a good-keys gateway."""
+    """E-1b: a public key that is an honest point plus a torsion point never loads; a signature whose R is an honest commitment plus a torsion point is 401 on a good-keys gateway under a known key_id."""
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives import serialization
     private = Ed25519PrivateKey.generate()
@@ -432,8 +433,15 @@ def test_an_honest_plus_torsion_key_is_refused_at_startup_and_gets_401_on_a_good
     r = boot(tmp_path, HEADER + f"cccccccccc mallory {encoded}\n")
     assert r.returncode != 0 and "GATEWAY_PUBLIC_KEYS_FILE line 2:" in r.stderr
     assert encoded[:16] not in r.stderr
+    # 401 half: known honest key_id on a good-keys gateway; signature R is the honest R plus a torsion point.
     base = start()
-    signed = post(base, GET, Signer("cccccccccc", priv_b64))
+    hdr = signed_headers(KEY.key_id, KEY.private_key, "GET", b"/", b"", b"")
+    sig = bytes.fromhex(hdr["X-KC-Signature"])
+    r_pt = _decode_oncurve(sig[:32])
+    assert r_pt is not None
+    forged = _encode_point(_ext_add(r_pt, _torsion_points()[1])) + sig[32:]
+    hdr["X-KC-Signature"] = forged.hex()
+    signed = httpx.get(base + "/", headers=hdr)
     assert signed.status_code == 401 and signed.json() == {"error": "unauthorized"}
 
 

@@ -8,6 +8,7 @@ from uvicorn import Config, Server
 
 from gateway.config import LOG
 from gateway.http_protocol import HeaderTimeoutProtocol
+from gateway.launcher_guard import mark_launched
 from gateway.main import create_app, header_timeout_s, limit_concurrency, probe_port
 from gateway.probe import probe_app
 from gateway.routes.health import require_openclaw, set_main_serving
@@ -17,7 +18,7 @@ def _config(app, host, port, *, cap=None, header_timeout=None):
     import gateway.http_protocol as http_protocol
     if header_timeout is not None:
         http_protocol.HEADER_TIMEOUT_S = header_timeout
-    kwargs = dict(app=app, host=host, port=port, access_log=False, http=HeaderTimeoutProtocol, workers=1)
+    kwargs = dict(app=app, host=host, port=port, access_log=False, http=HeaderTimeoutProtocol, ws="none", workers=1)
     if cap is not None:
         kwargs["limit_concurrency"] = cap
     return Config(**kwargs)
@@ -35,10 +36,12 @@ async def _wait_until(predicate, timeout=30, interval=0.02):
 async def serve(host: str, port: int, probe: int, cap: int, header_timeout: int):
     """Start the probe listener immediately, then the main app (whose lifespan holds ~31s)."""
     set_main_serving(False)
+    mark_launched()
     probe_server = Server(_config(probe_app, host, probe, header_timeout=header_timeout))
     main_server = Server(_config(create_app(), host, port, cap=cap, header_timeout=header_timeout))
+    applied = main_server.config.limit_concurrency
     LOG.warning("uvicorn limit_concurrency=%d header_timeout_s=%d probe_port=%d workers=1",
-                cap, header_timeout, probe)
+                applied, header_timeout, probe)
     if not require_openclaw():
         LOG.warning("GATEWAY_REQUIRE_OPENCLAW=0: readiness ignores openclaw; message/send will fail until openclaw is installed")
 

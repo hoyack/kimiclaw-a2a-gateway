@@ -24,7 +24,13 @@ class HeaderTimeoutProtocol(H11Protocol):
             self._cancel_header_timer()
 
     def on_response_complete(self):
+        # super() may start the next pipelined RequestResponseCycle from already-buffered
+        # headers; do not arm a timer that would then kill that request mid-body.
+        cycle_before = self.cycle
         super().on_response_complete()
+        if self.cycle is not None and self.cycle is not cycle_before:
+            self._cancel_header_timer()
+            return
         if self.transport is not None and not self.transport.is_closing():
             self._arm_header_timer()
 

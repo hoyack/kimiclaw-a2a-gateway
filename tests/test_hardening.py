@@ -110,6 +110,9 @@ def test_oversized_content_length_is_refused_before_the_body_is_read(base):
     ("128.0", "must be an integer"),
     ("1_024", "must be an integer"),
     ("+128", "must be an integer"),
+    (" 128", "must be an integer"),
+    ("128\n", "must be an integer"),
+    ("0128", "must be an integer"),
     ("63", "from 64 to 4096"),
     ("4097", "from 64 to 4096"),
 ])
@@ -133,10 +136,12 @@ def test_uvicorn_app_app_is_refused():
 
 
 @pytest.mark.parametrize("value,needle", [
-    ("0", "from 1 to 30"),
+    ("0", "must be an integer"),
     ("31", "from 1 to 30"),
     ("5.5", "must be an integer"),
     ("+5", "must be an integer"),
+    (" 5", "must be an integer"),
+    ("05", "must be an integer"),
 ])
 def test_refuses_to_start_with_a_bad_header_timeout(value, needle):
     r = subprocess.run([sys.executable, "-c", "from gateway.main import header_timeout_s; header_timeout_s()"],
@@ -354,32 +359,28 @@ def test_quiet_refusals_are_counted_in_requests_total_and_not_exported_as_spans(
     assert "401" in metrics and "200" in metrics
 
 def test_plain_uvicorn_including_workers_2_is_refused():
-    """W-1: python -m gateway is the only launcher; a second worker must not be startable."""
+    """W-1: python -m gateway is the only launcher; --workers 2 exits fast with a single refusal line."""
     from conftest import free_port
     port = free_port()
     r = subprocess.run(
         [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=15)
     assert r.returncode != 0 and "python -m gateway" in (r.stderr + r.stdout)
-    # --workers 2 runs a supervisor that may not exit when the workers fail to import
     port = free_port()
-    p = subprocess.Popen(
+    t0 = time.monotonic()
+    r = subprocess.run(
         [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port), "--workers", "2"],
-        cwd=ROOT, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=8)
+    elapsed = time.monotonic() - t0
+    out = r.stderr + r.stdout
+    assert elapsed < 6, elapsed
+    assert out.count("start with `python -m gateway`") == 1, out
+    assert "Traceback" not in out, out
     try:
-        try:
-            out, _ = p.communicate(timeout=8)
-        except subprocess.TimeoutExpired:
-            p.kill()
-            out, _ = p.communicate()
-        assert "python -m gateway" in (out or ""), out
-        try:
-            status = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=1).status_code
-        except httpx.HTTPError:
-            status = None
-        assert status not in (200, 503), status
-    finally:
-        p.kill(); p.wait(5)
+        status = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=1).status_code
+    except httpx.HTTPError:
+        status = None
+    assert status not in (200, 503), status
 
 def test_concurrency_cap_is_taken_from_the_env_only_and_logged_after_it_is_applied(tmp_path):
     """C-1: no --limit-concurrency flag; the env value is logged only after Config has it."""
@@ -513,4 +514,192 @@ def test_idle_connections_on_the_probe_port_are_closed_while_healthz_stays_200(t
         assert httpx.get(probe + "/healthz", timeout=2).json() == {"status": "up"}
     finally:
         [s.close() for s in held]
+        p.terminate(); p.wait(5)
+
+
+def test_factory_create_app_is_refused():
+    """Critic #2 / W-1b: uvicorn --factory gateway.main:create_app (including --workers 2) is refused."""
+    from conftest import free_port
+    port = free_port()
+    r = subprocess.run(
+        [sys.executable, "-m", "uvicorn", "--factory", "gateway.main:create_app",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=15)
+    out = r.stderr + r.stdout
+    assert r.returncode != 0 and "python -m gateway" in out and "--factory" in out
+    try:
+        status = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=1).status_code
+    except httpx.HTTPError:
+        status = None
+    assert status not in (200, 503), status
+
+    port = free_port()
+    t0 = time.monotonic()
+    r = subprocess.run(
+        [sys.executable, "-m", "uvicorn", "--factory", "gateway.main:create_app",
+         "--host", "127.0.0.1", "--port", str(port), "--workers", "2"],
+        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=8)
+    elapsed = time.monotonic() - t0
+    out = r.stderr + r.stdout
+    assert elapsed < 6, elapsed
+    assert out.count("start with `python -m gateway`") == 1, out
+    assert "Traceback" not in out, out
+    try:
+        status = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=1).status_code
+    except httpx.HTTPError:
+        status = None
+    assert status not in (200, 503), status
+
+
+def test_a_pipelined_request_with_a_slow_body_is_not_closed_by_the_header_timer(tmp_path):
+    """Complete headers of request 2 are already buffered when request 1 finishes; a body trickled past 5s must still get a response."""
+    p, base, _ = start_gateway(tmp_path, {
+        "GATEWAY_HEADER_TIMEOUT_S": "5",
+        "GATEWAY_BODY_READ_TIMEOUT_S": "15",
+        "GATEWAY_BODY_IDLE_TIMEOUT_S": "8",
+    })
+    port = int(base.rsplit(":", 1)[1])
+    try:
+        body = b'{"jsonrpc":"2.0","id":"1","method":"tasks/get","params":{"id":"x"}}'
+        h1 = signed_headers(KEY.key_id, KEY.private_key, "GET", b"/", b"", b"")
+        h2 = signed_headers(KEY.key_id, KEY.private_key, "POST", b"/", b"", body)
+        req1 = "GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n" + "".join(
+            f"{k}: {v}\r\n" for k, v in h1.items()) + "\r\n"
+        req2_head = (
+            f"POST / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n"
+            + "".join(f"{k}: {v}\r\n" for k, v in h2.items()) + "\r\n"
+        )
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        s.sendall(req1.encode() + req2_head.encode())
+        status1, _ = _read_http_response(s, timeout=5)
+        assert status1 == 200, status1
+        t0 = time.monotonic()
+        for i, byte in enumerate(body):
+            s.sendall(bytes([byte]))
+            if i + 1 < len(body):
+                time.sleep(0.15)
+        # stretch past the 5s header deadline while staying inside body deadlines
+        leftover = 5.5 - (time.monotonic() - t0)
+        if leftover > 0:
+            time.sleep(leftover)
+            s.sendall(b"")  # nothing; body already complete. If we already sent all bytes early, wait then read.
+        elapsed = time.monotonic() - t0
+        assert elapsed >= 5.2, elapsed
+        status2, raw = _read_http_response(s, timeout=8)
+        assert status2 in (200, 400), (status2, raw)
+        assert not (status2 == 0 and raw == b""), "connection closed instead of a response"
+    finally:
+        p.terminate(); p.wait(5)
+
+
+def test_unverified_options_public_paths_and_404_405_are_aggregated_quietly(tmp_path):
+    """A-2: 1,000 unauthenticated OPTIONS, public-path, 404 and 405 requests produce only a few aggregated lines."""
+    tdir = tmp_path / "tel"
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_REFUSAL_LOG_S": "1", "GATEWAY_TELEMETRY_DIR": str(tdir)})
+    try:
+        for _ in range(1000):
+            assert httpx.options(base + "/", timeout=5).status_code == 405
+        for _ in range(1000):
+            assert httpx.get(base + "/healthz", timeout=5).status_code == 200
+        for _ in range(1000):
+            assert httpx.get(base + "/no-such-route", auth=KEY, timeout=5).status_code == 404
+        for _ in range(1000):
+            assert httpx.post(base + "/healthz", timeout=5).status_code == 405
+        time.sleep(1.2)
+    finally:
+        p.terminate(); p.wait(10)
+    text = (tmp_path / "gateway.log").read_text()
+    refused = [ln for ln in text.splitlines() if "auth refused count=" in ln]
+    assert refused, text
+    # a handful of aggregated lines, not one per request
+    assert len(refused) < 40, len(refused)
+    access = [ln for ln in text.splitlines() if "kimiclaw.access" in ln or "uvicorn.access" in ln]
+    assert not any(" OPTIONS " in ln or " /healthz " in ln or " /no-such-route " in ln for ln in access), access
+    import json
+    traces = (tdir / "traces.jsonl").read_text() if (tdir / "traces.jsonl").exists() else ""
+    for s in [json.loads(l) for l in traces.splitlines() if l.strip()]:
+        attrs = s.get("attributes") or {}
+        method = attrs.get("http.request.method") or s.get("name")
+        path = attrs.get("url.path") or ""
+        status = attrs.get("http.response.status_code")
+        assert method != "OPTIONS", s
+        assert path not in ("/healthz", "/no-such-route"), s
+        assert status not in (404, 405), s
+
+
+def test_a_60kb_path_produces_a_log_line_under_300_bytes(tmp_path):
+    """A-2: a logged path is capped at 128 characters after log_safe, so a 60 kB path cannot bloat the log."""
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_REFUSAL_LOG_S": "0"})
+    path = "/p" + "a" * 60_000
+    try:
+        r = httpx.get(base + path, timeout=10)
+        assert r.status_code in (401, 404)
+        time.sleep(0.2)
+    finally:
+        p.terminate(); p.wait(5)
+    text = (tmp_path / "gateway.log").read_text()
+    # the new refusal line must exist and every log line stays small
+    assert "auth refused count=" in text
+    long = [ln for ln in text.splitlines() if len(ln.encode()) >= 300]
+    assert not long, [(len(ln.encode()), ln[:80]) for ln in long]
+    assert path not in text
+    assert ("a" * 200) not in text
+
+
+def test_a_thousand_rate_limit_429s_are_aggregated(tmp_path):
+    """A-3: 1,000 429s from a valid key produce aggregated lines, not two lines each."""
+    p, base, _ = start_gateway(tmp_path, {
+        "GATEWAY_REFUSAL_LOG_S": "1",
+        "GATEWAY_REQUESTS_PER_S": "0.0001",
+        "GATEWAY_REQUESTS_BURST": "1",
+    })
+    try:
+        codes = []
+        for _ in range(1001):
+            codes.append(httpx.get(base + "/", auth=KEY, timeout=5).status_code)
+        time.sleep(1.2)
+    finally:
+        p.terminate(); p.wait(5)
+    assert codes[0] == 200
+    n429 = sum(1 for c in codes if c == 429)
+    assert n429 >= 1000, (n429, set(codes))
+    text = (tmp_path / "gateway.log").read_text()
+    limited = [ln for ln in text.splitlines() if "rate limited count=" in ln]
+    assert limited, text
+    total = sum(int(ln.split("count=", 1)[1].split()[0]) for ln in limited)
+    assert total >= 1000, (total, limited)
+    assert len(limited) < 40, limited
+    # no per-request rate-limit warning or access line for the 429s
+    assert not any("rate limited key_id=" in ln for ln in text.splitlines())
+    access = [ln for ln in text.splitlines() if "kimiclaw.access" in ln]
+    assert not any(ln.endswith(" 429") or " 429" in ln.split("kimiclaw.access")[-1] for ln in access), access
+
+
+def test_message_send_without_openclaw_is_a_generic_503(tmp_path):
+    """Even with GATEWAY_REQUIRE_OPENCLAW=0, a signed message/send fails closed with a generic 503."""
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_REQUIRE_OPENCLAW": "0", "PATH": "/usr/bin:/bin"})
+    try:
+        assert httpx.get(_probe(p) + "/readyz", timeout=5).json() == {"status": "ready"}
+        body = {"jsonrpc": "2.0", "id": "1", "method": "message/send",
+                "params": {"message": {"role": "user", "parts": [{"kind": "text", "text": "hi"}]}}}
+        r = httpx.post(base + "/", json=body, auth=KEY, timeout=10)
+        text = r.text
+        assert r.status_code == 503, (r.status_code, text)
+        for needle in ("openclaw", "/", "No such file", "Errno"):
+            assert needle not in text, (needle, text)
+        log = (tmp_path / "gateway.log").read_text()
+        # only generic wording; no binary name, path, or OS error text on the failure line
+        fail_lines = [ln for ln in log.splitlines() if "agent unavailable" in ln or "message/send" in ln
+                      or "openclaw" in ln.lower() or "No such file" in ln or "Errno" in ln
+                      or "FileNotFound" in ln]
+        assert any("agent unavailable" in ln for ln in fail_lines), log
+        for ln in fail_lines:
+            if "GATEWAY_REQUIRE_OPENCLAW=0:" in ln:
+                continue  # the documented startup warning is allowed to name openclaw
+            assert "No such file" not in ln and "Errno" not in ln and "FileNotFound" not in ln
+            # the access/error line for the failed send itself is generic
+            if "agent unavailable" in ln:
+                assert "openclaw" not in ln.lower() and "No such file" not in ln
+    finally:
         p.terminate(); p.wait(5)
