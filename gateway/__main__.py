@@ -10,7 +10,7 @@ from gateway.config import LOG
 from gateway.http_protocol import HeaderTimeoutProtocol
 from gateway.main import create_app, header_timeout_s, limit_concurrency, probe_port
 from gateway.probe import probe_app
-from gateway.routes.health import set_main_serving
+from gateway.routes.health import require_openclaw, set_main_serving
 
 
 def _config(app, host, port, *, cap=None, header_timeout=None):
@@ -39,6 +39,8 @@ async def serve(host: str, port: int, probe: int, cap: int, header_timeout: int)
     main_server = Server(_config(create_app(), host, port, cap=cap, header_timeout=header_timeout))
     LOG.warning("uvicorn limit_concurrency=%d header_timeout_s=%d probe_port=%d workers=1",
                 cap, header_timeout, probe)
+    if not require_openclaw():
+        LOG.warning("GATEWAY_REQUIRE_OPENCLAW=0: readiness ignores openclaw; message/send will fail until openclaw is installed")
 
     async def run_probe():
         await probe_server._serve()

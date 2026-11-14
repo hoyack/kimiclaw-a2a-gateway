@@ -33,7 +33,7 @@ Publish two ports:
 Kubernetes probes must use the probe port, not 8000:
 
 - **Startup and liveness:** `GET :8001/healthz`. Returns 200 `{"status":"up"}` as soon as the process is up, **including during the startup hold** of `GATEWAY_SIGNATURE_FUTURE_S + 1` seconds (~31 s by default). The probe listener is bound before that hold begins. Bodies carry no version, config or caller data.
-- **Readiness:** `GET :8001/readyz`. Returns 503 `{"status":"starting"}` during the hold and 200 `{"status":"ready"}` once the main port is serving (or 503 `{"status":"not ready"}` if `openclaw` is not on PATH). 503 without OpenClaw is by design, not an outage; CI and the stock image have no `openclaw`.
+- **Readiness:** `GET :8001/readyz`. Returns 503 `{"status":"starting"}` during the hold and 200 `{"status":"ready"}` once the main port is serving. If `GATEWAY_REQUIRE_OPENCLAW` is on (the default: only the exact string `0` turns it off) and `openclaw` is not on PATH, it stays 503 `{"status":"not ready"}`. The v1 manifest sets `GATEWAY_REQUIRE_OPENCLAW=0` so the stock image becomes ready without OpenClaw (`message/send` will still fail until it is installed); the openclaw release turns the flag back on.
 
 Move the image HEALTHCHECK from `:8000/healthz` to `:8001/healthz`. Publish 8001 as well as 8000.
 
@@ -46,6 +46,7 @@ Required / relevant env:
 | `KIMICLAW_LIMIT_CONCURRENCY` | required | integer 64–4096, digits only (`^[0-9]+$`) |
 | `GATEWAY_PROBE_PORT` | `8001` | 1–65535, must differ from the main port |
 | `GATEWAY_HEADER_TIMEOUT_S` | `5` | 1–30, digits only |
+| `GATEWAY_REQUIRE_OPENCLAW` | on (unset) | only the exact string `0` turns it off. v1 manifest sets `0`; the openclaw release turns it back on |
 | `GATEWAY_PUBLIC_KEYS_FILE` | required | see README |
 | `GATEWAY_SIGNATURE_FUTURE_S` | `30` | hold is this plus 1 second |
 | `WEB_CONCURRENCY` | `1` | anything but 1 refuses startup |

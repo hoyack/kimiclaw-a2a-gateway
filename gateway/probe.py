@@ -34,7 +34,7 @@ async def probe_app(scope, receive, send):
     if method == "GET" and path == "/readyz":
         if not health_state.MAIN_SERVING:
             await _send(send, 503, {"status": "starting"})
-        elif shutil.which("openclaw") is None:
+        elif health_state.require_openclaw() and shutil.which("openclaw") is None:
             await _send(send, 503, {"status": "not ready"})
         else:
             await _send(send, 200, {"status": "ready"})

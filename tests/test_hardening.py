@@ -194,6 +194,74 @@ def test_probe_healthz_is_up_and_readyz_is_503_during_the_startup_hold(tmp_path)
         p.terminate(); p.wait(5)
 
 
+@pytest.mark.parametrize("value,required", [
+    (None, True),
+    ("false", True),
+    ("no", True),
+    (" 0", True),
+    ("00", True),
+    ("1", True),
+    ("", True),
+    ("0", False),
+])
+def test_require_openclaw_is_on_unless_the_value_is_exactly_0(value, required, monkeypatch):
+    if value is None:
+        monkeypatch.delenv("GATEWAY_REQUIRE_OPENCLAW", raising=False)
+    else:
+        monkeypatch.setenv("GATEWAY_REQUIRE_OPENCLAW", value)
+    from gateway.routes.health import require_openclaw
+    assert require_openclaw() is required
+
+
+def test_probe_readyz_is_starting_during_the_hold_even_when_openclaw_is_not_required(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {
+        "GATEWAY_SIGNATURE_FUTURE_S": "8",
+        "GATEWAY_REQUIRE_OPENCLAW": "0",
+        "PATH": "/usr/bin:/bin",
+    }, wait="probe")
+    try:
+        ready = httpx.get(_probe(p) + "/readyz", timeout=2)
+        assert ready.status_code == 503 and ready.json() == {"status": "starting"}
+        with pytest.raises(httpx.ConnectError):
+            httpx.get(base + "/healthz", timeout=0.4)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                if httpx.get(_probe(p) + "/readyz", timeout=0.5).status_code == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        r = httpx.get(_probe(p) + "/readyz", timeout=2)
+        assert r.status_code == 200 and r.json() == {"status": "ready"}
+        log = (tmp_path / "gateway.log").read_text()
+        assert "GATEWAY_REQUIRE_OPENCLAW=0: readiness ignores openclaw; message/send will fail until openclaw is installed" in log
+    finally:
+        p.terminate(); p.wait(5)
+
+
+def test_probe_readyz_is_200_when_openclaw_is_not_required_and_is_missing(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_REQUIRE_OPENCLAW": "0", "PATH": "/usr/bin:/bin"})
+    try:
+        r = httpx.get(_probe(p) + "/readyz", timeout=5)
+        assert r.status_code == 200 and r.json() == {"status": "ready"}
+        log = (tmp_path / "gateway.log").read_text()
+        assert "GATEWAY_REQUIRE_OPENCLAW=0: readiness ignores openclaw; message/send will fail until openclaw is installed" in log
+    finally:
+        p.terminate(); p.wait(5)
+
+
+def test_probe_readyz_is_not_ready_when_openclaw_is_required_and_is_missing(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {"PATH": "/usr/bin:/bin"})
+    try:
+        r = httpx.get(_probe(p) + "/readyz", timeout=5)
+        assert r.status_code == 503 and r.json() == {"status": "not ready"}
+        log = (tmp_path / "gateway.log").read_text()
+        assert "GATEWAY_REQUIRE_OPENCLAW=0:" not in log
+    finally:
+        p.terminate(); p.wait(5)
+
+
 def test_zero_byte_and_partial_header_connections_are_closed_by_the_header_timeout(tmp_path):
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_HEADER_TIMEOUT_S": "5", "KIMICLAW_LIMIT_CONCURRENCY": "64"})
     port = int(base.rsplit(":", 1)[1])
