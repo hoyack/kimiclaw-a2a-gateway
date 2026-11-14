@@ -1,5 +1,6 @@
 """Critic FIX FIRST on #5: no hung tasks, single-worker and per-key-slot guards, sanitized log fields, early 413."""
 import os
+from pathlib import Path
 import socket
 import subprocess
 import sys
@@ -372,18 +373,6 @@ def _venv_script(name):
     return os.path.join(os.path.dirname(sys.executable), name)
 
 
-def _try_install(*mods):
-    missing = [m for m in mods if __import__("importlib").util.find_spec(m) is None]
-    if not missing:
-        return True
-    r = subprocess.run([sys.executable, "-m", "pip", "install", *missing],
-                       capture_output=True, text=True, timeout=120)
-    if r.returncode != 0:
-        return False
-    import importlib
-    return all(importlib.util.find_spec(m) is not None for m in mods)
-
-
 def _assert_launch_refused(kind, argv, extra_env=None):
     """Unsupported server starts exit non-zero in a few seconds, never serve a signed 200, and do not flood."""
     from conftest import free_port
@@ -396,6 +385,10 @@ def _assert_launch_refused(kind, argv, extra_env=None):
         cmd = [_venv_script("gunicorn"), *argv, "-b", f"127.0.0.1:{port}"]
     elif kind == "hypercorn":
         cmd = [_venv_script("hypercorn"), *argv, "-b", f"127.0.0.1:{port}"]
+    elif kind == "py-uvicorn":
+        cmd = [sys.executable, *argv, "--host", "127.0.0.1", "--port", str(port)]
+    elif kind == "py-hypercorn":
+        cmd = [sys.executable, *argv, "-b", f"127.0.0.1:{port}"]
     else:
         raise ValueError(kind)
     env = {**ENV, **(extra_env or {})}
@@ -448,6 +441,11 @@ def _assert_launch_refused(kind, argv, extra_env=None):
     ("uvicorn", ["--factory", "gateway.__main__:create_app", "--workers", "2"], None),
     ("gunicorn", ["-k", "uvicorn.workers.UvicornWorker", "gateway.__main__:create_app()"], None),
     ("hypercorn", ["gateway.__main__:create_app()"], None),
+    ("uvicorn", ["tools.freeze_openapi:app"], None),
+    ("py-uvicorn", ["-u", _venv_script("uvicorn"), "app:app", "--workers", "2"], None),
+    ("py-uvicorn", ["-X", "dev", "-m", "uvicorn", "app:app", "--workers", "2"], None),
+    ("py-uvicorn", ["-I", "-m", "uvicorn", "--app-dir", ROOT, "app:app", "--workers", "2"], None),
+    ("py-hypercorn", ["-u", "-m", "hypercorn", "-w", "2", "gateway.__main__:create_app()"], None),
 ], ids=[
     "app:app",
     "app:app --workers 2",
@@ -467,16 +465,20 @@ def _assert_launch_refused(kind, argv, extra_env=None):
     "gateway.__main__:create_app --factory --workers 2",
     "gunicorn UvicornWorker gateway.__main__:create_app()",
     "hypercorn gateway.__main__:create_app()",
+    "uvicorn tools.freeze_openapi:app",
+    "python -u $(which uvicorn) --workers 2",
+    "python -X dev -m uvicorn --workers 2",
+    "python -I -m uvicorn --workers 2",
+    "python -u -m hypercorn -w 2",
 ])
 def test_unsupported_uvicorn_launches_are_refused(kind, argv, extra_env):
     """Every non-launcher start is refused: one sentinel, no argv/env case list in the guard."""
-    if kind in ("gunicorn", "hypercorn"):
-        if not _try_install(kind):
-            pytest.skip(f"{kind} is not installed")
-        exe = _venv_script(kind)
+    if kind in ("gunicorn", "hypercorn", "py-hypercorn"):
+        pytest.importorskip("gunicorn" if kind == "gunicorn" else "hypercorn")
+        exe = _venv_script("gunicorn" if kind == "gunicorn" else "hypercorn")
         if not os.path.exists(exe):
-            pytest.skip(f"{kind} console script is not installed")
-    if kind == "console" and not os.path.exists(_venv_script("uvicorn")):
+            pytest.skip(f"{exe} is not installed")
+    if kind in ("console", "py-uvicorn") and not os.path.exists(_venv_script("uvicorn")):
         pytest.skip("uvicorn console script is not installed")
     _assert_launch_refused(kind, argv, extra_env)
 
@@ -550,6 +552,44 @@ def test_official_launcher_rejects_bad_inflight_without_traceback():
     r = _run_official({**ENV, "GATEWAY_MAX_INFLIGHT_PER_KEY": "abc"})
     out = r.stderr + r.stdout
     assert r.returncode != 0 and "GATEWAY_MAX_INFLIGHT_PER_KEY must be an integer" in out and "Traceback" not in out, out
+
+
+def test_official_launcher_rejects_bad_create_burst_without_traceback():
+    r = _run_official({**ENV, "GATEWAY_CREATE_BURST": "abc"})
+    out = r.stderr + r.stdout
+    assert r.returncode != 0 and "GATEWAY_CREATE_BURST must be an integer" in out and "Traceback" not in out, out
+
+
+def test_importing_freeze_openapi_does_not_write_openapi_yaml():
+    path = os.path.join(ROOT, "openapi.yaml")
+    before = Path(path).read_bytes() if os.path.exists(path) else None
+    mtime = os.path.getmtime(path) if os.path.exists(path) else None
+    r = subprocess.run(
+        [sys.executable, "-c", "import tools.freeze_openapi"],
+        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=15)
+    assert r.returncode == 0, r.stderr + r.stdout
+    if before is None:
+        assert not os.path.exists(path)
+    else:
+        assert os.path.getmtime(path) == mtime
+        assert Path(path).read_bytes() == before
+
+
+def test_probe_incomplete_drop_does_not_hide_a_main_port_line():
+    """A probe swallow is task-local and cannot hide a main-port incomplete-response line."""
+    import contextvars
+    from gateway.probe import note_incomplete_drop, take_incomplete_drop
+
+    assert take_incomplete_drop() is False
+    probe_ctx = contextvars.copy_context()
+
+    def in_probe():
+        note_incomplete_drop()
+        assert take_incomplete_drop() is True
+        assert take_incomplete_drop() is False
+
+    probe_ctx.run(in_probe)
+    assert take_incomplete_drop() is False
 
 
 def test_official_launcher_still_serves(tmp_path):

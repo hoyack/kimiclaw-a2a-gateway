@@ -1,13 +1,12 @@
 """Uncapped probe listener: GET /healthz and GET /readyz only. Not the main app."""
+import contextvars
 import json
 import shutil
 
 import h11
 
-# Set when _send swallows an already-sent failure; the uvicorn.error filter
-# reads and clears it so the follow-on "returned without completing" line is
-# dropped only for the probe, not for a real bug on the main port.
-_drop_incomplete = False
+# Per-task counter: a probe swallow must not hide a main-port incomplete-response line.
+_drop_incomplete: contextvars.ContextVar[int] = contextvars.ContextVar("drop_incomplete", default=0)
 
 from gateway.routes import health as health_state
 
@@ -34,17 +33,20 @@ async def _send(send, status: int, body: dict):
         if not _already_sent(exc):
             raise
         from gateway.auth import note_quiet
-        global _drop_incomplete
-        _drop_incomplete = True
+        note_incomplete_drop()
         note_quiet("http", "malformed")
 
 
+def note_incomplete_drop() -> None:
+    _drop_incomplete.set(_drop_incomplete.get() + 1)
+
+
 def take_incomplete_drop() -> bool:
-    """True once after probe._send swallowed an already-sent failure."""
-    global _drop_incomplete
-    if not _drop_incomplete:
+    """True once after probe._send swallowed an already-sent failure on this task."""
+    n = _drop_incomplete.get()
+    if n <= 0:
         return False
-    _drop_incomplete = False
+    _drop_incomplete.set(n - 1)
     return True
 
 
