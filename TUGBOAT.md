@@ -37,7 +37,7 @@ Kubernetes probes must use the probe port, not 8000:
 
 Move the image HEALTHCHECK from `:8000/healthz` to `:8001/healthz`. Publish 8001 as well as 8000.
 
-A reverse proxy with client header and body timeouts (ingress nginx or equivalent) is required in front of the gateway for any public deploy. A later change will add an app-level header timeout as defense in depth; until then the front proxy is the only idle-connection close. uvicorn 0.54 counts idle and partial-header connections toward `limit_concurrency` and will not time them out on its own; without a proxy (and without the app timer) cap-many idle TCP connections 503 the main port, including `/healthz`, and the pod restarts into another 31 s hold.
+A reverse proxy with client header and body timeouts (ingress nginx or equivalent) is required in front of the gateway for any public deploy. The app timer (`GATEWAY_HEADER_TIMEOUT_S`, default 5 s, range 1–30) is defense in depth and applies to both the main port and the probe port (re-armed at connect and after each keep-alive response). The probe port has no connection cap, so a pile of idle probe connections cannot turn into a liveness failure; they are just closed after the header timeout. uvicorn 0.54 counts idle and partial-header connections toward `limit_concurrency` and will not time them out on its own; without a proxy (and without the app timer) cap-many idle TCP connections 503 the main port, including `/healthz`, and the pod restarts into another 31 s hold.
 
 Required / relevant env:
 
@@ -45,6 +45,7 @@ Required / relevant env:
 | --- | --- | --- |
 | `KIMICLAW_LIMIT_CONCURRENCY` | required | integer 64–4096, digits only (`^[0-9]+$`) |
 | `GATEWAY_PROBE_PORT` | `8001` | 1–65535, must differ from the main port |
+| `GATEWAY_HEADER_TIMEOUT_S` | `5` | 1–30, digits only |
 | `GATEWAY_PUBLIC_KEYS_FILE` | required | see README |
 | `GATEWAY_SIGNATURE_FUTURE_S` | `30` | hold is this plus 1 second |
 | `WEB_CONCURRENCY` | `1` | anything but 1 refuses startup |

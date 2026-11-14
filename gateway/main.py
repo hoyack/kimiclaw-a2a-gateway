@@ -16,6 +16,9 @@ from gateway.routes.health import set_main_serving
 
 LIMIT_CONCURRENCY_MIN = 64
 LIMIT_CONCURRENCY_MAX = 4096
+HEADER_TIMEOUT_MIN = 1
+HEADER_TIMEOUT_MAX = 30
+HEADER_TIMEOUT_DEFAULT = 5
 PROBE_PORT_DEFAULT = 8001
 _DIGITS = re.compile(r"^[0-9]+$")
 
@@ -38,6 +41,12 @@ def limit_concurrency() -> int:
     """KIMICLAW_LIMIT_CONCURRENCY is required: an integer from 64 to 4096, passed to uvicorn."""
     return _env_int("KIMICLAW_LIMIT_CONCURRENCY", os.environ.get("KIMICLAW_LIMIT_CONCURRENCY"),
                     LIMIT_CONCURRENCY_MIN, LIMIT_CONCURRENCY_MAX, required=True)
+
+
+def header_timeout_s() -> int:
+    """GATEWAY_HEADER_TIMEOUT_S: seconds to wait for complete request headers (default 5, range 1–30)."""
+    return _env_int("GATEWAY_HEADER_TIMEOUT_S", os.environ.get("GATEWAY_HEADER_TIMEOUT_S"),
+                    HEADER_TIMEOUT_MIN, HEADER_TIMEOUT_MAX, required=False, default=HEADER_TIMEOUT_DEFAULT)
 
 
 def probe_port() -> int:

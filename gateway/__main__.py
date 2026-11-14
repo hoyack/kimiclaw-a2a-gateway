@@ -7,13 +7,17 @@ import time
 from uvicorn import Config, Server
 
 from gateway.config import LOG
-from gateway.main import create_app, limit_concurrency, probe_port
+from gateway.http_protocol import HeaderTimeoutProtocol
+from gateway.main import create_app, header_timeout_s, limit_concurrency, probe_port
 from gateway.probe import probe_app
 from gateway.routes.health import set_main_serving
 
 
-def _config(app, host, port, *, cap=None):
-    kwargs = dict(app=app, host=host, port=port, access_log=False, workers=1)
+def _config(app, host, port, *, cap=None, header_timeout=None):
+    import gateway.http_protocol as http_protocol
+    if header_timeout is not None:
+        http_protocol.HEADER_TIMEOUT_S = header_timeout
+    kwargs = dict(app=app, host=host, port=port, access_log=False, http=HeaderTimeoutProtocol, workers=1)
     if cap is not None:
         kwargs["limit_concurrency"] = cap
     return Config(**kwargs)
@@ -28,13 +32,13 @@ async def _wait_until(predicate, timeout=30, interval=0.02):
     return False
 
 
-async def serve(host: str, port: int, probe: int, cap: int):
+async def serve(host: str, port: int, probe: int, cap: int, header_timeout: int):
     """Start the probe listener immediately, then the main app (whose lifespan holds ~31s)."""
     set_main_serving(False)
-    probe_server = Server(_config(probe_app, host, probe))
-    main_server = Server(_config(create_app(), host, port, cap=cap))
-    LOG.warning("uvicorn limit_concurrency=%d probe_port=%d workers=1",
-                cap, probe)
+    probe_server = Server(_config(probe_app, host, probe, header_timeout=header_timeout))
+    main_server = Server(_config(create_app(), host, port, cap=cap, header_timeout=header_timeout))
+    LOG.warning("uvicorn limit_concurrency=%d header_timeout_s=%d probe_port=%d workers=1",
+                cap, header_timeout, probe)
 
     async def run_probe():
         await probe_server._serve()
@@ -47,7 +51,7 @@ async def serve(host: str, port: int, probe: int, cap: int):
             probe_server.should_exit = True
 
     async def mark_serving():
-        if await _wait_until(lambda: main_server.started or main_server.should_exit, timeout=180):
+        if await _wait_until(lambda: main_server.started or main_server.should_exit, timeout=header_timeout + 120):
             if main_server.started:
                 set_main_serving(True)
                 LOG.warning("main port is serving on %s:%d", host, port)
@@ -81,10 +85,11 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
     cap = limit_concurrency()
+    timeout = header_timeout_s()
     probe = probe_port()
     if args.port == probe:
         raise RuntimeError("GATEWAY_PROBE_PORT must differ from the main port")
-    asyncio.run(serve(args.host, args.port, probe, cap))
+    asyncio.run(serve(args.host, args.port, probe, cap, timeout))
 
 
 if __name__ == "__main__":

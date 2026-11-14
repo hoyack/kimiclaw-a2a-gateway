@@ -138,13 +138,19 @@ def test_uvicorn_app_app_is_refused():
     ("5.5", "must be an integer"),
     ("+5", "must be an integer"),
 ])
+def test_refuses_to_start_with_a_bad_header_timeout(value, needle):
+    r = subprocess.run([sys.executable, "-c", "from gateway.main import header_timeout_s; header_timeout_s()"],
+                       cwd=ROOT, env={**ENV, "GATEWAY_HEADER_TIMEOUT_S": value},
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode != 0 and needle in r.stderr
+
 
 def test_a_valid_concurrency_cap_is_passed_to_uvicorn_and_logged(tmp_path):
     p, base, _ = start_gateway(tmp_path, {"KIMICLAW_LIMIT_CONCURRENCY": "64"})
     try:
         log = (tmp_path / "gateway.log").read_text()
         assert "uvicorn limit_concurrency=64" in log
-        assert "probe_port=" in log and "workers=1" in log
+        assert "probe_port=" in log and "workers=1" in log and "header_timeout_s=" in log
         port = int(base.rsplit(":", 1)[1])
         held = []
         for _ in range(64):
@@ -188,6 +194,48 @@ def test_probe_healthz_is_up_and_readyz_is_503_during_the_startup_hold(tmp_path)
         p.terminate(); p.wait(5)
 
 
+def test_zero_byte_and_partial_header_connections_are_closed_by_the_header_timeout(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_HEADER_TIMEOUT_S": "5", "KIMICLAW_LIMIT_CONCURRENCY": "64"})
+    port = int(base.rsplit(":", 1)[1])
+    try:
+        idle = socket.create_connection(("127.0.0.1", port), timeout=5)
+        partial = socket.create_connection(("127.0.0.1", port), timeout=5)
+        partial.sendall(b"GET /healthz HTTP/1.1\r\nHost: x\r\n")
+        idle.settimeout(8)
+        partial.settimeout(8)
+        t0 = time.monotonic()
+        assert idle.recv(64) == b""  # peer closed
+        assert partial.recv(64) == b""
+        elapsed = time.monotonic() - t0
+        assert 4 <= elapsed <= 8, elapsed
+    finally:
+        p.terminate(); p.wait(5)
+
+
+def test_after_cap_many_idle_connections_time_out_a_signed_request_gets_200(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_HEADER_TIMEOUT_S": "5", "KIMICLAW_LIMIT_CONCURRENCY": "64"})
+    port = int(base.rsplit(":", 1)[1])
+    try:
+        held = []
+        for _ in range(64):
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            held.append(s)
+        assert httpx.get(base + "/healthz", timeout=2).status_code == 503
+        assert httpx.get(_probe(p) + "/healthz", timeout=2).status_code == 200
+        deadline = time.monotonic() + 10
+        status = None
+        while time.monotonic() < deadline:
+            try:
+                status = httpx.get(base + "/", auth=KEY, timeout=2).status_code
+                if status == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        assert status == 200, status
+    finally:
+        [s.close() for s in held]
+        p.terminate(); p.wait(5)
 
 
 def test_a_thousand_quiet_refusals_do_not_write_uvicorn_access_lines_or_client_addresses(tmp_path):
@@ -305,3 +353,96 @@ def test_probe_port_404s_every_main_app_route_and_wrong_methods(tmp_path):
     finally:
         p.terminate(); p.wait(5)
 
+def _read_http_response(sock, timeout=5):
+    sock.settimeout(timeout)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1])
+    while len(rest) < length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    status = int(head.split()[1]) if head.split()[1:2] else 0
+    return status, rest
+
+
+def test_header_timer_is_rearmed_on_a_kept_alive_connection(tmp_path):
+    """After a 200 on a kept-alive connection, slow/partial headers are closed in about 5s."""
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_HEADER_TIMEOUT_S": "5"})
+    port = int(base.rsplit(":", 1)[1])
+    try:
+        s = socket.create_connection(("127.0.0.1", port), timeout=5)
+        hdr = signed_headers(KEY.key_id, KEY.private_key, "GET", b"/", b"", b"")
+        lines = "".join(f"{k}: {v}\r\n" for k, v in hdr.items())
+        s.sendall(f"GET / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n{lines}\r\n".encode())
+        status, _ = _read_http_response(s)
+        assert status == 200, status
+        s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n")  # incomplete headers on the same connection
+        s.settimeout(8)
+        t0 = time.monotonic()
+        assert s.recv(64) == b""
+        elapsed = time.monotonic() - t0
+        assert 4 <= elapsed <= 8, elapsed
+    finally:
+        p.terminate(); p.wait(5)
+
+
+def test_eleven_hundred_idle_connections_time_out_and_a_signed_request_gets_200(tmp_path):
+    import resource
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 8192), hard if hard > 0 else 8192))
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_HEADER_TIMEOUT_S": "5", "KIMICLAW_LIMIT_CONCURRENCY": "1024"})
+    port = int(base.rsplit(":", 1)[1])
+    held = []
+    try:
+        for _ in range(1100):
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            held.append(s)
+        # cap is held by idle connections; the probe stays up
+        assert httpx.get(_probe(p) + "/healthz", timeout=5).json() == {"status": "up"}
+        deadline = time.monotonic() + 12
+        status = None
+        while time.monotonic() < deadline:
+            try:
+                status = httpx.get(base + "/", auth=KEY, timeout=2).status_code
+                if status == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.2)
+        assert status == 200, status
+    finally:
+        [s.close() for s in held]
+        p.terminate(); p.wait(5)
+
+
+def test_idle_connections_on_the_probe_port_are_closed_while_healthz_stays_200(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_HEADER_TIMEOUT_S": "5"})
+    probe = _probe(p)
+    port = int(probe.rsplit(":", 1)[1])
+    held = []
+    try:
+        for _ in range(32):
+            s = socket.create_connection(("127.0.0.1", port), timeout=5)
+            held.append(s)
+        assert httpx.get(probe + "/healthz", timeout=2).json() == {"status": "up"}
+        for s in held:
+            s.settimeout(8)
+        t0 = time.monotonic()
+        for s in held:
+            assert s.recv(64) == b""
+        elapsed = time.monotonic() - t0
+        assert 4 <= elapsed <= 8, elapsed
+        assert httpx.get(probe + "/healthz", timeout=2).json() == {"status": "up"}
+    finally:
+        [s.close() for s in held]
+        p.terminate(); p.wait(5)
