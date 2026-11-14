@@ -16,5 +16,8 @@ USER gateway
 EXPOSE 8000 8001
 # Liveness: probe-port /healthz is 200 as soon as the process is up (including the ~31s hold).
 # /readyz is 503 in the stock image until openclaw is present, so it is not the HEALTHCHECK target.
-HEALTHCHECK CMD python -c "import urllib.request as u;u.urlopen('http://127.0.0.1:8001/healthz',timeout=3)"
+# GATEWAY_PROBE_PORT defaults to 8001 (same default as the gateway). The shell-form HEALTHCHECK expands
+# ${GATEWAY_PROBE_PORT} at check time, so a runtime override moves the healthcheck with the probe listener.
+ENV GATEWAY_PROBE_PORT=8001
+HEALTHCHECK CMD python -c "import urllib.request as u;u.urlopen('http://127.0.0.1:${GATEWAY_PROBE_PORT}/healthz',timeout=3)"
 CMD ["python", "-m", "gateway", "--host", "0.0.0.0", "--port", "8000"]
