@@ -22,8 +22,8 @@ def test_agent_card_public(gw_factory):
     card = r.json()
     assert card["name"] == "Kimiclaw" and card["url"] == "https://kimiclaw.hoyack.ai/"
     assert card["capabilities"] == {"streaming": True, "pushNotifications": False, "stateTransitionHistory": False}
-    assert list(card["securitySchemes"]) == ["kcHmac"] and card["security"] == [{"kcHmac": []}]
-    assert card["securitySchemes"]["kcHmac"]["name"] == "X-KC-Signature"
+    assert list(card["securitySchemes"]) == ["kcEd25519"] and card["security"] == [{"kcEd25519": []}]
+    assert card["securitySchemes"]["kcEd25519"]["name"] == "X-KC-Signature"
 
 
 SIGNED_SHAPE = {"X-KC-Key-Id": "testkey01", "X-KC-Timestamp": str(int(time.time())), "X-KC-Nonce": "n" * 24,

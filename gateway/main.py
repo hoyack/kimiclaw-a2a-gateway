@@ -38,7 +38,7 @@ def create_app() -> FastAPI:
                 comps.update(schema.pop("$defs", {}))
                 comps[model.__name__] = schema
             spec["components"]["securitySchemes"] = SECURITY_SCHEMES
-            spec["security"] = [{"kcHmac": []}]
+            spec["security"] = [{"kcEd25519": []}]
             app.openapi_schema = spec
         return app.openapi_schema
 

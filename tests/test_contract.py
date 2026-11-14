@@ -155,7 +155,7 @@ def _boot_fails(tmp_path, token_env):
     app = tmp_path / "app"
     shutil.copytree(ROOT, app, ignore=shutil.ignore_patterns(".venv", ".git", ".env", "telemetry", "__pycache__"))
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
-    env.update({"GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE, **token_env})
+    env.update({"GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, **token_env})
     r = subprocess.run([sys.executable, "-c", "import app"], cwd=app, env=env, capture_output=True, text=True, timeout=60)
     return r
 
@@ -243,7 +243,7 @@ def _assert_no_forgery(raw):
 
 def _py(prog, *args):
     import subprocess, sys
-    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE, "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "PYTHONIOENCODING": "utf-8"}
     return subprocess.run([sys.executable, "-c", prog, *args], env=env, capture_output=True, timeout=30,
                           cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -314,7 +314,7 @@ def test_sse_req_id_cannot_forge_log_lines():
         "asyncio.run(main())\n"
     )
     forged = "r1" + _FORGE_TAIL + "C" * 500
-    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE, "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "PYTHONIOENCODING": "utf-8"}
     r = subprocess.run([sys.executable, "-c", prog, forged], cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        env=env, capture_output=True, timeout=30)
     raw = r.stderr.decode("utf-8")
@@ -348,7 +348,7 @@ def test_sse_error_logs_type_only_no_traceback(caplog, monkeypatch, tmp_path):
     import asyncio, logging
     from conftest import KEYS_FILE, TOKEN
     monkeypatch.setenv("KIMICLAW_TOKEN", TOKEN)
-    monkeypatch.setenv("GATEWAY_SIGNING_KEYS_FILE", KEYS_FILE)
+    monkeypatch.setenv("GATEWAY_PUBLIC_KEYS_FILE", KEYS_FILE)
     monkeypatch.setenv("GATEWAY_TELEMETRY_DIR", str(tmp_path / "tel"))
     from gateway.controllers.rpc import sse_events
 

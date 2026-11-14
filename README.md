@@ -4,7 +4,7 @@ A2A protocol (v1.0 subset) gateway fronting the local OpenClaw agent.
 
 - Public URL: `https://kimiclaw.hoyack.ai/`
 - Agent card: `GET /.well-known/agent.json` (public)
-- JSON-RPC: `POST /` (HMAC-signed requests only, per-key rate limits; see "Request signing")
+- JSON-RPC: `POST /` (Ed25519-signed requests only, per-key rate limits; see "Request signing")
 - Origin: uvicorn on `127.0.0.1:8000`, tunnel via cloudflared systemd service
 
 ## Setup
@@ -13,12 +13,12 @@ A2A protocol (v1.0 subset) gateway fronting the local OpenClaw agent.
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt            # requirements-dev.txt for tests
 export KIMICLAW_TOKEN=...                  # only with GATEWAY_NOTIFY_URL; or KIMICLAW_TOKEN=... in .env (chmod 600)
-export GATEWAY_SIGNING_KEYS_FILE=/path/to/keys.txt # caller signing secrets (chmod 600), see "Request signing"
+export GATEWAY_PUBLIC_KEYS_FILE=/path/to/keys.txt # callers' Ed25519 public keys, see "Caller keys"
 uvicorn app:app --host 127.0.0.1 --port 8000
 ```
-`openclaw` must be on PATH. The app refuses to start without a valid `GATEWAY_SIGNING_KEYS_FILE`, or without `KIMICLAW_TOKEN` when `GATEWAY_NOTIFY_URL` is set.
+`openclaw` must be on PATH. The app refuses to start without a valid `GATEWAY_PUBLIC_KEYS_FILE`, or without `KIMICLAW_TOKEN` when `GATEWAY_NOTIFY_URL` is set.
 
-Docker: `docker build -t kimiclaw-gw . && docker run -e GATEWAY_SIGNING_KEYS_FILE=/keys/keys.txt -v $PWD/keys.txt:/keys/keys.txt:ro -p 8000:8000 kimiclaw-gw`
+Docker: `docker build -t kimiclaw-gw . && docker run -e GATEWAY_PUBLIC_KEYS_FILE=/keys/keys.txt -v $PWD/keys.txt:/keys/keys.txt:ro -p 8000:8000 kimiclaw-gw`
 (the image does not contain openclaw; add it in a derived image or mount it).
 
 ## Layout
@@ -27,7 +27,7 @@ Docker: `docker build -t kimiclaw-gw . && docker run -e GATEWAY_SIGNING_KEYS_FIL
 app.py                     entrypoint shim (uvicorn app:app)
 gateway/config.py          env settings + .env fallback
 gateway/models.py          agent card, wire builders, pydantic schemas (docs only)
-gateway/auth.py            signature middleware (per-caller HMAC secrets, nonces, POST / rate limit)
+gateway/auth.py            signature middleware (per-caller Ed25519 public keys, nonces, POST / rate limit)
 gateway/telemetry.py       OpenTelemetry setup + request middleware
 gateway/routes/            a2a.py (GET /, agent card, POST /), health.py
 gateway/controllers/rpc.py JSON-RPC dispatch + SSE
@@ -56,11 +56,11 @@ A2A `contextId` maps to OpenClaw session `a2a-<caller>-<ctx>`; reuse it to conti
 
 ### Example
 ```bash
-printf '%s' "$A2A_SECRET" > secret.txt && chmod 600 secret.txt   # or write it there from your secret store
-python tools/sign_request.py --key-id "$A2A_KEY_ID" --secret-file secret.txt https://kimiclaw.hoyack.ai/ \
+# the private key line from tools/new_api_key.py, kept by the CALLER (file, chmod 600, or env KC_PRIVATE_KEY)
+python tools/sign_request.py --key-id "$A2A_KEY_ID" --private-key-file a2a.key https://kimiclaw.hoyack.ai/ \
   '{"jsonrpc":"2.0","id":"1","method":"message/send","params":{"message":{"role":"user","messageId":"m1","parts":[{"kind":"text","text":"Summarize the systemd journal for yesterday"}]}}}'
 ```
-From Python: `httpx.Client(base_url="https://kimiclaw.hoyack.ai", auth=Signer(key_id, secret))` with `Signer` from
+From Python: `httpx.Client(base_url="https://kimiclaw.hoyack.ai", auth=Signer(key_id, private_key))` with `Signer` from
 `tools/sign_request.py` signs every request the client sends.
 
 ## Request signing
@@ -72,11 +72,10 @@ Every request except `GET /.well-known/agent.json` and `GET /healthz` carries fo
 | `X-KC-Key-Id` | the caller's key_id (10 lowercase hex chars) |
 | `X-KC-Timestamp` | unix time in whole seconds, decimal |
 | `X-KC-Nonce` | 16 to 64 chars of `A-Z a-z 0-9 - _`, new for every request (e.g. 24 random bytes, base64url) |
-| `X-KC-Signature` | lowercase hex HMAC-SHA256 of the canonical string, keyed with the caller's secret string as ASCII bytes (see below) |
+| `X-KC-Signature` | the Ed25519 signature of the canonical string, made with the caller's private key: 64 bytes as 128 lowercase hex chars |
 
-> **Do not base64-decode the secret.** It looks like base64url, but the HMAC key is the secret string itself, as
-> ASCII bytes: `hmac.new(secret.encode(), canonical, sha256)`. Decoding it first gives a different key and every request
-> fails with 401.
+The gateway holds only public keys, so nothing it stores can be used to sign. Hex was picked over base64url because it
+has exactly one spelling per signature, so there are no padding or alphabet variants to normalize.
 
 The canonical string is six lines joined by `\n` (no trailing newline), in this order:
 
@@ -94,15 +93,16 @@ KEY_ID                  the X-KC-Key-Id value
 re-encoded. With no query, or an empty one, the line is the path alone with no `?`. Example: `POST /?wait=false&b=2`
 signs the line `/?wait=false&b=2`, and sending `/?b=2&wait=false` with that signature fails. Signing the query as sent
 (not sorted) means the order of repeated keys such as `?wait=true&wait=false` is signed too, with no
-duplicate-key rule to get wrong. A proxy in front of the gateway must not rewrite the path, the query or the body.
+duplicate-key rule to get wrong. This is the reviewed design from the HMAC rounds and is kept for Ed25519. A proxy in front of the gateway must not rewrite the path, the query or the body.
 
 The gateway checks, in order: each of the four headers present exactly once (a repeated `X-KC-*` header is rejected)
 and well formed, the timestamp at most 300 s behind its clock and at most 30 s ahead (`GATEWAY_SIGNATURE_PAST_S`,
 `GATEWAY_SIGNATURE_FUTURE_S`) and later than the second the process started in, then a slot for reading the body (see
 below), the body is at most 1 MB (else 413), read within the deadlines below (else 408) and hashed chunk by chunk (its
-bytes are kept only when the key_id is known, so an unknown key_id costs one chunk of memory), then the signature, compared in constant time over the bytes
-it received, before any JSON parsing. An unknown key_id is checked against a random dummy secret, so it costs the same
-as a wrong signature and gets the same response. Only a request whose signature verifies has its nonce checked and
+bytes are kept only when the key_id is known, so an unknown key_id costs one chunk of memory), then the Ed25519 signature
+over the bytes it received, before any JSON parsing. An unknown key_id is verified against a random dummy public key,
+so it costs the same as a wrong signature and gets the same response. A signature that isn't 128 lowercase hex chars is
+rejected as malformed, and a verify failure of any kind is a plain 401, never an exception. Only a request whose signature verifies has its nonce checked and
 recorded. A nonce already used by the same caller within the window is rejected (401). Next, the caller's nonce quota
 must have room (else 429, with no bucket token spent). Then every signed request, including `GET /`, `/docs` and
 unknown JSON-RPC methods, pays the caller's general token bucket (`GATEWAY_REQUESTS_PER_S`, default 5/s, burst
@@ -129,7 +129,7 @@ issued by `tools/new_api_key.py`. A per-IP connection cap belongs at the edge, n
 
 Any rejection is `401 {"error": "unauthorized"}`. The reason (`duplicate_header`, `missing_header`, `malformed_header`, `stale_timestamp`, `stale_after_restart`,
 `unknown_key`, `bad_signature`, `replayed_nonce`) goes to the log with the key_id. A header value that isn't shaped like
-a key_id is logged as `malformed`, never verbatim, and the secret and the signature are never logged.
+a key_id is logged as `malformed`, never verbatim (it could be a misplaced private key), and signatures are never logged.
 
 Nonces are kept in process memory per caller, each until its timestamp leaves the window, and at most
 `GATEWAY_MAX_NONCES_PER_CALLER` (default 20,000) per caller. The general bucket keeps a caller far below that
@@ -146,26 +146,32 @@ cost: right after a restart, requests signed just before it get 401, and a calle
 
 ### Caller keys
 
-`GATEWAY_SIGNING_KEYS_FILE` holds one `<key_id> <caller> <secret>` line per key (`#` comments allowed). It is the only
-place a secret lives: the gateway never reads secrets from env vars or arguments, and never writes them to logs,
-telemetry, error messages or probe output. The secret has to be readable by the gateway to check signatures, so this
-file is the credential store. Mount it from the secret store, read-only, mode `0400`/`0440` (or `0600`/`0640`).
+`GATEWAY_PUBLIC_KEYS_FILE` holds one `<key_id> <caller> <public_key>` line per key (`#` comments allowed), where
+`public_key` is the 32-byte Ed25519 public key as unpadded base64url (43 chars). It holds no secrets: a public key can
+verify a signature but not make one. It can be a ConfigMap or a read-only mount; the gateway only insists that nobody
+but its owner can write it, because whoever can add a line can add a caller.
 
 Startup is refused, with an error that names only the line number, if the file is missing, empty or malformed, if a
-key_id repeats, if a caller name isn't 1 to 32 of `A-Z a-z 0-9 _`, if a secret isn't base64url of at least 32 bytes, or
-if the file is writable by its group or has any permission for others. Mint a key with
+key_id repeats, if a caller name isn't 1 to 32 of `A-Z a-z 0-9 _`, if a public key isn't exactly 32 bytes in canonical
+unpadded base64url, or if the file is writable by its group or others. The old `GATEWAY_SIGNING_KEYS_FILE` (HMAC
+secrets) is no longer read; setting only it refuses startup with a pointer here. Mint a keypair with
 
 ```bash
-(umask 077; python tools/new_api_key.py <caller> >> keys.txt)   # stdout: the file line (holds the secret); stderr: the key_id
+python tools/new_api_key.py <caller>
 ```
 
-It draws 32 bytes from Python's `secrets` module (the OS CSPRNG). **`tools/new_api_key.py` is the only supported way to
-make a secret.** The startup check can only confirm the secret is base64url of at least 32 bytes; it can't tell random
-bytes from a hand-typed or derived value. Hand the caller its key_id and secret over a secure channel.
+It prints, once, a warning, the **private key** (unpadded base64url of the 32-byte Ed25519 seed), and the public line
+for the keys file. Hand the private key to the caller over a secure channel and don't keep a copy; the caller stores
+it (a chmod 600 file for `--private-key-file`, or `KC_PRIVATE_KEY`). Append only the last line to the keys file. Pasting
+the whole output there by mistake fails startup, because the private key line doesn't parse.
+
+key_ids are not secret but must be unguessable (see the read pools above). **`tools/new_api_key.py` is the only
+supported way to issue a key_id:** it draws 40 bits from Python's `secrets` module (the OS CSPRNG), and the keypair
+comes from `cryptography`'s Ed25519 generator.
 
 **Rotation.** A caller can have several key_ids at once:
-1. Run `new_api_key.py` with the same caller name and add the new line.
-2. Restart the gateway, then give the caller the new key_id and secret. Both keys work during the overlap.
+1. Run `new_api_key.py` with the same caller name and add the new public line.
+2. Restart the gateway, then give the caller the new key_id and private key. Both keys work during the overlap.
 3. Once the caller has switched, delete the old line and restart.
 
 To revoke a key immediately, delete its line and restart.
@@ -191,7 +197,7 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | Name | Default | Purpose |
 |---|---|---|
 | `KIMICLAW_TOKEN` | required only when `GATEWAY_NOTIFY_URL` is set (env or `.env`) | outbound notify credential; never accepted inbound |
-| `GATEWAY_SIGNING_KEYS_FILE` | required | path to the per-caller signing secrets file (mount it from the secret store, mode 0400/0440; see "Caller keys"). Missing, empty, malformed or open to others refuses startup |
+| `GATEWAY_PUBLIC_KEYS_FILE` | required | path to the callers' Ed25519 public keys (see "Caller keys"; no secrets). Missing, empty, malformed or writable by group or others refuses startup. Replaces `GATEWAY_SIGNING_KEYS_FILE` |
 | `GATEWAY_CREATE_PER_MIN` / `GATEWAY_CREATE_BURST` | `10` / `5` | per caller: `message/send` + `message/stream` token bucket |
 | `GATEWAY_GET_PER_S` | `2` | per caller: `tasks/get` |
 | `GATEWAY_CANCEL_PER_S` | `1` | per caller: `tasks/cancel` |

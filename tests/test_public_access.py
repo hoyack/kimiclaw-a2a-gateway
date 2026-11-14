@@ -1,4 +1,4 @@
-"""Per-caller signing keys file, per-key rate limits, body cap, key_id audit logs, agent-card URL."""
+"""Per-caller public keys file, per-key rate limits, body cap, key_id audit logs, agent-card URL."""
 import base64
 import json
 import os
@@ -10,12 +10,12 @@ import time
 import httpx
 import pytest
 
-from conftest import KEY, OTHER_KEY, ROOT, SECRETS, TOKEN, Signer, start_gateway, write_keys_file
+from conftest import KEY, OTHER_KEY, ROOT, PRIVATE_KEYS, TOKEN, Signer, public_key, start_gateway, write_keys_file
 
 GET = {"jsonrpc": "2.0", "id": "1", "method": "tasks/get", "params": {"id": "nope"}}
 SEND = {"jsonrpc": "2.0", "id": "1", "method": "message/send",
         "params": {"message": {"parts": [{"kind": "text", "text": "hi"}]}, "configuration": {"blocking": False}}}
-WRONG_SECRET = Signer("testkey01", secrets.token_urlsafe(32))
+WRONG_KEY = Signer("testkey01", secrets.token_urlsafe(32))  # a different Ed25519 private key
 
 
 @pytest.fixture
@@ -37,7 +37,7 @@ def boot(tmp_path, keys_text=None, keys_file=None):
     path = keys_file
     if keys_text is not None:
         path = tmp_path / "keys.txt"; path.write_text(keys_text); path.chmod(0o600)
-    env = {**os.environ, "KIMICLAW_TOKEN": TOKEN, "GATEWAY_SIGNING_KEYS_FILE": str(path or "")}
+    env = {**os.environ, "KIMICLAW_TOKEN": TOKEN, "GATEWAY_PUBLIC_KEYS_FILE": str(path or "")}
     return subprocess.run([sys.executable, "-c", "import gateway.config"], cwd=ROOT, env=env, capture_output=True, text=True)
 
 
@@ -72,7 +72,7 @@ def test_get_and_cancel_buckets_refill(start):
 def test_failed_auth_does_not_spend_a_keys_quota(start):
     base = start(GATEWAY_GET_PER_S="0.01")
     for _ in range(5):
-        assert post(base, GET, WRONG_SECRET).status_code == 401
+        assert post(base, GET, WRONG_KEY).status_code == 401
     assert post(base, GET).status_code == 200
 
 
@@ -91,7 +91,8 @@ def test_agent_card_url_is_configurable_and_card_does_not_advertise_backend(star
     assert "openclaw" not in card.text.lower() and "shell" not in card.text.lower()
 
 
-S1 = SECRETS["testkey01"]
+S1 = public_key(PRIVATE_KEYS["testkey01"])
+B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 
 @pytest.mark.parametrize("keys_text", [
@@ -101,54 +102,66 @@ S1 = SECRETS["testkey01"]
     f"testkey01 alice {S1[:42]}\n",
     f"testkey01 alice {S1}!\n",
     f"testkey01 alice {S1}\ntestkey01 bob {S1}\n",
+    f"testkey01 alice {S1[:42]}{B64[B64.index(S1[42]) ^ 1]}\n",  # same bytes, non-canonical last char
 ])
 def test_bad_keys_file_refuses_to_start_without_echoing_it(tmp_path, keys_text):
     r = boot(tmp_path, keys_text)
-    assert r.returncode != 0 and "GATEWAY_SIGNING_KEYS_FILE" in r.stderr
+    assert r.returncode != 0 and "GATEWAY_PUBLIC_KEYS_FILE" in r.stderr
     assert S1[:16] not in r.stderr and "alice" not in r.stderr
 
 
-@pytest.mark.parametrize("mode,ok", [(0o600, True), (0o400, True), (0o440, True), (0o640, True),
-                                     (0o644, False), (0o604, False), (0o660, False), (0o666, False)])
-def test_keys_file_open_to_others_refuses_to_start(tmp_path, mode, ok):
+@pytest.mark.parametrize("mode,ok", [(0o600, True), (0o400, True), (0o440, True), (0o640, True), (0o644, True),
+                                     (0o604, True), (0o620, False), (0o602, False), (0o660, False), (0o666, False)])
+def test_keys_file_writable_by_others_refuses_to_start(tmp_path, mode, ok):
     r = boot(tmp_path, keys_file=write_keys_file(tmp_path / "keys.txt", mode=mode))
     assert (r.returncode == 0) == ok, r.stderr
-    assert ok or "too open" in r.stderr and S1[:16] not in r.stderr
+    assert ok or "writable by group or others" in r.stderr and S1[:16] not in r.stderr
+
+
+def test_the_old_secrets_env_var_alone_refuses_to_start_and_says_why(tmp_path):
+    env = {**os.environ, "KIMICLAW_TOKEN": TOKEN, "GATEWAY_SIGNING_KEYS_FILE": str(tmp_path / "old.txt")}
+    env.pop("GATEWAY_PUBLIC_KEYS_FILE", None)
+    r = subprocess.run([sys.executable, "-c", "import gateway.config"], cwd=ROOT, env=env, capture_output=True, text=True)
+    assert r.returncode != 0 and "GATEWAY_PUBLIC_KEYS_FILE not set" in r.stderr and "new_api_key.py" in r.stderr
 
 
 def test_missing_keys_file_refuses_to_start(tmp_path):
     for path in (None, tmp_path / "nope.txt"):
         r = boot(tmp_path, keys_file=path)
-        assert r.returncode != 0 and "GATEWAY_SIGNING_KEYS_FILE" in r.stderr
+        assert r.returncode != 0 and "GATEWAY_PUBLIC_KEYS_FILE" in r.stderr
 
 
 def test_removing_a_keys_line_revokes_it(start, tmp_path):
-    base = start(GATEWAY_SIGNING_KEYS_FILE=write_keys_file(tmp_path / "revoked.txt", ("testkey02",)))
+    base = start(GATEWAY_PUBLIC_KEYS_FILE=write_keys_file(tmp_path / "revoked.txt", ("testkey02",)))
     assert post(base, GET).status_code == 401
     assert post(base, GET, OTHER_KEY).status_code == 200
 
 
-def test_new_api_key_tool_mints_a_working_key(start, tmp_path):
+def test_new_api_key_tool_mints_a_working_keypair_and_shows_the_private_key_once(start, tmp_path):
     r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "new_api_key.py"), "acme"],
                        capture_output=True, text=True, check=True)
-    line = r.stdout.strip()
-    key_id, caller, secret = line.split()
-    assert len(key_id) == 10 and int(key_id, 16) >= 0 and caller == "acme"
-    assert len(base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))) >= 32
-    assert key_id in r.stderr and secret not in r.stderr
+    lines = r.stdout.splitlines()
+    assert len(lines) == 5 and lines[0].startswith("# WARNING: the next line is the PRIVATE key for acme")
+    private, line = lines[2], lines[4]
+    key_id, caller, public = line.split()
+    assert len(key_id) == 10 and int(key_id, 16) >= 0 and caller == "acme" and public == public_key(private)
+    assert r.stdout.count(private) == 1 and private not in line
+    assert len(base64.urlsafe_b64decode(public + "=")) == 32
     minted = tmp_path / "minted.txt"
-    minted.write_text(line + "\n"); minted.chmod(0o600)
-    base = start(GATEWAY_SIGNING_KEYS_FILE=str(minted))
-    assert post(base, GET, Signer(key_id, secret)).status_code == 200
+    minted.write_text(line + "\n"); minted.chmod(0o644)
+    base = start(GATEWAY_PUBLIC_KEYS_FILE=str(minted))
+    assert post(base, GET, Signer(key_id, private)).status_code == 200
     assert post(base, GET).status_code == 401
+    pasted_all = boot(tmp_path, r.stdout)
+    assert pasted_all.returncode != 0 and private not in pasted_all.stderr
 
 
-def test_key_id_and_reason_are_logged_never_the_secret_or_signature(start, tmp_path):
+def test_key_id_and_reason_are_logged_never_a_private_key_or_signature(start, tmp_path):
     tdir = tmp_path / "tel"
     base = start(GATEWAY_TELEMETRY_DIR=str(tdir))
     ok = post(base, GET)
     post(base, GET, Signer("testkey09", S1))
-    bad = post(base, GET, WRONG_SECRET)
+    bad = post(base, GET, WRONG_KEY)
     time.sleep(0.5)
     out = (tmp_path / "gateway.log").read_text()
     logs = (tdir / "logs.jsonl").read_text()
@@ -157,19 +170,19 @@ def test_key_id_and_reason_are_logged_never_the_secret_or_signature(start, tmp_p
     assert "unauthorized reason=bad_signature key_id=testkey01" in out
     assert '"key_id": "testkey01"' in logs and '"key_id": "invalid:testkey09"' in logs
     for text in (out, logs):
-        assert all(sec not in text for sec in SECRETS.values())
+        assert all(sec not in text for sec in PRIVATE_KEYS.values())
         assert ok.request.headers["x-kc-signature"] not in text and bad.request.headers["x-kc-signature"] not in text
 
 
 def test_rotation_two_key_ids_for_one_caller_share_its_tasks(start, tmp_path):
-    base = start(GATEWAY_SIGNING_KEYS_FILE=write_keys_file(tmp_path / "k.txt", ("testkey01", "testkey02", "testkey03")))
-    new_key = Signer("testkey03", SECRETS["testkey03"])
+    base = start(GATEWAY_PUBLIC_KEYS_FILE=write_keys_file(tmp_path / "k.txt", ("testkey01", "testkey02", "testkey03")))
+    new_key = Signer("testkey03", PRIVATE_KEYS["testkey03"])
     tid = post(base, SEND, KEY).json()["result"]["id"]
     for method in ("tasks/get", "tasks/cancel"):
         body = {"jsonrpc": "2.0", "id": "1", "method": method, "params": {"id": tid}}
         assert post(base, body, OTHER_KEY).json()["error"]["code"] == -32001
         assert post(base, body, new_key).json()["result"]["id"] == tid
-    retired = start(GATEWAY_SIGNING_KEYS_FILE=write_keys_file(tmp_path / "k2.txt", ("testkey02", "testkey03")))
+    retired = start(GATEWAY_PUBLIC_KEYS_FILE=write_keys_file(tmp_path / "k2.txt", ("testkey02", "testkey03")))
     assert post(retired, GET, KEY).status_code == 401
     assert post(retired, GET, new_key).status_code == 200
 
@@ -177,16 +190,14 @@ def test_rotation_two_key_ids_for_one_caller_share_its_tasks(start, tmp_path):
 @pytest.mark.parametrize("line", [
     "testkey01 alice {s} extra", "bad!id alice {s}", "testkey01 al-ice {s}", "testkey01 alice {s}=",
 ])
-def test_startup_error_names_the_line_never_the_secret(tmp_path, line):
-    secret = secrets.token_urlsafe(32)
-    r = boot(tmp_path, f"# header\n{line.format(s=secret)}\n")
-    assert r.returncode != 0 and "GATEWAY_SIGNING_KEYS_FILE line 2:" in r.stderr
-    assert secret not in r.stderr and secret[:8] not in r.stderr
+def test_startup_error_names_the_line_never_its_content(tmp_path, line):
+    r = boot(tmp_path, f"# header\n{line.format(s=S1)}\n")
+    assert r.returncode != 0 and "GATEWAY_PUBLIC_KEYS_FILE line 2:" in r.stderr
+    assert S1[:8] not in r.stderr
 
 
-@pytest.mark.parametrize("nbytes,ok", [(16, False), (31, False), (32, True), (64, True)])
-def test_secrets_under_32_bytes_refuse_to_start(tmp_path, nbytes, ok):
-    secret = secrets.token_urlsafe(nbytes)
-    r = boot(tmp_path, f"testkey01 alice {secret}\n")
+@pytest.mark.parametrize("nbytes,ok", [(16, False), (31, False), (32, True), (33, False), (64, False)])
+def test_public_keys_must_be_32_bytes(tmp_path, nbytes, ok):
+    key = public_key(secrets.token_urlsafe(32)) if nbytes == 32 else secrets.token_urlsafe(nbytes)
+    r = boot(tmp_path, f"testkey01 alice {key}\n")
     assert (r.returncode == 0) == ok, r.stderr
-    assert secret not in r.stderr

@@ -1,16 +1,24 @@
-import atexit, os, secrets, shutil, socket, subprocess, sys, tempfile, threading, time
+import atexit, base64, os, secrets, shutil, socket, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx, pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
-from sign_request import Signer  # noqa: E402
+from sign_request import Signer, load_private_key  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
 
 TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN: outbound notify credential only
 CALLERS = {"testkey01": "alice", "testkey02": "bob", "testkey03": "alice"}  # testkey03: alice's rotation key
-SECRETS = {key_id: secrets.token_urlsafe(32) for key_id in CALLERS}  # fresh every run, never committed
-KEY = Signer("testkey01", SECRETS["testkey01"])
-OTHER_KEY = Signer("testkey02", SECRETS["testkey02"])
+PRIVATE_KEYS = {key_id: secrets.token_urlsafe(32) for key_id in CALLERS}  # fresh Ed25519 seeds every run, never committed
+
+
+def public_key(private_key: str) -> str:
+    raw = load_private_key(private_key).public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+KEY = Signer("testkey01", PRIVATE_KEYS["testkey01"])
+OTHER_KEY = Signer("testkey02", PRIVATE_KEYS["testkey02"])
 LIMITS_OFF = {"GATEWAY_CREATE_PER_MIN": "100000", "GATEWAY_CREATE_BURST": "1000",
               "GATEWAY_REQUESTS_PER_S": "100000", "GATEWAY_REQUESTS_BURST": "100000",
               "GATEWAY_GET_PER_S": "1000", "GATEWAY_CANCEL_PER_S": "1000"}
@@ -20,7 +28,7 @@ LIMITS_OFF = {"GATEWAY_CREATE_PER_MIN": "100000", "GATEWAY_CREATE_BURST": "1000"
 def write_keys_file(path, key_ids=("testkey01", "testkey02"), mode=0o600):
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     with os.fdopen(fd, "w") as f:
-        f.writelines(f"{k} {CALLERS[k]} {SECRETS[k]}\n" for k in key_ids)
+        f.writelines(f"{k} {CALLERS[k]} {public_key(PRIVATE_KEYS[k])}\n" for k in key_ids)
     os.chmod(path, mode)
     return str(path)
 
@@ -61,7 +69,7 @@ def start_gateway(tmp_path, extra_env):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
     env.update({
         "KIMICLAW_TOKEN": TOKEN,
-        "GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE,
+        "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE,
         **LIMITS_OFF,
         "PATH": os.path.join(ROOT, "tests", "fakebin") + os.pathsep + env["PATH"],
         "HOME": str(tmp_path),

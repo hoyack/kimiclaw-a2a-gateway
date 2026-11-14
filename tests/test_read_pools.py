@@ -28,11 +28,11 @@ def gw(tmp_path):
             p.terminate(); p.wait(10)
 
 
-def stall(port, key_id, secret=None, sent=b"", length=1000):
-    """A POST whose headers are well formed and signed (with a throwaway secret unless given) but whose body stops
+def stall(port, key_id, private_key=None, sent=b"", length=1000):
+    """A POST whose headers are well formed and signed (with a throwaway private key unless given) but whose body stops
     after `sent` bytes of the `length` promised."""
     body = sent + b"x" * (length - len(sent))
-    h = signed_headers(key_id, secret or secrets.token_urlsafe(32), "POST", b"/", b"", body)
+    h = signed_headers(key_id, private_key or secrets.token_urlsafe(32), "POST", b"/", b"", body)
     head = "POST / HTTP/1.1\r\nHost: x\r\n" + "".join(f"{k}: {v}\r\n" for k, v in h.items())
     s = socket.create_connection(("127.0.0.1", port), timeout=30)
     s.sendall((head + f"Content-Type: application/json\r\nContent-Length: {length}\r\n\r\n").encode() + sent)
@@ -67,7 +67,7 @@ def test_with_32_unknown_key_reads_held_valid_callers_get_200_at_once(gw):
 
 def test_a_slow_upload_on_caller_a_does_not_affect_caller_b(gw):
     _, base, port, log = gw(**SHORT)
-    held = [stall(port, KEY.key_id, KEY.secret, sent=b"x" * 10) for _ in range(3)]
+    held = [stall(port, KEY.key_id, KEY.private_key, sent=b"x" * 10) for _ in range(3)]
     time.sleep(0.3)
     r = get(base, KEY)
     assert (r.status_code, r.headers["retry-after"]) == (429, "1")
@@ -77,30 +77,30 @@ def test_a_slow_upload_on_caller_a_does_not_affect_caller_b(gw):
     assert "read refused pool=caller reason=pool_full key_id=testkey01" in log.read_text()
 
 
-def test_a_flood_with_a_real_key_id_but_no_secret_only_fills_that_callers_pool(gw):
+def test_a_flood_with_a_real_key_id_but_not_its_private_key_only_fills_that_callers_pool(gw):
     _, base, port, _ = gw(**SHORT)
     flood = [stall(port, KEY.key_id) for _ in range(20)]
     time.sleep(0.5)
     assert sorted(status(s, 0.5) or 0 for s in flood[3:]) == [429] * 17
     assert [get(base, OTHER_KEY).status_code for _ in range(5)] == [200] * 5
-    unknown = httpx.post(base + "/", content=GET, auth=type(KEY)("zzzzzzzzzz", KEY.secret))
+    unknown = httpx.post(base + "/", content=GET, auth=type(KEY)("zzzzzzzzzz", KEY.private_key))
     assert unknown.status_code == 401
     assert [status(s) for s in flood[:3]] == [408] * 3
 
 
 def test_100_aborted_reads_in_each_pool_leak_no_slots(gw):
     _, base, port, log = gw()
-    for key_id, secret in (("zzzzzzzzzz", None), (KEY.key_id, KEY.secret)):
+    for key_id, private_key in (("zzzzzzzzzz", None), (KEY.key_id, KEY.private_key)):
         for _ in range(100):
-            s = stall(port, key_id, secret, sent=b"x" * 10)
+            s = stall(port, key_id, private_key, sent=b"x" * 10)
             s.close()
     time.sleep(1)
     unknown = [stall(port, "zzzzzzzzzz") for _ in range(32)]
-    mine = [stall(port, KEY.key_id, KEY.secret) for _ in range(3)]
+    mine = [stall(port, KEY.key_id, KEY.private_key) for _ in range(3)]
     time.sleep(0.3)
     assert [status(s, 0.05) for s in unknown + mine] == [None] * 35
     assert status(stall(port, "zzzzzzzzzz"), 1) == 503
-    assert status(stall(port, KEY.key_id, KEY.secret), 1) == 429
+    assert status(stall(port, KEY.key_id, KEY.private_key), 1) == 429
     assert get(base, OTHER_KEY).status_code == 200
     text = log.read_text()
     for pool in ("unknown", "caller"):
@@ -114,7 +114,7 @@ def test_a_stalled_read_gets_408_at_the_idle_timeout_and_a_trickle_at_the_deadli
     started = time.monotonic()
     assert status(stall(port, "zzzzzzzzzz")) == 408
     assert 1.3 < time.monotonic() - started < 2.5
-    s = stall(port, KEY.key_id, KEY.secret, sent=b"x")
+    s = stall(port, KEY.key_id, KEY.private_key, sent=b"x")
     started = time.monotonic()
     for _ in range(4):
         time.sleep(1)

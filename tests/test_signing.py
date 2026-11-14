@@ -1,6 +1,5 @@
-"""HMAC request signing: what the gateway accepts, what it rejects with a generic 401, and the reason it logs."""
-import hashlib
-import hmac
+"""Ed25519 request signing: what the gateway accepts, what it rejects with a generic 401, and the reason it logs."""
+import base64
 import json
 import os
 import threading
@@ -12,8 +11,8 @@ import time
 import httpx
 import pytest
 
-from conftest import KEY, KEYS_FILE, OTHER_KEY, ROOT, SECRETS, Signer, start_gateway
-from sign_request import canonical, signed_headers
+from conftest import KEY, KEYS_FILE, OTHER_KEY, ROOT, PRIVATE_KEYS, Signer, start_gateway
+from sign_request import canonical, load_private_key, signed_headers
 
 GET = json.dumps({"jsonrpc": "2.0", "id": "1", "method": "tasks/get", "params": {"id": "nope"}}).encode()
 UNAUTHORIZED = (401, {"error": "unauthorized"})
@@ -21,7 +20,7 @@ UNAUTHORIZED = (401, {"error": "unauthorized"})
 
 @pytest.fixture(scope="module")
 def gw(tmp_path_factory):
-    tmp = tmp_path_factory.mktemp("hmac")
+    tmp = tmp_path_factory.mktemp("signing")
     p, base, _ = start_gateway(tmp, {})
     yield base, tmp / "gateway.log"
     p.terminate(); p.wait(5)
@@ -32,7 +31,7 @@ def send(base, path="/", body=GET, method="POST", key=KEY, sign_path=None, sign_
     if skew is not None:
         override["timestamp"] = str(int(time.time()) + skew)
     raw_path, _, query = (path if sign_path is None else sign_path).encode().partition(b"?")
-    h = signed_headers(key.key_id, key.secret, method, raw_path, query, body if sign_body is None else sign_body,
+    h = signed_headers(key.key_id, key.private_key, method, raw_path, query, body if sign_body is None else sign_body,
                        **{k: v for k, v in override.items() if k in ("timestamp", "nonce")})
     h.update({k: v for k, v in override.items() if k.startswith("X-")})
     h.pop(drop, None)
@@ -56,17 +55,25 @@ def test_query_is_signed_exactly_as_sent_so_reordering_breaks_it(gw):
 
 
 @pytest.mark.parametrize("case,kw,reason", [
-    ("wrong secret", {"key": Signer("testkey01", secrets.token_urlsafe(32))}, "bad_signature"),
+    ("another caller's private key", {"key": Signer("testkey01", PRIVATE_KEYS["testkey02"])}, "bad_signature"),
+    ("random private key", {"key": Signer("testkey01", secrets.token_urlsafe(32))}, "bad_signature"),
+    ("well-formed but invalid signature", {"X-KC-Signature": "0" * 128}, "bad_signature"),
+    ("signature with S out of range", {"X-KC-Signature": "0" * 64 + "f" * 64}, "bad_signature"),
     ("altered body", {"sign_body": GET.replace(b"nope", b"nopf")}, "bad_signature"),
     ("altered path", {"sign_path": "/readyz"}, "bad_signature"),
     ("altered query", {"path": "/?wait=true", "sign_path": "/?wait=false"}, "bad_signature"),
     ("query dropped", {"path": "/", "sign_path": "/?wait=false"}, "bad_signature"),
     ("stale timestamp", {"skew": -301}, "stale_timestamp"),
     ("future timestamp", {"skew": 31}, "stale_timestamp"),
-    ("unknown key", {"key": Signer("testkey09", KEY.secret)}, "unknown_key"),
-    ("uppercase signature", {"X-KC-Signature": "A" * 64}, "malformed_header"),
-    ("short signature", {"X-KC-Signature": "0" * 63}, "malformed_header"),
-    ("non-hex signature", {"X-KC-Signature": "z" * 64}, "malformed_header"),
+    ("unknown key", {"key": Signer("testkey09", KEY.private_key)}, "unknown_key"),
+    ("uppercase signature", {"X-KC-Signature": "A" * 128}, "malformed_header"),
+    ("short signature", {"X-KC-Signature": "0" * 127}, "malformed_header"),
+    ("63-byte signature", {"X-KC-Signature": "0" * 126}, "malformed_header"),
+    ("long signature", {"X-KC-Signature": "0" * 130}, "malformed_header"),
+    ("non-hex signature", {"X-KC-Signature": "z" * 128}, "malformed_header"),
+    ("base64url signature", {"X-KC-Signature": base64.urlsafe_b64encode(b"\0" * 64).rstrip(b"=").decode()},
+     "malformed_header"),
+    ("old HMAC-length signature", {"X-KC-Signature": "0" * 64}, "malformed_header"),
     ("nonce too long", {"nonce": "n" * 65}, "malformed_header"),
     ("nonce too short", {"nonce": "n" * 15}, "malformed_header"),
     ("timestamp not a number", {"timestamp": "1.5e9"}, "malformed_header"),
@@ -80,7 +87,7 @@ def test_rejections_are_a_generic_401_with_the_reason_logged(gw, case, kw, reaso
 
 
 def test_signature_for_another_method_is_401(gw):
-    h = signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", b"")
+    h = signed_headers(KEY.key_id, KEY.private_key, "POST", b"/", b"", b"")
     r = httpx.get(gw[0] + "/", headers=h)
     assert (r.status_code, r.json()) == UNAUTHORIZED
 
@@ -109,7 +116,7 @@ def test_replayed_nonce_is_rejected_even_with_a_fresh_signature(gw):
 
 def test_exact_replay_of_a_captured_request_is_rejected(gw):
     base, _ = gw
-    h = {**signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", GET), "Content-Type": "application/json"}
+    h = {**signed_headers(KEY.key_id, KEY.private_key, "POST", b"/", b"", GET), "Content-Type": "application/json"}
     assert httpx.post(base + "/", content=GET, headers=h).status_code == 200
     assert httpx.post(base + "/", content=GET, headers=h).status_code == 401
 
@@ -137,20 +144,20 @@ def test_key_id_is_bound_into_the_signature(gw):
     headers = {"X-KC-Key-Id": "testkey01", "X-KC-Timestamp": ts, "X-KC-Nonce": nonce, "Content-Type": "application/json"}
     for message in (canonical("POST", b"/", b"", ts, nonce, GET, "testkey02"),
                     canonical("POST", b"/", b"", ts, nonce, GET, "testkey01").rsplit(b"\n", 1)[0]):
-        sig = hmac.new(KEY.secret.encode(), message, hashlib.sha256).hexdigest()
+        sig = load_private_key(KEY.private_key).sign(message).hex()
         r = httpx.post(base + "/", content=GET, headers={**headers, "X-KC-Signature": sig})
         assert (r.status_code, r.json()) == UNAUTHORIZED
-    sig = hmac.new(KEY.secret.encode(), canonical("POST", b"/", b"", ts, nonce, GET, "testkey01"), hashlib.sha256)
-    assert httpx.post(base + "/", content=GET, headers={**headers, "X-KC-Signature": sig.hexdigest()}).status_code == 200
+    sig = load_private_key(KEY.private_key).sign(canonical("POST", b"/", b"", ts, nonce, GET, "testkey01")).hex()
+    assert httpx.post(base + "/", content=GET, headers={**headers, "X-KC-Signature": sig}).status_code == 200
 
 
 def test_unknown_key_id_gets_the_same_401_as_a_bad_signature(gw):
     base, log = gw
     def raw(key):
-        h = signed_headers(key.key_id, key.secret, "POST", b"/", b"", GET)
+        h = signed_headers(key.key_id, key.private_key, "POST", b"/", b"", GET)
         r = httpx.post(base + "/", content=GET, headers={**h, "Content-Type": "application/json"})
         return r.status_code, r.content, sorted((k, v) for k, v in r.headers.items() if k != "date")
-    assert raw(Signer("testkey09", KEY.secret)) == raw(Signer("testkey01", secrets.token_urlsafe(32)))
+    assert raw(Signer("testkey09", KEY.private_key)) == raw(Signer("testkey01", secrets.token_urlsafe(32)))
     time.sleep(0.1)
     assert "reason=unknown_key key_id=testkey09" in log.read_text()
 
@@ -191,15 +198,15 @@ def test_rejected_signatures_do_not_spend_nonces_or_fill_the_cache(capped):
     nonce = secrets.token_urlsafe(24)
     for i in range(20):
         assert send(capped, key=Signer("testkey01", secrets.token_urlsafe(32)), nonce=nonce if i == 0 else None) == UNAUTHORIZED
-        assert send(capped, key=Signer("testkey09", KEY.secret)) == UNAUTHORIZED
+        assert send(capped, key=Signer("testkey09", KEY.private_key)) == UNAUTHORIZED
     assert send(capped, nonce=nonce)[0] == 200
     assert [send(capped)[0] for _ in range(2)] == [200, 200]
 
 
-def test_no_secret_in_probe_card_or_spec_output(gw):
+def test_no_private_key_in_probe_card_or_spec_output(gw):
     base, _ = gw
     texts = [httpx.get(base + p, auth=KEY).text for p in ("/readyz", "/healthz", "/.well-known/agent.json", "/openapi.json")]
-    assert not any(secret in t for secret in SECRETS.values() for t in texts)
+    assert not any(private in t for private in PRIVATE_KEYS.values() for t in texts)
 
 
 def test_bastion_d3_repro_one_caller_filling_its_nonce_quota_gets_429_and_others_still_get_200(tmp_path):
@@ -216,11 +223,11 @@ def test_every_signed_request_pays_the_callers_general_bucket_before_its_nonce_i
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_REQUESTS_PER_S": "0.01", "GATEWAY_REQUESTS_BURST": "3"})
     try:
         unknown = json.dumps({"jsonrpc": "2.0", "id": "1", "method": "foo/bar"}).encode()
-        h = {**signed_headers(KEY.key_id, KEY.secret, "GET", b"/", b"", b""), "Content-Type": "application/json"}
+        h = {**signed_headers(KEY.key_id, KEY.private_key, "GET", b"/", b"", b""), "Content-Type": "application/json"}
         assert httpx.get(base + "/", headers=h).status_code == 200
         assert httpx.post(base + "/", content=unknown, auth=KEY).status_code == 200
         assert httpx.get(base + "/docs", auth=KEY).status_code == 200
-        limited = signed_headers(KEY.key_id, KEY.secret, "GET", b"/", b"", b"")
+        limited = signed_headers(KEY.key_id, KEY.private_key, "GET", b"/", b"", b"")
         r = httpx.get(base + "/", headers=limited)
         assert (r.status_code, r.json()) == (429, {"error": "rate limited"}) and int(r.headers["retry-after"]) >= 1
         assert httpx.post(base + "/", content=unknown, auth=KEY).status_code == 429
@@ -232,7 +239,7 @@ def test_every_signed_request_pays_the_callers_general_bucket_before_its_nonce_i
 
 def test_a_request_and_nonce_captured_before_a_restart_are_rejected_after_it(tmp_path):
     p, base, _ = start_gateway(tmp_path, {})
-    h = {**signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", GET), "Content-Type": "application/json"}
+    h = {**signed_headers(KEY.key_id, KEY.private_key, "POST", b"/", b"", GET), "Content-Type": "application/json"}
     assert httpx.post(base + "/", content=GET, headers=h).status_code == 200
     assert httpx.post(base + "/", content=GET, headers=h).status_code == 401
     p.terminate(); p.wait(5)
@@ -250,7 +257,7 @@ def test_a_request_and_nonce_captured_before_a_restart_are_rejected_after_it(tmp
 def test_a_request_240s_ahead_is_401_now_and_after_a_restart(tmp_path):
     p, base, _ = start_gateway(tmp_path, {})
     ahead = str(int(time.time()) + 240)
-    h = {**signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", GET, timestamp=ahead),
+    h = {**signed_headers(KEY.key_id, KEY.private_key, "POST", b"/", b"", GET, timestamp=ahead),
          "Content-Type": "application/json"}
     stale = "unauthorized reason=stale_timestamp key_id=testkey01"
     assert httpx.post(base + "/", content=GET, headers=h).status_code == 401
@@ -269,12 +276,27 @@ def test_a_request_240s_ahead_is_401_now_and_after_a_restart(tmp_path):
 @pytest.mark.parametrize("header", ["X-KC-Key-Id", "X-KC-Timestamp", "X-KC-Nonce", "X-KC-Signature"])
 def test_a_repeated_signing_header_is_401(gw, header):
     base, log = gw
-    h = signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", GET)
+    h = signed_headers(KEY.key_id, KEY.private_key, "POST", b"/", b"", GET)
     pairs = list(h.items()) + [(header, h[header]), ("Content-Type", "application/json")]
     r = httpx.post(base + "/", content=GET, headers=pairs)
     assert (r.status_code, r.json()) == UNAUTHORIZED
     time.sleep(0.1)
     assert "unauthorized reason=duplicate_header key_id=testkey01" in log.read_text()
+
+
+def test_verification_never_raises_on_a_bad_signature_length_or_encoding():
+    prog = """
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from gateway.auth import DUMMY_KEY, verified
+key = Ed25519PrivateKey.generate()
+good = key.sign(b"m").hex()
+print([verified(key.public_key(), good, b"m"), verified(DUMMY_KEY, good, b"m")]
+      + [verified(key.public_key(), s, b"m") for s in ("", "ab", "zz" * 64, good[:-2], good + "00", "0" * 128)])
+"""
+    env = {**os.environ, "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE}
+    r = subprocess.run([sys.executable, "-c", prog], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert r.stdout.split("\n")[-2] == str([True] + [False] * 7)
 
 
 def test_a_429_from_the_nonce_quota_does_not_spend_a_bucket_token():
@@ -285,7 +307,7 @@ from fastapi.testclient import TestClient
 from sign_request import Signer
 from gateway import auth
 from gateway.main import app
-key = Signer("testkey01", {KEY.secret!r})
+key = Signer("testkey01", {KEY.private_key!r})
 with TestClient(app, base_url="http://127.0.0.1") as c:
     codes = [c.get("/", auth=key).status_code for _ in range(2)]
     auth._nonces.clear()
@@ -293,7 +315,7 @@ with TestClient(app, base_url="http://127.0.0.1") as c:
 print(codes)
 """
     env = {**{k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_", "WEB_"))},
-           "GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE, "GATEWAY_MAX_NONCES_PER_CALLER": "1",
+           "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "GATEWAY_MAX_NONCES_PER_CALLER": "1",
            "GATEWAY_REQUESTS_PER_S": "0.0001", "GATEWAY_REQUESTS_BURST": "2"}
     r = subprocess.run([sys.executable, "-c", prog], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr[-2000:]
@@ -305,7 +327,7 @@ def vm(pid, field):
 
 
 def flood(base, n, body, trickle=False):
-    h = {**signed_headers("zzzzzzzzzz", KEY.secret, "POST", b"/", b"", body), "Content-Type": "application/json"}
+    h = {**signed_headers("zzzzzzzzzz", KEY.private_key, "POST", b"/", b"", body), "Content-Type": "application/json"}
     def content():
         for i in range(0, len(body), 100_000):
             yield body[i:i + 100_000]; time.sleep(0.2)

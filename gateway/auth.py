@@ -1,12 +1,13 @@
-"""HMAC-signed requests (X-KC-* headers, per-caller secrets from GATEWAY_SIGNING_KEYS_FILE) and per-key token buckets."""
+"""Ed25519-signed requests (X-KC-* headers, callers' public keys from GATEWAY_PUBLIC_KEYS_FILE) and per-key token buckets."""
 import asyncio
 import hashlib
 import heapq
-import hmac
 import math
 import re
-import secrets
 import time
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -14,15 +15,15 @@ from starlette.requests import ClientDisconnect
 
 from gateway.config import (BODY_IDLE_TIMEOUT_S, BODY_READ_TIMEOUT_S, CANCEL_PER_S, CREATE_BURST, CREATE_PER_MIN,
                             GET_PER_S, KEY_ID_RE, LOG, MAX_BODY, MAX_NONCES_PER_CALLER, READS_PER_CALLER,
-                            REQUESTS_BURST, REQUESTS_PER_S, SIGNATURE_FUTURE_S, SIGNATURE_PAST_S, SIGNING_KEYS,
+                            REQUESTS_BURST, REQUESTS_PER_S, SIGNATURE_FUTURE_S, SIGNATURE_PAST_S, PUBLIC_KEYS,
                             log_safe)
 
 PUBLIC_PATHS = {"/.well-known/agent.json", "/healthz"}
 HEADERS = ("x-kc-key-id", "x-kc-timestamp", "x-kc-nonce", "x-kc-signature")
 TIMESTAMP_RE = re.compile(r"[0-9]{1,12}")
 NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
-SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
-DUMMY_SECRET = secrets.token_bytes(32)  # unknown key_ids pay for the same HMAC + compare as a wrong signature
+SIGNATURE_RE = re.compile(r"[0-9a-f]{128}")
+DUMMY_KEY = Ed25519PrivateKey.generate().public_key()  # unknown key_ids pay for the same verify as a wrong signature
 STARTED_S = int(time.time())  # nonces don't survive a restart, so nothing signed in or before this second is accepted
 MAX_UNKNOWN_READS = 32
 _reads: dict[str, int] = {}  # pre-auth body reads in progress: "" = unknown key_ids (shared), else per caller
@@ -112,12 +113,20 @@ def take(slot: tuple[str, str], rate: float, size: float) -> int:
     return 0
 
 
+def verified(key: Ed25519PublicKey, signature: str, message: bytes) -> bool:
+    try:
+        key.verify(bytes.fromhex(signature), message)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
 def rate_limited(wait: int) -> JSONResponse:
     return JSONResponse({"error": "rate limited"}, status_code=429, headers={"Retry-After": str(wait)})
 
 
 def unauthorized(request: Request, key_id: str, reason: str) -> JSONResponse:
-    """A header value that isn't shaped like a key_id is never logged (it could be a misplaced secret)."""
+    """A header value that isn't shaped like a key_id is never logged (it could be a misplaced private key)."""
     shown = key_id if KEY_ID_RE.fullmatch(key_id) else ("malformed" if key_id else "-")
     LOG.warning("unauthorized reason=%s key_id=%s path=%s", reason, shown, log_safe(request.url.path))
     request.state.key_id = f"invalid:{shown}" if key_id else "none"
@@ -140,7 +149,7 @@ async def signed_auth(request: Request, call_next):
         return unauthorized(request, key_id, "stale_timestamp")
     if int(timestamp) <= STARTED_S:
         return unauthorized(request, key_id, "stale_after_restart")
-    caller, secret = SIGNING_KEYS.get(key_id, (None, DUMMY_SECRET))
+    caller, key = PUBLIC_KEYS.get(key_id, (None, DUMMY_KEY))
     pool = caller or ""
     pool_name = "caller" if caller else "unknown"
     request.state.key_id = f"unverified:{key_id}"
@@ -161,7 +170,7 @@ async def signed_auth(request: Request, call_next):
     body_sha256, body = hashed
     message = canonical(request.method, request.scope["raw_path"], request.scope["query_string"], timestamp, nonce,
                         body_sha256, key_id)
-    matches = hmac.compare_digest(hmac.new(secret, message, hashlib.sha256).hexdigest(), signature)
+    matches = verified(key, signature, message)
     if caller is None:
         return unauthorized(request, key_id, "unknown_key")
     if not matches:

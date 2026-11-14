@@ -8,7 +8,7 @@ import time
 import httpx
 import pytest
 
-from conftest import KEY, KEYS_FILE, OTHER_KEY, ROOT, SECRETS, TOKEN, start_gateway
+from conftest import KEY, KEYS_FILE, OTHER_KEY, ROOT, PRIVATE_KEYS, TOKEN, start_gateway
 
 
 @pytest.fixture
@@ -91,7 +91,7 @@ def test_r4_agent_env_has_no_gateway_settings_or_key_material(gw):
     rpc(KEY, "message/send", msg("run env"))
     call = rpc.calls()[0]
     assert set(call["env"]) <= {"PATH", "HOME", "LANG", "LC_ALL", "TZ"}
-    assert not any(secret in json.dumps(call) for secret in SECRETS.values())
+    assert not any(secret in json.dumps(call) for secret in PRIVATE_KEYS.values())
     assert "--message" not in call["argv"] and "run env" not in call["argv"]
 
 
@@ -101,7 +101,7 @@ def test_r4_message_over_128kb_goes_over_stdin(tmp_path):
     text = "y" * 140_000
     prog = ("import asyncio, sys\nfrom gateway.services.agent_runner import run_agent\n"
             "print(len(asyncio.run(run_agent('s1', sys.stdin.read()))))")
-    env = {**os.environ, "GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE, "KIMICLAW_TOKEN": TOKEN, "HOME": str(tmp_path),
+    env = {**os.environ, "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "KIMICLAW_TOKEN": TOKEN, "HOME": str(tmp_path),
            "GATEWAY_TELEMETRY_DIR": str(tmp_path / "tel"),
            "PATH": os.path.join(ROOT, "tests", "fakebin") + os.pathsep + os.environ["PATH"]}
     r = subprocess.run([sys.executable, "-c", prog], input=text, cwd=ROOT, env=env, capture_output=True, text=True,

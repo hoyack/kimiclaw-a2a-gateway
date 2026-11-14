@@ -4,24 +4,25 @@
 record:  python golden.py record --app-dir DIR      (starts DIR's app.py with stubs, writes cases/*.json)
 replay:  python golden.py replay --base-url URL --n8n-port PORT [--profile default|n8n_basic]
    n8n_basic profile: target also needs GATEWAY_NOTIFY_AUTH_MODE=basic GATEWAY_NOTIFY_AUTH_USER=n8n-dummy-user.
-   Target must run with: KIMICLAW_TOKEN=dummy-test-token, GATEWAY_SIGNING_KEYS_FILE=<file with a testkey01 line; pass
-   the same file as --signing-keys-file>, rate limits raised
+   Target must run with: KIMICLAW_TOKEN=dummy-test-token, GATEWAY_PUBLIC_KEYS_FILE=<file with a testkey01 public line; pass
+   the matching private key as --private-key-file>, rate limits raised
    (see start_app), fakebin/ first on PATH,
    HOME=<writable dir>, GATEWAY_NOTIFY_URL=http://127.0.0.1:PORT/webhook/firewall.
 replay-local: python golden.py replay-local --app-dir DIR   (starts DIR's app with stubs, then replays)
 Normalized: timestamps, UUIDs, durationMs, Content-Length/Date/server headers.
 """
-import argparse, json, os, re, secrets, socket, subprocess, sys, tempfile, threading, time
+import argparse, base64, json, os, re, secrets, socket, subprocess, sys, tempfile, threading, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(HERE)), "tools"))
-from sign_request import Signer  # noqa: E402
+from sign_request import Signer, load_private_key  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
 
 CASES = os.path.join(HERE, "cases")
 TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN, notify credential
-SIGNER = Signer("testkey01", secrets.token_urlsafe(32))  # replay-local: fresh secret per run; replay: --signing-keys-file
+SIGNER = Signer("testkey01", secrets.token_urlsafe(32))  # replay-local: fresh Ed25519 key per run; replay: --private-key-file
 AUTH = {}
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 TS = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?\+00:00")
@@ -168,8 +169,10 @@ def start_app(app_dir, n8n_port, extra=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
     keys = os.path.join(tempfile.mkdtemp(prefix="golden-keys-"), "keys.txt")
     with os.fdopen(os.open(keys, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
-        f.write(f"{SIGNER.key_id} golden {SIGNER.secret}\n")
-    env.update(KIMICLAW_TOKEN=TOKEN, GATEWAY_SIGNING_KEYS_FILE=keys,
+        raw = load_private_key(SIGNER.private_key).public_key().public_bytes(serialization.Encoding.Raw,
+                                                                             serialization.PublicFormat.Raw)
+        f.write(f"{SIGNER.key_id} golden {base64.urlsafe_b64encode(raw).rstrip(b'=').decode()}\n")
+    env.update(KIMICLAW_TOKEN=TOKEN, GATEWAY_PUBLIC_KEYS_FILE=keys,
                GATEWAY_CREATE_PER_MIN="100000", GATEWAY_CREATE_BURST="1000", GATEWAY_GET_PER_S="1000",
                GATEWAY_CANCEL_PER_S="1000", GATEWAY_REQUESTS_PER_S="100000", GATEWAY_REQUESTS_BURST="100000", PATH=os.path.join(HERE, "fakebin") + os.pathsep + env["PATH"],
                HOME=tempfile.mkdtemp(prefix="golden-"),
@@ -199,10 +202,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(); ap.add_argument("mode", choices=["record", "replay", "replay-local"])
     ap.add_argument("--app-dir"); ap.add_argument("--base-url"); ap.add_argument("--n8n-port", type=int, default=0)
     ap.add_argument("--profile", default="default", choices=list(PROFILES)); ap.add_argument("--only")
-    ap.add_argument("--signing-keys-file", help="replay: the target's GATEWAY_SIGNING_KEYS_FILE (its testkey01 line signs)")
+    ap.add_argument("--private-key-file", help="replay: private key for the target's testkey01 public line")
     a = ap.parse_args()
     if a.mode == "replay":
-        SIGNER.secret = next(l.split()[2] for l in open(a.signing_keys_file) if l.startswith("testkey01 "))
+        SIGNER.private_key = open(a.private_key_file).read().strip()
         sys.exit(1 if replay(a.base_url, N8n(a.n8n_port), a.profile) else 0)
     fails = 0
     for prof, extra in PROFILES.items():

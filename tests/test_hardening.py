@@ -12,7 +12,7 @@ from conftest import KEY, KEYS_FILE, ROOT, start_gateway
 from sign_request import signed_headers
 
 ENV = {**{k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_", "WEB_"))},
-       "GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE}
+       "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE}
 
 
 def py(prog, **env):
@@ -97,7 +97,7 @@ def test_huge_id_and_junk_method_do_not_land_raw_in_logs(base, tmp_path):
 def test_oversized_content_length_is_refused_before_the_body_is_read(base):
     host, port = base.removeprefix("http://").split(":")
     with socket.create_connection((host, int(port)), timeout=3) as s:
-        signed = "".join(f"{k}: {v}\r\n" for k, v in signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", b"").items())
+        signed = "".join(f"{k}: {v}\r\n" for k, v in signed_headers(KEY.key_id, KEY.private_key, "POST", b"/", b"", b"").items())
         s.sendall((f"POST / HTTP/1.1\r\nHost: x\r\n{signed}"
                    "Content-Type: application/json\r\nContent-Length: 2000000\r\n\r\n").encode())
         assert s.recv(200).startswith(b"HTTP/1.1 413")

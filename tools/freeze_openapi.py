@@ -1,5 +1,5 @@
-"""Regenerate openapi.yaml from the app. Needs any valid signing keys file, e.g.:
-    python tools/new_api_key.py dev > /tmp/k && chmod 600 /tmp/k && GATEWAY_SIGNING_KEYS_FILE=/tmp/k python tools/freeze_openapi.py
+"""Regenerate openapi.yaml from the app. Needs any valid public keys file, e.g.:
+    python tools/new_api_key.py dev | tail -1 > /tmp/k && GATEWAY_PUBLIC_KEYS_FILE=/tmp/k python tools/freeze_openapi.py
 """
 import os
 import sys
