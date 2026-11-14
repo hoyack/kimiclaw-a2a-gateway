@@ -12,6 +12,9 @@ import os
 import time
 from urllib.parse import urlparse
 
+from gateway.env import _env_num
+
+
 from opentelemetry import metrics, trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult, PeriodicExportingMetricReader
@@ -19,9 +22,16 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter, SpanExportResult
 
+def _log_path(value) -> str:
+    """Same cap as gateway.config.log_path, kept local so this module can load without keys."""
+    s = "".join(c if c.isprintable() else (f"\\x{ord(c):02x}" if ord(c) < 256 else f"\\u{ord(c):04x}")
+                for c in str(value)[:128])
+    return s[:128]
+
+
 TELEMETRY_DIR = os.environ.get("GATEWAY_TELEMETRY_DIR", "telemetry")
 OTLP_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
-FILE_BYTES = int(float(os.environ.get("GATEWAY_TELEMETRY_FILE_MB", "10")) * 1_000_000)
+FILE_BYTES = int(_env_num("GATEWAY_TELEMETRY_FILE_MB", "10", float, gt=0) * 1_000_000)
 BACKUPS = 4
 
 tracer = trace.get_tracer("kimiclaw")
@@ -32,6 +42,7 @@ agent_ms = meter.create_histogram("gateway.agent.duration", unit="ms")
 notify_failures = meter.create_counter("gateway.notify.failures")
 breaker_opens = meter.create_counter("gateway.notify.breaker_opens")
 
+ACCESS = logging.getLogger("kimiclaw.access")
 EVENTS = logging.getLogger("kimiclaw.telemetry")  # structured events only; not propagated to stdout
 EVENTS.propagate = False
 EVENTS.setLevel(logging.INFO)
@@ -79,6 +90,22 @@ class _FileMetricExporter(MetricExporter):
         pass
 
 
+class _SkipQuiet(SpanExporter):
+    """Drops spans marked kimiclaw.quiet (read-pool 503/429/408), so they never hit the file or OTLP."""
+    def __init__(self, inner):
+        self.inner = inner
+
+    def export(self, spans):
+        kept = [s for s in spans if not (s.attributes or {}).get("kimiclaw.quiet")]
+        return SpanExportResult.SUCCESS if not kept else self.inner.export(kept)
+
+    def shutdown(self, **kw):
+        return self.inner.shutdown(**kw) if hasattr(self.inner, "shutdown") else None
+
+    def force_flush(self, timeout_millis=None, **kw):
+        return True if not hasattr(self.inner, "force_flush") else self.inner.force_flush(timeout_millis, **kw)
+
+
 class _JsonFormatter(logging.Formatter):
     def format(self, record):
         ctx = trace.get_current_span().get_span_context()
@@ -115,14 +142,14 @@ def setup():
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
         from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-        tp.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+        tp.add_span_processor(BatchSpanProcessor(_SkipQuiet(OTLPSpanExporter())))
         readers = [PeriodicExportingMetricReader(OTLPMetricExporter())]
         lp = LoggerProvider(resource=resource)
         lp.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
         EVENTS.addHandler(LoggingHandler(logger_provider=lp))
     else:
         os.makedirs(TELEMETRY_DIR, exist_ok=True)
-        tp.add_span_processor(BatchSpanProcessor(_FileSpanExporter()))
+        tp.add_span_processor(BatchSpanProcessor(_SkipQuiet(_FileSpanExporter())))
         readers = [PeriodicExportingMetricReader(_FileMetricExporter(), export_interval_millis=60_000)]
         logs_handler = _capped_handler("logs")
         logs_handler.setFormatter(_JsonFormatter())
@@ -139,18 +166,24 @@ async def telemetry_middleware(request, call_next):
     """One "rpc" span per request. For SSE (message/stream) the span and duration close at stream end."""
     started = time.perf_counter()
     span = tracer.start_span("rpc", attributes={
-        "http.request.method": request.method, "url.path": request.url.path})
+        "http.request.method": request.method, "url.path": _log_path(request.url.path)})
     state = {"status": 500}
 
     def finish():
         ms = (time.perf_counter() - started) * 1000
         status = state["status"]
-        span.set_attribute("http.response.status_code", status)
+        quiet = getattr(request, "state", None) is not None and getattr(request.state, "quiet_read", False)
         attrs = {"http.request.method": request.method, "http.response.status_code": status}
         requests_total.add(1, attrs)
         request_ms.record(ms, attrs)
+        if quiet:
+            span.set_attribute("kimiclaw.quiet", True)
+            span.end()
+            return
+        span.set_attribute("http.response.status_code", status)
+        ACCESS.info("%s %s %s", request.method, _log_path(request.url.path), status)
         with trace.use_span(span):
-            event("http_request", method=request.method, path=request.url.path, status=status,
+            event("http_request", method=request.method, path=_log_path(request.url.path), status=status,
                   duration_ms=round(ms, 1), key_id=getattr(request.state, "key_id", None),
                   **getattr(request.state, "ids", {}))
         span.end()

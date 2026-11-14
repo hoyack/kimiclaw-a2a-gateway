@@ -2,6 +2,11 @@
 import logging
 import os
 import re
+import stat
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from gateway.pubkey import public_key
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -11,9 +16,13 @@ logging.basicConfig(
 )
 LOG = logging.getLogger("kimiclaw")
 
+
+from gateway.env import _env_num
+
 MAX_LOG_ID = 128
-KEY_ID_RE = re.compile(r"[a-z0-9]{8,12}")
-SHA256_RE = re.compile(r"[0-9a-f]{64}")
+KEY_ID_RE = re.compile(r"[0-9a-f]{10}")  # exactly what tools/new_api_key.py mints (token_hex(5))
+CALLER_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
+PUBLIC_KEYS_HEADER = "# kimiclaw-public-keys v1"
 
 
 def log_safe(value) -> str:
@@ -24,6 +33,11 @@ def log_safe(value) -> str:
         c if c.isprintable() else (f"\\x{ord(c):02x}" if ord(c) < 256 else f"\\u{ord(c):04x}")
         for c in s
     )
+
+
+def log_path(value) -> str:
+    """A request path for logs: log_safe, then cap at 128 characters."""
+    return log_safe(value)[:MAX_LOG_ID]
 
 
 def _load_token() -> str:
@@ -43,48 +57,78 @@ def _load_token() -> str:
     return tok
 
 
-def load_keys(path: str) -> dict[str, tuple[str, str]]:
-    """Keys file: one `<key_id> <sha256-hex of the full key> <caller>` per line; blank lines and # comments skipped.
-    Missing, empty or malformed refuses startup. Errors name the line number, never its content."""
+def load_public_keys(path: str) -> dict[str, tuple[str, Ed25519PublicKey]]:
+    """Public keys file: first line must be `# kimiclaw-public-keys v1`, then one `<key_id> <caller> <public_key>`
+    per line; blank lines and # comments skipped. A caller may have several key_ids (rotation). Missing, empty,
+    malformed, missing the header, or writable by group or others refuses startup. Errors name the line number,
+    never its content. Setting GATEWAY_SIGNING_KEYS_FILE (the old HMAC secrets path) refuses startup, even if
+    GATEWAY_PUBLIC_KEYS_FILE is also set."""
+    if "GATEWAY_SIGNING_KEYS_FILE" in os.environ:
+        raise RuntimeError("GATEWAY_SIGNING_KEYS_FILE is set; it held HMAC secrets and is no longer read. "
+                           "Unset it and set GATEWAY_PUBLIC_KEYS_FILE to the callers' Ed25519 public keys "
+                           "(mint with tools/new_api_key.py). The file must start with `# kimiclaw-public-keys v1`")
     if not path:
-        raise RuntimeError("GATEWAY_KEYS_FILE not set (path to the hashed API keys file)")
+        raise RuntimeError("GATEWAY_PUBLIC_KEYS_FILE not set (path to the callers' Ed25519 public keys; "
+                           "first line must be `# kimiclaw-public-keys v1`)")
     try:
         with open(path) as f:
+            mode = os.fstat(f.fileno()).st_mode
             lines = f.read().splitlines()
     except OSError as e:
-        raise RuntimeError(f"GATEWAY_KEYS_FILE unreadable: {type(e).__name__}") from None
+        raise RuntimeError(f"GATEWAY_PUBLIC_KEYS_FILE unreadable: {type(e).__name__}") from None
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise RuntimeError(f"GATEWAY_PUBLIC_KEYS_FILE mode {stat.S_IMODE(mode):o} is writable by group or others")
+    if not lines or lines[0] != PUBLIC_KEYS_HEADER:
+        raise RuntimeError("GATEWAY_PUBLIC_KEYS_FILE: first line must be `# kimiclaw-public-keys v1`")
     keys = {}
     for n, line in enumerate(lines, 1):
-        if not line.strip() or line.lstrip().startswith("#"):
+        if n == 1 or not line.strip() or line.lstrip().startswith("#"):
             continue
         parts = line.split()
-        if len(parts) != 3 or not KEY_ID_RE.fullmatch(parts[0]) or not SHA256_RE.fullmatch(parts[1]) or parts[0] in keys:
-            raise RuntimeError(f"GATEWAY_KEYS_FILE line {n}: want unique `<key_id> <sha256-hex> <caller>`")
-        keys[parts[0]] = (parts[1], parts[2])
+        key = public_key(parts[2]) if len(parts) == 3 else None
+        if key is None or not KEY_ID_RE.fullmatch(parts[0]) or not CALLER_RE.fullmatch(parts[1]) or parts[0] in keys:
+            raise RuntimeError(f"GATEWAY_PUBLIC_KEYS_FILE line {n}: want unique `<key_id> <caller> <public_key>` "
+                               "(key_id: 10 lowercase hex; caller: up to 32 of A-Z a-z 0-9 _; "
+                               "public_key: 32-byte canonical on-curve Ed25519 key in the prime-order subgroup, unpadded base64url)")
+        keys[parts[0]] = (parts[1], key)
     if not keys:
-        raise RuntimeError("GATEWAY_KEYS_FILE has no keys")
+        raise RuntimeError("GATEWAY_PUBLIC_KEYS_FILE has no keys")
     return keys
 
 
 NOTIFY_URL = os.environ.get("GATEWAY_NOTIFY_URL", "").strip()
 TOKEN = _load_token() if NOTIFY_URL else ""  # outbound notify credential only; never accepted inbound
-API_KEYS = load_keys(os.environ.get("GATEWAY_KEYS_FILE", "").strip())
-CREATE_PER_MIN = float(os.environ.get("GATEWAY_CREATE_PER_MIN", "10"))
-CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
-GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))
-CANCEL_PER_S = float(os.environ.get("GATEWAY_CANCEL_PER_S", "1"))
+PUBLIC_KEYS = load_public_keys(os.environ.get("GATEWAY_PUBLIC_KEYS_FILE", "").strip())
+SIGNATURE_PAST_S = _env_num("GATEWAY_SIGNATURE_PAST_S", "300", lo=0)
+SIGNATURE_FUTURE_S = _env_num("GATEWAY_SIGNATURE_FUTURE_S", "30", lo=0)
+if not 0 <= SIGNATURE_FUTURE_S <= SIGNATURE_PAST_S:
+    raise RuntimeError("want 0 <= GATEWAY_SIGNATURE_FUTURE_S <= GATEWAY_SIGNATURE_PAST_S")
+MAX_NONCES_PER_CALLER = _env_num("GATEWAY_MAX_NONCES_PER_CALLER", "20000", lo=1)
+REQUESTS_PER_S = _env_num("GATEWAY_REQUESTS_PER_S", "5", float, gt=0)
+REQUESTS_BURST = _env_num("GATEWAY_REQUESTS_BURST", "10", lo=1)
+READS_PER_CALLER = _env_num("GATEWAY_READS_PER_CALLER", "3")
+BODY_READ_TIMEOUT_S = _env_num("GATEWAY_BODY_READ_TIMEOUT_S", "10", float, gt=0)
+BODY_IDLE_TIMEOUT_S = _env_num("GATEWAY_BODY_IDLE_TIMEOUT_S", "5", float, gt=0)
+if not 2 <= READS_PER_CALLER <= 4:
+    raise RuntimeError("GATEWAY_READS_PER_CALLER must be 2, 3 or 4")
+if not 0 < BODY_IDLE_TIMEOUT_S <= BODY_READ_TIMEOUT_S:
+    raise RuntimeError("want 0 < GATEWAY_BODY_IDLE_TIMEOUT_S <= GATEWAY_BODY_READ_TIMEOUT_S")
+CREATE_PER_MIN = _env_num("GATEWAY_CREATE_PER_MIN", "10", float, gt=0)
+CREATE_BURST = _env_num("GATEWAY_CREATE_BURST", "5", lo=1)
+GET_PER_S = _env_num("GATEWAY_GET_PER_S", "2", float, gt=0)
+CANCEL_PER_S = _env_num("GATEWAY_CANCEL_PER_S", "1", float, gt=0)
 MAX_BODY = 1_000_000
-MAX_INFLIGHT_PER_KEY = int(os.environ.get("GATEWAY_MAX_INFLIGHT_PER_KEY", "2"))
-MAX_PENDING = int(os.environ.get("GATEWAY_MAX_PENDING", "50"))
-MAX_TASKS_PER_KEY = int(os.environ.get("GATEWAY_MAX_TASKS_PER_KEY", "100"))
+MAX_INFLIGHT_PER_KEY = _env_num("GATEWAY_MAX_INFLIGHT_PER_KEY", "2", lo=1)
+MAX_PENDING = _env_num("GATEWAY_MAX_PENDING", "50", lo=1)
+MAX_TASKS_PER_KEY = _env_num("GATEWAY_MAX_TASKS_PER_KEY", "100", lo=1)
 PUBLIC_URL = os.environ.get("GATEWAY_PUBLIC_URL", "").strip() or "https://kimiclaw.hoyack.ai/"
 NOTIFY_AUTH_MODE = os.environ.get("GATEWAY_NOTIFY_AUTH_MODE", "raw").lower()
 NOTIFY_AUTH_USER = os.environ.get("GATEWAY_NOTIFY_AUTH_USER", "agent")
 NOTIFY_EVENTS = {e.strip() for e in os.environ.get(
     "GATEWAY_NOTIFY_EVENTS", "task_completed,task_failed").split(",") if e.strip()}
 NOTIFY_TIMEOUT = 10
-NOTIFY_FAIL_LIMIT = int(os.environ.get("GATEWAY_NOTIFY_FAIL_LIMIT", "5"))
-NOTIFY_COOLDOWN_S = int(os.environ.get("GATEWAY_NOTIFY_COOLDOWN_S", "900"))
+NOTIFY_FAIL_LIMIT = _env_num("GATEWAY_NOTIFY_FAIL_LIMIT", "5", lo=1)
+NOTIFY_COOLDOWN_S = _env_num("GATEWAY_NOTIFY_COOLDOWN_S", "900", lo=0)
 MAX_TEXT = 100_000
 AGENT_TIMEOUT = 560           # seconds, passed to openclaw
 AGENT_CONCURRENCY = 3         # concurrent agent turns

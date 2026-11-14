@@ -8,7 +8,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def test_served_spec_matches_frozen_yaml(gw_factory):
-    served = gw_factory().get("/openapi.json").json()
+    served = gw_factory(GATEWAY_SIGNATURE_FUTURE_S="30", GATEWAY_SIGNATURE_PAST_S="300").get("/openapi.json").json()
     with open(os.path.join(ROOT, "openapi.yaml")) as f:
         assert served == yaml.safe_load(f)
 
@@ -23,17 +23,18 @@ def test_healthz_readyz(gw_factory):
     assert c.get("/readyz").json() == {"status": "ready"}  # fake openclaw is on PATH
 
 
-def test_healthz_public_minimal_readyz_protected(gw_factory):
+def test_healthz_and_readyz_are_public_and_skip_auth(gw_factory):
     import httpx
     base = str(gw_factory().base_url)
-    for h in ({}, {"Authorization": "Bearer wrong"}):
+    for h in ({}, {"X-KC-Key-Id": "a1a1a1a1a1", "X-KC-Signature": "0" * 64}):
         r = httpx.get(base + "/healthz", headers=h)
         assert (r.status_code, r.json()) == (200, {"status": "ok"})
         r = httpx.get(base + "/readyz", headers=h)
-        assert (r.status_code, r.json()) == (401, {"error": "unauthorized"})
-    for m in ("POST", "PUT", "DELETE"):  # only GET /healthz exists; other methods are not a back door
+        assert (r.status_code, r.json()) == (200, {"status": "ready"})
+    for m in ("POST", "PUT", "DELETE"):  # only GET /healthz and GET /readyz exist; other methods are not a back door
         assert httpx.request(m, base + "/healthz").status_code == 405
-    for p in ("/healthz/", "/healthz/x", "/openapi.json", "/redoc"):
+        assert httpx.request(m, base + "/readyz").status_code == 405
+    for p in ("/healthz/", "/healthz/x", "/readyz/", "/readyz/x", "/openapi.json", "/redoc"):
         r = httpx.get(base + p)
         assert (r.status_code, r.json()) == (401, {"error": "unauthorized"})
 
@@ -60,7 +61,7 @@ def test_traces_and_metrics_files(tmp_path):
     from conftest import start_gateway, KEY
     tdir = tmp_path / "tel"
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_TELEMETRY_DIR": str(tdir)})
-    httpx.get(base + "/", headers={"Authorization": f"Bearer {KEY}"})
+    httpx.get(base + "/", auth=KEY)
     p.terminate(); p.wait(10)
     traces = (tdir / "traces.jsonl").read_text()
     assert '"name": "rpc"' in traces
@@ -85,7 +86,7 @@ def test_rpc_agent_notify_spans_share_one_trace(tmp_path, mock):
     tdir = tmp_path / "tel"
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_TELEMETRY_DIR": str(tdir),
                                           "GATEWAY_NOTIFY_URL": f"http://127.0.0.1:{mock.port}/hook"})
-    httpx.post(base + "/", json=_rpc("hi", "tr1"), headers={"Authorization": f"Bearer {KEY}"}, timeout=30)
+    httpx.post(base + "/", json=_rpc("hi", "tr1"), auth=KEY, timeout=30)
     mock.wait(1)
     p.terminate(); p.wait(10)
     spans = _read_spans(tdir)
@@ -102,9 +103,8 @@ def test_no_message_text_in_logs_or_traces_including_agent_error(tmp_path):
     from conftest import start_gateway, KEY
     tdir = tmp_path / "tel"
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_TELEMETRY_DIR": str(tdir)})
-    h = {"Authorization": f"Bearer {KEY}"}
-    ok = httpx.post(base + "/", json=_rpc("SECRET-OK-77", "ok1"), headers=h, timeout=30).json()
-    bad = httpx.post(base + "/", json=_rpc("SECRET-FAIL-88 FAIL", "bad1"), headers=h, timeout=30).json()
+    ok = httpx.post(base + "/", json=_rpc("SECRET-OK-77", "ok1"), auth=KEY, timeout=30).json()
+    bad = httpx.post(base + "/", json=_rpc("SECRET-FAIL-88 FAIL", "bad1"), auth=KEY, timeout=30).json()
     assert ok["result"]["status"]["state"] == "completed" and bad["result"]["status"]["state"] == "failed"
     p.terminate(); p.wait(10)
     for name in ("logs.jsonl", "traces.jsonl"):
@@ -120,7 +120,7 @@ def test_stream_span_and_duration_close_at_stream_end(tmp_path):
     tdir = tmp_path / "tel"
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_TELEMETRY_DIR": str(tdir)})
     with httpx.stream("POST", base + "/", json=_rpc("SLOW", "st1", "message/stream"),
-                      headers={"Authorization": f"Bearer {KEY}"}, timeout=30) as r:
+                      auth=KEY, timeout=30) as r:
         body = "".join(r.iter_text())
     assert '"completed"' in body
     p.terminate(); p.wait(10)
@@ -156,8 +156,8 @@ def _boot_fails(tmp_path, token_env):
     app = tmp_path / "app"
     shutil.copytree(ROOT, app, ignore=shutil.ignore_patterns(".venv", ".git", ".env", "telemetry", "__pycache__"))
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
-    env.update({"GATEWAY_KEYS_FILE": KEYS_FILE, **token_env})
-    r = subprocess.run([sys.executable, "-c", "import app"], cwd=app, env=env, capture_output=True, text=True, timeout=60)
+    env.update({"GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "KIMICLAW_LIMIT_CONCURRENCY": "1024", **token_env})
+    r = subprocess.run([sys.executable, "-c", "from gateway.launcher_guard import mark_launched; mark_launched(); from gateway.main import create_app; create_app()"], cwd=app, env=env, capture_output=True, text=True, timeout=60)
     return r
 
 
@@ -193,8 +193,7 @@ def test_agent_error_stderr_and_traceback_not_in_stdout_or_logs(tmp_path):
     from conftest import start_gateway, KEY
     tdir = tmp_path / "tel"
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_TELEMETRY_DIR": str(tdir)})
-    h = {"Authorization": f"Bearer {KEY}"}
-    bad = httpx.post(base + "/", json=_rpc("PROMPT-ECHO-99 FAIL", "bad2"), headers=h, timeout=30).json()
+    bad = httpx.post(base + "/", json=_rpc("PROMPT-ECHO-99 FAIL", "bad2"), auth=KEY, timeout=30).json()
     assert bad["result"]["status"]["state"] == "failed"
     p.terminate(); p.wait(10)
     out = (tmp_path / "gateway.log").read_text()
@@ -209,8 +208,7 @@ def _run_success(tmp_path, env):
     from conftest import start_gateway, KEY
     tdir = tmp_path / "tel"
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_TELEMETRY_DIR": str(tdir), **env})
-    h = {"Authorization": f"Bearer {KEY}"}
-    r = httpx.post(base + "/", json=_rpc("PROMPT-OK-77 hello", "ok77", message_id="mid-77"), headers=h, timeout=30).json()
+    r = httpx.post(base + "/", json=_rpc("PROMPT-OK-77 hello", "ok77", message_id="mid-77"), auth=KEY, timeout=30).json()
     assert r["result"]["status"]["state"] != "failed"
     p.terminate(); p.wait(10)
     return (tmp_path / "gateway.log").read_text(), (tdir / "logs.jsonl").read_text(), r["result"]["id"]
@@ -246,7 +244,7 @@ def _assert_no_forgery(raw):
 
 def _py(prog, *args):
     import subprocess, sys
-    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "GATEWAY_KEYS_FILE": KEYS_FILE, "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "PYTHONIOENCODING": "utf-8"}
     return subprocess.run([sys.executable, "-c", prog, *args], env=env, capture_output=True, timeout=30,
                           cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -269,9 +267,8 @@ def test_client_message_id_cannot_forge_log_lines(tmp_path):
     import httpx
     from conftest import start_gateway, KEY
     p, base, _ = start_gateway(tmp_path, {"PYTHONIOENCODING": "utf-8"})
-    h = {"Authorization": f"Bearer {KEY}"}
     forged = "m1" + _FORGE_TAIL + "A" * 500
-    r = httpx.post(base + "/", json=_rpc("hello", "forge1", message_id=forged), headers=h, timeout=30).json()
+    r = httpx.post(base + "/", json=_rpc("hello", "forge1", message_id=forged), auth=KEY, timeout=30).json()
     assert r["result"]["status"]["state"] != "failed"
     p.terminate(); p.wait(10)
     raw = (tmp_path / "gateway.log").read_text(encoding="utf-8")
@@ -285,13 +282,12 @@ def test_client_task_id_never_reaches_logs(tmp_path, mock):
     """A client taskId is ignored (R1): inbound, agent-failed and notify log lines carry the server-minted id."""
     import httpx
     from conftest import start_gateway, KEY
-    h = {"Authorization": f"Bearer {KEY}"}
     forged = "t1" + _FORGE_TAIL + "B" * 500
     for name, url, text in (("ok", f"http://127.0.0.1:{mock.port}/hook", "hello FAIL"),
                             ("down", "http://127.0.0.1:9/hook", "hello FAIL")):
         d = tmp_path / name; d.mkdir()
         p, base, _ = start_gateway(d, {"PYTHONIOENCODING": "utf-8", "GATEWAY_NOTIFY_URL": url})
-        tid = httpx.post(base + "/", json=_rpc(text, forged), headers=h, timeout=30).json()["result"]["id"]
+        tid = httpx.post(base + "/", json=_rpc(text, forged), auth=KEY, timeout=30).json()["result"]["id"]
         import time
         for _ in range(50):
             raw = (d / "gateway.log").read_text(encoding="utf-8")
@@ -319,7 +315,7 @@ def test_sse_req_id_cannot_forge_log_lines():
         "asyncio.run(main())\n"
     )
     forged = "r1" + _FORGE_TAIL + "C" * 500
-    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "GATEWAY_KEYS_FILE": KEYS_FILE, "PYTHONIOENCODING": "utf-8"}
+    env = {**os.environ, "KIMICLAW_TOKEN": "dummy-test-token", "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "PYTHONIOENCODING": "utf-8"}
     r = subprocess.run([sys.executable, "-c", prog, forged], cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                        env=env, capture_output=True, timeout=30)
     raw = r.stderr.decode("utf-8")
@@ -334,8 +330,7 @@ def test_notify_failure_logs_type_and_host_only(tmp_path):
     tdir = tmp_path / "tel"
     url = "http://127.0.0.1:9/SECRET-HOOK-PATH/abc123?k=SECRETQ"
     p, base, _ = start_gateway(tmp_path, {"GATEWAY_TELEMETRY_DIR": str(tdir), "GATEWAY_NOTIFY_URL": url})
-    h = {"Authorization": f"Bearer {KEY}"}
-    r = httpx.post(base + "/", json=_rpc("hello notify", "n1"), headers=h, timeout=30).json()
+    r = httpx.post(base + "/", json=_rpc("hello notify", "n1"), auth=KEY, timeout=30).json()
     assert r["result"]["status"]["state"] == "completed"
     import time
     for _ in range(50):
@@ -354,7 +349,7 @@ def test_sse_error_logs_type_only_no_traceback(caplog, monkeypatch, tmp_path):
     import asyncio, logging
     from conftest import KEYS_FILE, TOKEN
     monkeypatch.setenv("KIMICLAW_TOKEN", TOKEN)
-    monkeypatch.setenv("GATEWAY_KEYS_FILE", KEYS_FILE)
+    monkeypatch.setenv("GATEWAY_PUBLIC_KEYS_FILE", KEYS_FILE)
     monkeypatch.setenv("GATEWAY_TELEMETRY_DIR", str(tmp_path / "tel"))
     from gateway.controllers.rpc import sse_events
 

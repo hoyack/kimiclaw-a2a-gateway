@@ -8,7 +8,7 @@ import time
 import httpx
 import pytest
 
-from conftest import KEY, KEYS_FILE, OTHER_KEY, ROOT, TOKEN, start_gateway
+from conftest import KEY, KEYS_FILE, OTHER_KEY, ROOT, PRIVATE_KEYS, TOKEN, start_gateway
 
 
 @pytest.fixture
@@ -18,7 +18,7 @@ def gw(tmp_path):
         p, base, rec = start_gateway(tmp_path, env); procs.append(p)
         def rpc(key, method, params, query=""):
             body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-            return httpx.post(base + "/" + query, json=body, headers={"Authorization": f"Bearer {key}"}, timeout=20)
+            return httpx.post(base + "/" + query, json=body, auth=key, timeout=20)
         rpc.calls = lambda: [json.loads(l) for l in rec.read_text().splitlines()] if rec.exists() else []
         return rpc
     yield make
@@ -48,8 +48,8 @@ def test_r1_other_key_cannot_read_overwrite_join_or_cancel(gw):
 
     rpc(OTHER_KEY, "message/send", msg("B-joins-A-session", contextId="ctx-A"))  # repro R4
     sessions = {c["message"]: c["argv"][c["argv"].index("--session-id") + 1] for c in rpc.calls()}
-    assert sessions["A-SECRET-DATA"] == "a2a-testkey01-ctx-A"
-    assert sessions["B-joins-A-session"] == "a2a-testkey02-ctx-A"
+    assert sessions["A-SECRET-DATA"] == "a2a-alice-ctx-A"
+    assert sessions["B-joins-A-session"] == "a2a-bob-ctx-A"
 
     slow = rpc(KEY, "message/send", msg("SLOW job", taskId="t-A2"), "?wait=false").json()["result"]  # repro R6
     r = rpc(OTHER_KEY, "tasks/cancel", {"id": slow["id"]}).json()
@@ -91,6 +91,7 @@ def test_r4_agent_env_has_no_gateway_settings_or_key_material(gw):
     rpc(KEY, "message/send", msg("run env"))
     call = rpc.calls()[0]
     assert set(call["env"]) <= {"PATH", "HOME", "LANG", "LC_ALL", "TZ"}
+    assert not any(secret in json.dumps(call) for secret in PRIVATE_KEYS.values())
     assert "--message" not in call["argv"] and "run env" not in call["argv"]
 
 
@@ -100,7 +101,7 @@ def test_r4_message_over_128kb_goes_over_stdin(tmp_path):
     text = "y" * 140_000
     prog = ("import asyncio, sys\nfrom gateway.services.agent_runner import run_agent\n"
             "print(len(asyncio.run(run_agent('s1', sys.stdin.read()))))")
-    env = {**os.environ, "GATEWAY_KEYS_FILE": KEYS_FILE, "KIMICLAW_TOKEN": TOKEN, "HOME": str(tmp_path),
+    env = {**os.environ, "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "KIMICLAW_TOKEN": TOKEN, "HOME": str(tmp_path),
            "GATEWAY_TELEMETRY_DIR": str(tmp_path / "tel"),
            "PATH": os.path.join(ROOT, "tests", "fakebin") + os.pathsep + os.environ["PATH"]}
     r = subprocess.run([sys.executable, "-c", prog], input=text, cwd=ROOT, env=env, capture_output=True, text=True,
@@ -131,6 +132,7 @@ def test_startup_warns_limits_are_single_replica(caplog):
     import asyncio
     import logging
 
+    os.environ["GATEWAY_PUBLIC_KEYS_FILE"] = KEYS_FILE
     from gateway.main import lifespan
 
     async def run():

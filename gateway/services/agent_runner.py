@@ -75,10 +75,14 @@ async def _run_agent(session_id: str, text: str) -> str:
         "--timeout", str(AGENT_TIMEOUT),
     ]
     LOG.info("agent run start session=%s len=%d", session_id, len(text))
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env=agent_env(),
-    )
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=agent_env(),
+        )
+    except FileNotFoundError:
+        LOG.error("agent unavailable")
+        raise RuntimeError("agent unavailable") from None
     try:
         out, err = await asyncio.wait_for(proc.communicate(text.encode()), timeout=AGENT_TIMEOUT + 30)
     except asyncio.TimeoutError:

@@ -1,15 +1,50 @@
-import os, socket, subprocess, sys, threading, time
+import atexit, base64, os, secrets, shutil, socket, subprocess, sys, tempfile, threading, time
+os.environ.setdefault("KIMICLAW_LIMIT_CONCURRENCY", "1024")
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx, pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN: outbound notify credential only
-KEY = "kc_testkey01_" + "k" * 43
-OTHER_KEY = "kc_testkey02_" + "o" * 43
-LIMITS_OFF = {"GATEWAY_CREATE_PER_MIN": "100000", "GATEWAY_CREATE_BURST": "1000",
-              "GATEWAY_GET_PER_S": "1000", "GATEWAY_CANCEL_PER_S": "1000"}
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+from gateway.launcher_guard import mark_launched  # noqa: E402
+from sign_request import Signer, load_private_key  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
 
-KEYS_FILE = os.path.join(ROOT, "tests", "keys.test.txt")
+
+def pytest_configure(config):
+    mark_launched()
+
+TOKEN = "dummy-test-token"  # KIMICLAW_TOKEN: outbound notify credential only
+CALLERS = {"a1a1a1a1a1": "alice", "b2b2b2b2b2": "bob", "a1a1a1a1a3": "alice"}  # a1a1a1a1a3: alice's rotation key
+PRIVATE_KEYS = {key_id: secrets.token_urlsafe(32) for key_id in CALLERS}  # fresh Ed25519 seeds every run, never committed
+
+
+def public_key(private_key: str) -> str:
+    raw = load_private_key(private_key).public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+KEY = Signer("a1a1a1a1a1", PRIVATE_KEYS["a1a1a1a1a1"])
+OTHER_KEY = Signer("b2b2b2b2b2", PRIVATE_KEYS["b2b2b2b2b2"])
+LIMITS_OFF = {"GATEWAY_CREATE_PER_MIN": "100000", "GATEWAY_CREATE_BURST": "1000",
+              "GATEWAY_REQUESTS_PER_S": "100000", "GATEWAY_REQUESTS_BURST": "100000",
+              "GATEWAY_GET_PER_S": "1000", "GATEWAY_CANCEL_PER_S": "1000",
+              "GATEWAY_SIGNATURE_FUTURE_S": "2", "GATEWAY_REFUSAL_LOG_S": "0.05",
+              "KIMICLAW_LIMIT_CONCURRENCY": "1024"}
+
+
+
+def write_keys_file(path, key_ids=("a1a1a1a1a1", "b2b2b2b2b2"), mode=0o600):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        f.write("# kimiclaw-public-keys v1\n")
+        f.writelines(f"{k} {CALLERS[k]} {public_key(PRIVATE_KEYS[k])}\n" for k in key_ids)
+    os.chmod(path, mode)
+    return str(path)
+
+
+_keys_dir = tempfile.mkdtemp(prefix="kc-test-keys-")
+atexit.register(shutil.rmtree, _keys_dir, True)
+KEYS_FILE = write_keys_file(os.path.join(_keys_dir, "keys.txt"))
 
 
 def free_port():
@@ -37,28 +72,42 @@ class Mock:
         return self.requests
 
 
-def start_gateway(tmp_path, extra_env):
+def start_gateway(tmp_path, extra_env, wait="main"):
+    """Start `python -m gateway`. wait='main' blocks until the main port is serving (after the hold);
+    wait='probe' returns as soon as the probe /healthz is up (during the hold)."""
     port = free_port()
     rec = tmp_path / "argv.jsonl"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
     env.update({
         "KIMICLAW_TOKEN": TOKEN,
-        "GATEWAY_KEYS_FILE": KEYS_FILE,
+        "GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE,
         **LIMITS_OFF,
         "PATH": os.path.join(ROOT, "tests", "fakebin") + os.pathsep + env["PATH"],
         "HOME": str(tmp_path),
         "NO_PROXY": "*",
     })
     env.update(extra_env)
+    probe_port = int(env["GATEWAY_PROBE_PORT"]) if env.get("GATEWAY_PROBE_PORT") else free_port()
+    env["GATEWAY_PROBE_PORT"] = str(probe_port)
     log = open(tmp_path / "gateway.log", "w")
-    p = subprocess.Popen([sys.executable, "-m", "uvicorn", "app:app", "--port", str(port)],
+    p = subprocess.Popen([sys.executable, "-m", "gateway", "--host", "127.0.0.1", "--port", str(port)],
                          cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+    log.close()
     base = f"http://127.0.0.1:{port}"
-    for _ in range(100):
+    probe_base = f"http://127.0.0.1:{probe_port}"
+    p.probe_base = probe_base
+    (tmp_path / "probe_url").write_text(probe_base)
+    ready = (base + "/.well-known/agent.json") if wait == "main" else (probe_base + "/healthz")
+    deadline = time.time() + int(env.get("GATEWAY_SIGNATURE_FUTURE_S", "30")) + 10
+    while time.time() < deadline:
+        if p.poll() is not None:
+            break
         try:
-            httpx.get(base + "/.well-known/agent.json", timeout=0.5); break
+            httpx.get(ready, timeout=0.5); break
         except Exception:
-            time.sleep(0.1)
+            time.sleep(0.05)
+    if p.poll() is not None:
+        raise RuntimeError(f"gateway exited {p.returncode}: {(tmp_path / 'gateway.log').read_text()}")
     return p, base, rec
 
 
@@ -72,7 +121,7 @@ def gw_factory(tmp_path):
     procs = []
     def make(**env):
         p, base, rec = start_gateway(tmp_path, env); procs.append(p)
-        c = httpx.Client(base_url=base, headers={"Authorization": f"Bearer {KEY}"}, timeout=30)
+        c = httpx.Client(base_url=base, auth=KEY, timeout=30)
         c.argv_file = rec; c.log_file = tmp_path / "gateway.log"
         return c
     yield make

@@ -4,7 +4,7 @@
       "request": {
         "method": "POST",
         "path": "/",
-        "auth": "bearer",
+        "auth": "signed",
         "json": {
           "jsonrpc": "2.0",
           "id": 9,
