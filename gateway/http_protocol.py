@@ -23,12 +23,19 @@ class HeaderTimeoutProtocol(H11Protocol):
         try:
             super().data_received(data)
         except h11.LocalProtocolError as exc:
-            # send_400_response after a keep-alive reply: h11 is already MUST_CLOSE.
+            # send_400_response after a response has started: h11 is MUST_CLOSE or
+            # still in SEND_BODY (bad chunk arrived mid-stream).
             if not str(exc).startswith("can't handle event type Response"):
                 raise
+            # The error message names MUST_CLOSE / SEND_BODY / DONE, but h11
+            # has already moved our_state to ERROR by the time we catch.
+            if self.conn.our_state not in (h11.ERROR, h11.MUST_CLOSE, h11.SEND_BODY, h11.DONE):
+                raise
             # The uvicorn.error filter already counted "Invalid HTTP request received."
-            # as malformed once; do not count again. Close so asyncio does not log
-            # "Fatal error: protocol.data_received() call failed" plus a traceback.
+            # as malformed once. Mark the cycle disconnected so the app's next
+            # send does not raise "Can't send data when our state is ERROR".
+            if self.cycle is not None:
+                self.cycle.disconnected = True
             if self.transport is not None and not self.transport.is_closing():
                 self.transport.close()
             return

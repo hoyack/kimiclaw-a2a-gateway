@@ -1,6 +1,7 @@
 """Critic FIX FIRST on #5: no hung tasks, single-worker and per-key-slot guards, sanitized log fields, early 413."""
 import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -512,10 +513,17 @@ def _assert_never_listens(cmd, ports, extra_env=None, timeout=8):
     Does not assert the exit code: some exotic forms exit 0 after the workers refuse.
     A supervisor may bind and log "Uvicorn running" / "Listening at" before workers
     refuse; connect() alone is not a serve. No new argv parsing is added to hide those lines.
+
+    GATEWAY_SIGNATURE_FUTURE_S=2 so a guard bypass would serve inside the poll window.
+    The child is started in its own session and the whole group is SIGKILL'd so
+    orphan workers cannot hold the pipes open.
     """
-    env = {**ENV, **(extra_env or {})}
-    proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    env = {**ENV, "GATEWAY_SIGNATURE_FUTURE_S": "2", **(extra_env or {})}
+    proc = subprocess.Popen(
+        cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True)
     served = False
+    stdout = stderr = ""
     try:
         deadline = time.monotonic() + timeout
         while proc.poll() is None and time.monotonic() < deadline:
@@ -523,12 +531,16 @@ def _assert_never_listens(cmd, ports, extra_env=None, timeout=8):
                 served = True
                 break
             time.sleep(0.05)
-        if proc.poll() is None:
-            proc.kill()
-        stdout, stderr = proc.communicate(timeout=3)
-    except Exception:
-        proc.kill()
-        raise
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            if proc.poll() is None:
+                proc.kill()
+        try:
+            stdout, stderr = proc.communicate(timeout=3)
+        except Exception:
+            pass
     out = (stderr or "") + (stdout or "")
     assert not served, out
     assert not any(_http_response_from(p) for p in ports), out
@@ -1292,6 +1304,78 @@ def test_headers_then_bad_chunked_body_is_quiet_on_both_ports(tmp_path):
                 if m:
                     total += int(m.group(1))
             assert total == n, (total, n, chunk)
+        assert httpx.get(base + "/", auth=KEY, timeout=5).status_code == 200
+    finally:
+        p.terminate()
+        p.wait(10)
+
+
+def _first_byte_then_bad_chunk(port, path=b"/.well-known/agent.json"):
+    """Send chunked headers, wait for the first response byte, then a bad chunk (mid-body)."""
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        s.sendall(b"GET " + path + b" HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+        s.settimeout(2)
+        first = s.recv(1)
+        try:
+            s.sendall(b"ZZZ\r\n")
+        except OSError:
+            pass
+        try:
+            s.settimeout(0.3)
+            while s.recv(4096):
+                pass
+        except OSError:
+            pass
+        return first
+
+
+def _assert_quiet_malformed(log, mark, n):
+    import re
+    chunk = log.read_text()[mark:]
+    assert "Fatal error: protocol.data_received() call failed" not in chunk, chunk
+    assert "Exception in ASGI application" not in chunk, chunk
+    assert "Can't send data when our state is ERROR" not in chunk, chunk
+    assert "Traceback" not in chunk, chunk
+    lines = [ln for ln in chunk.splitlines() if ln.strip()]
+    assert len(lines) <= 5, (len(lines), lines)
+    total = 0
+    for ln in chunk.splitlines():
+        m = re.search(r"\bmalformed:(\d+)", ln)
+        if m:
+            total += int(m.group(1))
+    assert total == n, (total, n, chunk)
+    return lines
+
+
+def test_mid_response_and_full_read_bad_chunks_are_quiet(tmp_path):
+    """A-5c mid-response: bad chunk after the first byte of GET /.well-known/agent.json
+    on the main port, plus the full-read case on both ports. 200 requests each stay quiet."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_REFUSAL_LOG_S": "2", "GATEWAY_HEADER_TIMEOUT_S": "30"})
+    log = tmp_path / "gateway.log"
+    main_port = int(base.rsplit(":", 1)[1])
+    probe_port = int(p.probe_base.rsplit(":", 1)[1])
+    n = 200
+    try:
+        # 1. mid-response on the main port (public agent card, first byte, then bad chunk)
+        mark = len(log.read_text())
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            firsts = list(pool.map(lambda _: _first_byte_then_bad_chunk(main_port), range(n)))
+        assert all(firsts) and all(f == b"H" or f.startswith(b"H") for f in firsts), set(firsts)
+        time.sleep(2.3)
+        _assert_quiet_malformed(log, mark, n)
+
+        # 2–3. full-read case on both ports
+        for port in (main_port, probe_port):
+            mark = len(log.read_text())
+            with ThreadPoolExecutor(max_workers=32) as pool:
+                statuses = list(pool.map(lambda _: _headers_then_bad_chunk(port), range(n)))
+            assert all(s.startswith(b"HTTP/1.1 200") for s in statuses), set(statuses)
+            time.sleep(2.3)
+            _assert_quiet_malformed(log, mark, n)
+
         assert httpx.get(base + "/", auth=KEY, timeout=5).status_code == 200
     finally:
         p.terminate()
