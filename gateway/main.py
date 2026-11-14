@@ -4,7 +4,9 @@ import os
 import re
 import time
 
-from gateway.launcher_guard import FACTORY_REFUSAL, launched, refuse_launcher
+from gateway.launcher_guard import FACTORY_REFUSAL, launched, refuse_launcher, refuse_unsupported_import
+
+refuse_unsupported_import()
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI

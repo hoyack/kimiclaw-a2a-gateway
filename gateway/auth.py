@@ -138,6 +138,10 @@ def emit_refusals(pool_name: str, reasons: dict[str, int], path: str | None = No
     suffix = f" path={log_path(path)}" if path else ""
     if pool_name == "precheck":
         LOG.warning("auth refused count=%d reasons=%s%s", count, parts, suffix)
+    elif pool_name == "public":
+        LOG.warning("public count=%d reasons=%s%s", count, parts, suffix)
+    elif pool_name == "http":
+        LOG.warning("http refused count=%d reasons=%s%s", count, parts, suffix)
     elif pool_name == "limit":
         LOG.warning("rate limited count=%d reasons=%s%s", count, parts, suffix)
     else:
@@ -158,9 +162,8 @@ async def _flush_refusals(pool_name: str):
         rec["task"] = asyncio.get_running_loop().create_task(_flush_refusals(pool_name))
 
 
-def note_refusal(request: Request, pool_name: str, reason: str, path: str | None = None):
-    """Quiet refusal: one aggregated log line per pool per interval, no per-request log, trace, or access log."""
-    request.state.quiet_read = True
+def note_quiet(pool_name: str, reason: str, path: str | None = None):
+    """Count one event into the existing aggregated summary for this pool."""
     rec = _refusals.setdefault(pool_name, {"reasons": {}, "task": None, "path": None})
     rec["reasons"][reason] = rec["reasons"].get(reason, 0) + 1
     if path is not None:
@@ -172,7 +175,19 @@ def note_refusal(request: Request, pool_name: str, reason: str, path: str | None
             emit_refusals(pool_name, reasons, path=sample)
         return
     if rec["task"] is None:
-        rec["task"] = asyncio.get_running_loop().create_task(_flush_refusals(pool_name))
+        try:
+            rec["task"] = asyncio.get_running_loop().create_task(_flush_refusals(pool_name))
+        except RuntimeError:
+            reasons, rec["reasons"] = rec["reasons"], {}
+            sample, rec["path"] = rec.get("path"), None
+            if reasons:
+                emit_refusals(pool_name, reasons, path=sample)
+
+
+def note_refusal(request: Request, pool_name: str, reason: str, path: str | None = None):
+    """Quiet refusal: one aggregated log line per pool per interval, no per-request log, trace, or access log."""
+    request.state.quiet_read = True
+    note_quiet(pool_name, reason, path=path)
 
 
 def quiet_unauthorized(request: Request, reason: str) -> JSONResponse:
@@ -198,9 +213,13 @@ def _quiet_status_reason(request: Request, status: int) -> str | None:
 async def signed_auth(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
         response = await call_next(request)
-        reason = _quiet_status_reason(request, response.status_code) or (
-            "options" if request.method == "OPTIONS" else "public")
-        note_refusal(request, "precheck", reason, path=request.url.path)
+        if response.status_code in (404, 405):
+            note_refusal(request, "http", _quiet_status_reason(request, response.status_code),
+                         path=request.url.path)
+        elif request.url.path in PUBLIC_PATHS:
+            note_refusal(request, "public", "ok", path=request.url.path)
+        else:
+            note_refusal(request, "http", "options", path=request.url.path)
         return response
     values = [request.headers.getlist(h) for h in HEADERS]
     key_id, timestamp, nonce, signature, body_sha256 = (v[0] if v else "" for v in values)
@@ -263,6 +282,6 @@ async def signed_auth(request: Request, call_next):
     LOG.info("request key_id=%s caller=%s %s %s", key_id, log_safe(caller), request.method, log_path(request.url.path))
     response = await call_next(request)
     if response.status_code in (404, 405):
-        note_refusal(request, "precheck", _quiet_status_reason(request, response.status_code),
+        note_refusal(request, "http", _quiet_status_reason(request, response.status_code),
                      path=request.url.path)
     return response

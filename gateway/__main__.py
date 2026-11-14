@@ -1,6 +1,7 @@
 """Only supported entrypoint: `python -m gateway`. Pins one worker, the concurrency cap, and the probe port."""
 import argparse
 import asyncio
+import logging
 import signal
 import time
 
@@ -12,6 +13,39 @@ from gateway.launcher_guard import mark_launched
 from gateway.main import create_app, header_timeout_s, limit_concurrency, probe_port
 from gateway.probe import probe_app
 from gateway.routes.health import require_openclaw, set_main_serving
+
+
+# Exact uvicorn.error templates from uvicorn/protocols/http/h11_impl.py (no user data).
+_UVICORN_PROTOCOL_COUNTED = {
+    "Invalid HTTP request received.": ("http", "malformed"),
+    "Unsupported upgrade request.": ("http", "upgrade"),
+    "Exceeded concurrency limit.": ("http", "concurrency"),
+}
+_UVICORN_PROTOCOL_DROP = frozenset({
+    *_UVICORN_PROTOCOL_COUNTED,
+    'No supported WebSocket library detected. Please use "pip install \'uvicorn[standard]\'", or install \'websockets\' or \'wsproto\' manually.',
+})
+
+
+class _UvicornProtocolFilter(logging.Filter):
+    """Drop uvicorn's per-request protocol warnings and count them into the quiet summary."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.msg
+        if not isinstance(msg, str) or msg not in _UVICORN_PROTOCOL_DROP:
+            return True
+        counted = _UVICORN_PROTOCOL_COUNTED.get(msg)
+        if counted is not None:
+            from gateway.auth import note_quiet
+            note_quiet(*counted)
+        return False
+
+
+def _install_uvicorn_error_filter() -> None:
+    log = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, _UvicornProtocolFilter) for f in log.filters):
+        log.addFilter(_UvicornProtocolFilter())
+
 
 
 def _config(app, host, port, *, cap=None, header_timeout=None):
@@ -39,6 +73,7 @@ async def serve(host: str, port: int, probe: int, cap: int, header_timeout: int)
     mark_launched()
     probe_server = Server(_config(probe_app, host, probe, header_timeout=header_timeout))
     main_server = Server(_config(create_app(), host, port, cap=cap, header_timeout=header_timeout))
+    _install_uvicorn_error_filter()
     applied = main_server.config.limit_concurrency
     LOG.warning("uvicorn limit_concurrency=%d header_timeout_s=%d probe_port=%d workers=1",
                 applied, header_timeout, probe)

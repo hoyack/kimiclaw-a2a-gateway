@@ -358,21 +358,18 @@ def test_quiet_refusals_are_counted_in_requests_total_and_not_exported_as_spans(
     assert "gateway.requests" in metrics
     assert "401" in metrics and "200" in metrics
 
-def test_plain_uvicorn_including_workers_2_is_refused():
-    """W-1: python -m gateway is the only launcher; --workers 2 exits fast with a single refusal line."""
+def _assert_uvicorn_refused(args, extra_env=None):
+    """Every unsupported uvicorn start exits non-zero in a few seconds, with one refusal line and no traceback."""
     from conftest import free_port
     port = free_port()
-    r = subprocess.run(
-        [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port)],
-        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=15)
-    assert r.returncode != 0 and "python -m gateway" in (r.stderr + r.stdout)
-    port = free_port()
+    env = {**ENV, **(extra_env or {})}
     t0 = time.monotonic()
     r = subprocess.run(
-        [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port), "--workers", "2"],
-        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=8)
+        [sys.executable, "-m", "uvicorn", *args, "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, env=env, capture_output=True, text=True, timeout=8)
     elapsed = time.monotonic() - t0
     out = r.stderr + r.stdout
+    assert r.returncode != 0, (r.returncode, out)
     assert elapsed < 6, elapsed
     assert out.count("start with `python -m gateway`") == 1, out
     assert "Traceback" not in out, out
@@ -381,6 +378,41 @@ def test_plain_uvicorn_including_workers_2_is_refused():
     except httpx.HTTPError:
         status = None
     assert status not in (200, 503), status
+    return out
+
+
+@pytest.mark.parametrize("args,extra_env", [
+    (["app:app"], None),
+    (["app:app", "--workers", "2"], None),
+    (["app:app", "--workers=3"], None),
+    (["app:app"], {"WEB_CONCURRENCY": "2"}),
+    (["--factory", "gateway.main:create_app"], None),
+    (["--factory", "gateway.main:create_app", "--workers", "2"], None),
+    (["--factory", "gateway.main:create_app", "--reload"], None),
+    (["--factory", "gateway.main:create_app"], {"WEB_CONCURRENCY": "2"}),
+], ids=[
+    "app:app",
+    "app:app --workers 2",
+    "app:app --workers=3",
+    "WEB_CONCURRENCY=2 app:app",
+    "factory",
+    "factory --workers 2",
+    "factory --reload",
+    "WEB_CONCURRENCY=2 factory",
+])
+def test_plain_uvicorn_including_workers_2_is_refused(args, extra_env):
+    """W-1 / W-1b: python -m gateway is the only launcher; every uvicorn refusal exits non-zero once."""
+    out = _assert_uvicorn_refused(args, extra_env)
+    if "--factory" in args:
+        assert "--factory" in out or "create_app" in out
+
+
+def test_factory_create_app_is_refused():
+    """Critic #2 / W-1b: uvicorn --factory (plain, --workers 2, --reload, WEB_CONCURRENCY=2) is refused."""
+    _assert_uvicorn_refused(["--factory", "gateway.main:create_app"])
+    _assert_uvicorn_refused(["--factory", "gateway.main:create_app", "--workers", "2"])
+    _assert_uvicorn_refused(["--factory", "gateway.main:create_app", "--reload"])
+    _assert_uvicorn_refused(["--factory", "gateway.main:create_app"], {"WEB_CONCURRENCY": "2"})
 
 def test_concurrency_cap_is_taken_from_the_env_only_and_logged_after_it_is_applied(tmp_path):
     """C-1: no --limit-concurrency flag; the env value is logged only after Config has it."""
@@ -517,38 +549,6 @@ def test_idle_connections_on_the_probe_port_are_closed_while_healthz_stays_200(t
         p.terminate(); p.wait(5)
 
 
-def test_factory_create_app_is_refused():
-    """Critic #2 / W-1b: uvicorn --factory gateway.main:create_app (including --workers 2) is refused."""
-    from conftest import free_port
-    port = free_port()
-    r = subprocess.run(
-        [sys.executable, "-m", "uvicorn", "--factory", "gateway.main:create_app",
-         "--host", "127.0.0.1", "--port", str(port)],
-        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=15)
-    out = r.stderr + r.stdout
-    assert r.returncode != 0 and "python -m gateway" in out and "--factory" in out
-    try:
-        status = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=1).status_code
-    except httpx.HTTPError:
-        status = None
-    assert status not in (200, 503), status
-
-    port = free_port()
-    t0 = time.monotonic()
-    r = subprocess.run(
-        [sys.executable, "-m", "uvicorn", "--factory", "gateway.main:create_app",
-         "--host", "127.0.0.1", "--port", str(port), "--workers", "2"],
-        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=8)
-    elapsed = time.monotonic() - t0
-    out = r.stderr + r.stdout
-    assert elapsed < 6, elapsed
-    assert out.count("start with `python -m gateway`") == 1, out
-    assert "Traceback" not in out, out
-    try:
-        status = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=1).status_code
-    except httpx.HTTPError:
-        status = None
-    assert status not in (200, 503), status
 
 
 def test_a_pipelined_request_with_a_slow_body_is_not_closed_by_the_header_timer(tmp_path):
@@ -610,10 +610,18 @@ def test_unverified_options_public_paths_and_404_405_are_aggregated_quietly(tmp_
     finally:
         p.terminate(); p.wait(10)
     text = (tmp_path / "gateway.log").read_text()
-    refused = [ln for ln in text.splitlines() if "auth refused count=" in ln]
-    assert refused, text
+    public = [ln for ln in text.splitlines() if "public count=" in ln]
+    http_refused = [ln for ln in text.splitlines() if "http refused count=" in ln]
+    assert public and http_refused, text
     # a handful of aggregated lines, not one per request
-    assert len(refused) < 40, len(refused)
+    assert len(public) + len(http_refused) < 40, (len(public), len(http_refused))
+    # public 200s and a verified caller's 404/405 are not labelled "auth refused"
+    auth = [ln for ln in text.splitlines() if "auth refused" in ln]
+    assert not any("reasons=public:" in ln or "reasons=not_found:" in ln or "reasons=method_not_allowed:" in ln
+                   or "reasons=ok:" in ln for ln in auth), auth
+    pub_n = sum(int(ln.split("count=", 1)[1].split()[0]) for ln in public)
+    http_n = sum(int(ln.split("count=", 1)[1].split()[0]) for ln in http_refused)
+    assert pub_n >= 1000 and http_n >= 2000, (pub_n, http_n, public, http_refused)
     access = [ln for ln in text.splitlines() if "kimiclaw.access" in ln or "uvicorn.access" in ln]
     assert not any(" OPTIONS " in ln or " /healthz " in ln or " /no-such-route " in ln for ln in access), access
     import json
@@ -703,3 +711,116 @@ def test_message_send_without_openclaw_is_a_generic_503(tmp_path):
                 assert "openclaw" not in ln.lower() and "No such file" not in ln
     finally:
         p.terminate(); p.wait(5)
+
+
+def _raw_requests(port, payload, n=1000, workers=32):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(_):
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+            s.sendall(payload)
+            try:
+                s.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            data = b""
+            try:
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except OSError:
+                pass
+            first = data.split(b"\r\n", 1)[0]
+            try:
+                return int(first.split()[1])
+            except (IndexError, ValueError):
+                return 0
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(one, range(n)))
+
+
+def _assert_few_protocol_lines(chunk, reason, expected):
+    """A-4: raw uvicorn.error templates are gone; at most 5 new lines; counts land in the summary."""
+    raw = (
+        "Invalid HTTP request received.",
+        "Unsupported upgrade request.",
+        "No supported WebSocket library detected.",
+        "Exceeded concurrency limit.",
+    )
+    assert not any(s in chunk for s in raw), chunk
+    lines = [ln for ln in chunk.splitlines() if ln.strip()]
+    assert len(lines) <= 5, (len(lines), lines)
+    refused = [ln for ln in lines if "http refused count=" in ln]
+    assert refused, chunk
+    import re
+    total = 0
+    for ln in refused:
+        m = re.search(rf"\b{reason}:(\d+)", ln)
+        if m:
+            total += int(m.group(1))
+    assert total >= expected, (total, reason, chunk)
+    return lines
+
+
+def test_uvicorn_protocol_warnings_are_aggregated_on_both_ports(tmp_path):
+    """A-4: 1,000 malformed, Upgrade, and cap-full 503s on both listeners produce <=5 log lines per kind.
+
+    The probe has no concurrency cap, so cap-full 503s are generated on the main port only;
+    malformed and Upgrade are sent to both ports. Startup uvicorn.error lines must remain.
+    """
+    p, base, _ = start_gateway(tmp_path, {
+        "GATEWAY_REFUSAL_LOG_S": "3",
+        "KIMICLAW_LIMIT_CONCURRENCY": "64",
+        "GATEWAY_HEADER_TIMEOUT_S": "30",
+    })
+    log = tmp_path / "gateway.log"
+    main_port = int(base.rsplit(":", 1)[1])
+    probe_port = int(p.probe_base.rsplit(":", 1)[1])
+    malformed = b"FOO * BAR\r\n\r\n"
+    upgrade = (
+        b"GET / HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"Connection: upgrade\r\n"
+        b"Upgrade: websocket\r\n"
+        b"\r\n"
+    )
+    try:
+        text = log.read_text()
+        assert "Started server process" in text or "Uvicorn running" in text, text
+        # 1. malformed on both ports
+        mark = len(text)
+        _raw_requests(main_port, malformed, 1000)
+        _raw_requests(probe_port, malformed, 1000)
+        time.sleep(3.3)
+        _assert_few_protocol_lines(log.read_text()[mark:], "malformed", 2000)
+        # 2. Upgrade: header on both ports (uvicorn would otherwise write two lines each)
+        mark = len(log.read_text())
+        _raw_requests(main_port, upgrade, 1000)
+        _raw_requests(probe_port, upgrade, 1000)
+        time.sleep(3.3)
+        _assert_few_protocol_lines(log.read_text()[mark:], "upgrade", 2000)
+        # 3. cap-full 503s on the main port (probe is uncapped by design)
+        held = []
+        try:
+            for _ in range(64):
+                s = socket.create_connection(("127.0.0.1", main_port), timeout=5)
+                s.sendall(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n")
+                held.append(s)
+            mark = len(log.read_text())
+            complete = b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
+            codes = _raw_requests(main_port, complete, 1000)
+            assert codes.count(503) >= 1000, (codes.count(503), set(codes))
+            time.sleep(3.3)
+            _assert_few_protocol_lines(log.read_text()[mark:], "concurrency", 1000)
+        finally:
+            for s in held:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+    finally:
+        p.terminate()
+        p.wait(10)
