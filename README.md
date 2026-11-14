@@ -52,7 +52,7 @@ openapi.yaml               frozen API contract (served spec must match; see test
 
 `message/send` is blocking by default. Through Cloudflare it is capped at ~120 s; for longer turns use
 `?wait=false` (or `params.configuration.blocking=false`) and poll `tasks/get`, or use `message/stream` (SSE, 15 s keepalives).
-A2A `contextId` maps to OpenClaw session `a2a-<ctx>`; reuse it to continue a conversation.
+A2A `contextId` maps to OpenClaw session `a2a-<caller>-<ctx>`; reuse it to continue a conversation.
 
 ### Example
 ```bash
@@ -72,7 +72,11 @@ Every request except `GET /.well-known/agent.json` and `GET /healthz` carries fo
 | `X-KC-Key-Id` | the caller's key_id (10 lowercase hex chars) |
 | `X-KC-Timestamp` | unix time in whole seconds, decimal |
 | `X-KC-Nonce` | 16 to 64 chars of `A-Z a-z 0-9 - _`, new for every request (e.g. 24 random bytes, base64url) |
-| `X-KC-Signature` | lowercase hex HMAC-SHA256 of the canonical string, keyed with the caller's secret (its ASCII bytes) |
+| `X-KC-Signature` | lowercase hex HMAC-SHA256 of the canonical string, keyed with the caller's secret string as ASCII bytes (see below) |
+
+> **Do not base64-decode the secret.** It looks like base64url, but the HMAC key is the secret string itself, as
+> ASCII bytes: `hmac.new(secret.encode(), canonical, sha256)`. Decoding it first gives a different key and every request
+> fails with 401.
 
 The canonical string is six lines joined by `\n` (no trailing newline), in this order:
 
@@ -92,16 +96,24 @@ signs the line `/?wait=false&b=2`, and sending `/?b=2&wait=false` with that sign
 (not sorted) means the order of repeated keys such as `?wait=true&wait=false` is signed too, with no
 duplicate-key rule to get wrong. A proxy in front of the gateway must not rewrite the path, the query or the body.
 
-The gateway checks, in order: all four headers present and well formed, the timestamp is within 300 s of its clock
-(either direction), the body is at most 1 MB (else 413), then the signature, compared in constant time over the bytes
+The gateway checks, in order: each of the four headers present exactly once (a repeated `X-KC-*` header is rejected)
+and well formed, the timestamp is within 300 s of its clock (either direction) and later than the second the process started in,
+then a slot for reading the body (at most 32 bodies are read at once before authentication; over that the request gets
+`503 {"error": "busy"}` with `Retry-After: 1`), the body is at most 1 MB (else 413) and is hashed chunk by chunk (its
+bytes are kept only when the key_id is known, so an unknown key_id costs one chunk of memory), then the signature, compared in constant time over the bytes
 it received, before any JSON parsing. An unknown key_id is checked against a random dummy secret, so it costs the same
 as a wrong signature and gets the same response. Only a request whose signature verifies has its nonce checked and
-recorded. A nonce already used by the same caller within the window is rejected (401). Then every signed request,
-including `GET /`, `/docs` and unknown JSON-RPC methods, pays the caller's general token bucket
-(`GATEWAY_REQUESTS_PER_S`, default 5/s, burst `GATEWAY_REQUESTS_BURST` 10); when it is empty, the caller gets 429 and
-no nonce is kept. Only then is the nonce stored. The per-method limits below apply on top.
+recorded. A nonce already used by the same caller within the window is rejected (401). Next, the caller's nonce quota
+must have room (else 429, with no bucket token spent). Then every signed request, including `GET /`, `/docs` and
+unknown JSON-RPC methods, pays the caller's general token bucket (`GATEWAY_REQUESTS_PER_S`, default 5/s, burst
+`GATEWAY_REQUESTS_BURST` 10); when it is empty the caller gets 429 and no nonce is kept. Only then is the nonce
+stored. The per-method limits below apply on top.
 
-Any rejection is `401 {"error": "unauthorized"}`. The reason (`missing_header`, `malformed_header`, `stale_timestamp`,
+The 32-slot cap bounds memory (peak RSS stays within tens of MB however many 1 MB unauthenticated bodies arrive) at
+the cost of availability under a flood: while slow uploads hold every slot, other callers get 503 and should retry.
+Connection and upload-timeout limits in front of the gateway are the place to blunt that.
+
+Any rejection is `401 {"error": "unauthorized"}`. The reason (`duplicate_header`, `missing_header`, `malformed_header`, `stale_timestamp`, `stale-after-restart`,
 `unknown_key`, `bad_signature`, `replayed_nonce`) goes to the log with the key_id. A header value that isn't shaped like
 a key_id is logged as `malformed`, never verbatim, and the secret and the signature are never logged.
 
@@ -110,8 +122,12 @@ Nonces are kept in process memory per caller, each until its timestamp leaves th
 (5/s × 600 s + 10 ≈ 3,010), so the cap is a backstop. A caller at its cap gets `429 {"error": "rate limited"}` with
 `Retry-After` set to when its oldest nonce expires. Only that caller is affected: other callers keep getting 200 and
 never 401. Memory is bounded by callers × cap. Per-process state is sound because the
-gateway runs one worker. A restart forgets the nonces, but every request is bound to its timestamp, so one captured
-before a restart can only be replayed within its own 300 s. `Authorization: Bearer` keys are no longer accepted.
+gateway runs one worker. A restart forgets the nonces, so the gateway also rejects (401, reason `stale-after-restart`)
+any timestamp from the second it started in or earlier, and holds startup until the next second begins before it
+serves. **The skew allowance is zero:** nothing signed before a restart is accepted after it, even when the restart
+takes under a second, and startup takes up to 1 s longer. The cost: right after a restart, requests signed just before
+it, or by a caller whose clock runs slow, get 401 for as many seconds as the clock lags. Callers should re-sign and
+retry. `Authorization: Bearer` keys are no longer accepted.
 
 ### Caller keys
 
@@ -125,7 +141,7 @@ key_id repeats, if a caller name isn't 1 to 32 of `A-Z a-z 0-9 _`, if a secret i
 if the file is writable by its group or has any permission for others. Mint a key with
 
 ```bash
-python tools/new_api_key.py <caller> >> keys.txt   # stdout: the file line (holds the secret); stderr: the key_id
+(umask 077; python tools/new_api_key.py <caller> >> keys.txt)   # stdout: the file line (holds the secret); stderr: the key_id
 ```
 
 It draws 32 bytes from Python's `secrets` module (the OS CSPRNG). **`tools/new_api_key.py` is the only supported way to

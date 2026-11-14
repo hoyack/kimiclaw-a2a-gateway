@@ -1,4 +1,6 @@
 """App factory."""
+import asyncio
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -6,7 +8,7 @@ from fastapi.openapi.utils import get_openapi
 
 from gateway import telemetry
 from gateway.config import LOG
-from gateway.auth import signed_auth
+from gateway.auth import STARTED_S, signed_auth
 from gateway.models import SCHEMAS, SECURITY_SCHEMES
 from gateway.routes import a2a, health
 
@@ -14,6 +16,7 @@ from gateway.routes import a2a, health
 @asynccontextmanager
 async def lifespan(app):
     LOG.warning("rate limits and task caps are per process; run exactly one replica and one worker")
+    await asyncio.sleep(max(0.0, STARTED_S + 1 - time.time()))  # serve only once requests can be signed after STARTED_S
     yield
     telemetry.shutdown()  # flush spans/metrics on graceful stop
 

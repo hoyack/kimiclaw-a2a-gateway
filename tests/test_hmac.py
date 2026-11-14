@@ -2,13 +2,17 @@
 import hashlib
 import hmac
 import json
+import os
+import threading
 import secrets
+import subprocess
+import sys
 import time
 
 import httpx
 import pytest
 
-from conftest import KEY, OTHER_KEY, SECRETS, Signer, start_gateway
+from conftest import KEY, KEYS_FILE, OTHER_KEY, ROOT, SECRETS, Signer, start_gateway
 from sign_request import canonical, signed_headers
 
 GET = json.dumps({"jsonrpc": "2.0", "id": "1", "method": "tasks/get", "params": {"id": "nope"}}).encode()
@@ -88,7 +92,7 @@ def test_missing_any_header_is_401(gw, header):
 
 
 def test_timestamp_inside_the_window_is_accepted(gw):
-    for skew in (-290, 290):
+    for skew in (0, 290):
         assert send(gw[0], skew=skew)[0] == 200
 
 
@@ -222,5 +226,110 @@ def test_every_signed_request_pays_the_callers_general_bucket_before_its_nonce_i
         assert httpx.post(base + "/", content=unknown, auth=KEY).status_code == 429
         assert httpx.get(base + "/", headers=h).status_code == 401
         assert httpx.get(base + "/", auth=OTHER_KEY).status_code == 200
+    finally:
+        p.terminate(); p.wait(5)
+
+
+def test_a_request_and_nonce_captured_before_a_restart_are_rejected_after_it(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {})
+    h = {**signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", GET), "Content-Type": "application/json"}
+    assert httpx.post(base + "/", content=GET, headers=h).status_code == 200
+    assert httpx.post(base + "/", content=GET, headers=h).status_code == 401
+    p.terminate(); p.wait(5)
+    p, base, _ = start_gateway(tmp_path, {})
+    try:
+        r = httpx.post(base + "/", content=GET, headers=h)
+        assert (r.status_code, r.json()) == UNAUTHORIZED
+        assert httpx.post(base + "/", content=GET, auth=KEY).status_code == 200
+        time.sleep(0.1)
+        assert "unauthorized reason=stale-after-restart key_id=testkey01" in (tmp_path / "gateway.log").read_text()
+    finally:
+        p.terminate(); p.wait(5)
+
+
+@pytest.mark.parametrize("header", ["X-KC-Key-Id", "X-KC-Timestamp", "X-KC-Nonce", "X-KC-Signature"])
+def test_a_repeated_signing_header_is_401(gw, header):
+    base, log = gw
+    h = signed_headers(KEY.key_id, KEY.secret, "POST", b"/", b"", GET)
+    pairs = list(h.items()) + [(header, h[header]), ("Content-Type", "application/json")]
+    r = httpx.post(base + "/", content=GET, headers=pairs)
+    assert (r.status_code, r.json()) == UNAUTHORIZED
+    time.sleep(0.1)
+    assert "unauthorized reason=duplicate_header key_id=testkey01" in log.read_text()
+
+
+def test_a_429_from_the_nonce_quota_does_not_spend_a_bucket_token():
+    prog = f"""
+import sys
+sys.path.insert(0, "tools")
+from fastapi.testclient import TestClient
+from sign_request import Signer
+from gateway import auth
+from gateway.main import app
+key = Signer("testkey01", {KEY.secret!r})
+with TestClient(app, base_url="http://127.0.0.1") as c:
+    codes = [c.get("/", auth=key).status_code for _ in range(2)]
+    auth._nonces.clear()
+    codes.append(c.get("/", auth=key).status_code)
+print(codes)
+"""
+    env = {**{k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_", "WEB_"))},
+           "GATEWAY_SIGNING_KEYS_FILE": KEYS_FILE, "GATEWAY_MAX_NONCES_PER_CALLER": "1",
+           "GATEWAY_REQUESTS_PER_S": "0.0001", "GATEWAY_REQUESTS_BURST": "2"}
+    r = subprocess.run([sys.executable, "-c", prog], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert r.stdout.split("\n")[-2] == "[200, 429, 200]"
+
+
+def vm(pid, field):
+    return int(next(l for l in open(f"/proc/{pid}/status") if l.startswith(field)).split()[1]) // 1024
+
+
+def flood(base, n, body, trickle=False):
+    h = {**signed_headers("zzzzzzzzzz", KEY.secret, "POST", b"/", b"", body), "Content-Type": "application/json"}
+    def content():
+        for i in range(0, len(body), 100_000):
+            yield body[i:i + 100_000]; time.sleep(0.2)
+    codes, lock = [], threading.Lock()
+    def one():
+        try:
+            s = httpx.post(base + "/", content=content() if trickle else body, headers=h, timeout=60).status_code
+        except httpx.HTTPError as e:
+            s = type(e).__name__
+        with lock:
+            codes.append(s)
+    threads = [threading.Thread(target=one) for _ in range(n)]
+    [t.start() for t in threads]
+    return threads, codes
+
+
+def test_concurrent_1mb_bodies_with_unknown_keys_keep_memory_bounded(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {})
+    try:
+        body = b'{"pad":"' + b"p" * 999_000 + b'"}'
+        before = vm(p.pid, "VmRSS")
+        threads, codes = flood(base, 300, body, trickle=True)
+        time.sleep(1)
+        assert httpx.post(base + "/", content=GET, auth=OTHER_KEY).status_code in (200, 503)
+        [t.join() for t in threads]
+        peak = vm(p.pid, "VmHWM")
+        assert set(codes) <= {401, 503} and 401 in codes and 503 in codes, set(codes)
+        assert peak - before < 60, f"RSS {before} -> peak {peak} MB"
+        assert httpx.post(base + "/", content=GET, auth=OTHER_KEY).status_code == 200
+    finally:
+        p.terminate(); p.wait(5)
+
+
+def test_preauth_read_cap_is_503_with_retry_after(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {})
+    try:
+        threads, codes = flood(base, 40, b"x" * 500_000, trickle=True)
+        time.sleep(0.5)
+        r = httpx.post(base + "/", content=GET, auth=OTHER_KEY)
+        assert (r.status_code, r.json(), r.headers["retry-after"]) == (503, {"error": "busy"}, "1")
+        [t.join() for t in threads]
+        assert codes.count(401) == 32 and codes.count(503) == 8, codes
+        assert httpx.post(base + "/", content=GET, auth=OTHER_KEY).status_code == 200
+        assert "busy pre-auth body reads=32 key_id=testkey02" in (tmp_path / "gateway.log").read_text()
     finally:
         p.terminate(); p.wait(5)

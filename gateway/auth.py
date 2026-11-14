@@ -20,6 +20,9 @@ TIMESTAMP_RE = re.compile(r"[0-9]{1,12}")
 NONCE_RE = re.compile(r"[A-Za-z0-9_-]{16,64}")
 SIGNATURE_RE = re.compile(r"[0-9a-f]{64}")
 DUMMY_SECRET = secrets.token_bytes(32)  # unknown key_ids pay for the same HMAC + compare as a wrong signature
+STARTED_S = int(time.time())  # nonces don't survive a restart, so nothing signed in or before this second is accepted
+MAX_PREAUTH_READS = 32
+_reading = 0
 
 # rpc method -> (tokens per second, bucket size)
 LIMITS = {
@@ -33,10 +36,9 @@ _buckets: dict[tuple[str, str], tuple[float, float]] = {}
 _nonces: dict[str, tuple[set[str], list[tuple[int, str]]]] = {}  # caller -> (nonces, heap of (expiry, nonce))
 
 
-def canonical(method: str, raw_path: bytes, query: bytes, timestamp: str, nonce: str, body: bytes, key_id: str) -> bytes:
+def canonical(method: str, raw_path: bytes, query: bytes, timestamp: str, nonce: str, body_sha256: str, key_id: str) -> bytes:
     target = raw_path + (b"?" + query if query else b"")
-    return b"\n".join([method.encode(), target, timestamp.encode(), nonce.encode(),
-                       hashlib.sha256(body).hexdigest().encode(), key_id.encode()])
+    return b"\n".join([method.encode(), target, timestamp.encode(), nonce.encode(), body_sha256.encode(), key_id.encode()])
 
 
 def live_nonces(caller: str) -> tuple[set[str], list[tuple[int, str]]]:
@@ -55,17 +57,21 @@ def nonce_quota_wait(seen: set[str], expiry: list[tuple[int, str]]) -> int:
     return max(1, math.ceil(expiry[0][0] - time.time()))
 
 
-async def read_body(request: Request) -> bytes | None:
-    """The request body, or None if Content-Length or the bytes read pass MAX_BODY."""
+async def hash_body(request: Request, keep: bool) -> tuple[str, bytearray] | None:
+    """(sha256 hex, body) hashed chunk by chunk; the bytes are kept only if keep, so an unknown key_id costs one chunk
+    of memory. None if Content-Length or the bytes read pass MAX_BODY."""
     length = request.headers.get("content-length", "")
     if length.isdigit() and int(length) > MAX_BODY:
         return None
-    body = b""
+    digest, body, size = hashlib.sha256(), bytearray(), 0
     async for chunk in request.stream():
-        body += chunk
-        if len(body) > MAX_BODY:
+        size += len(chunk)
+        if size > MAX_BODY:
             return None
-    return body
+        digest.update(chunk)
+        if keep:
+            body += chunk
+    return digest.hexdigest(), body
 
 
 def retry_after(caller: str, method: str) -> int:
@@ -103,7 +109,10 @@ def unauthorized(request: Request, key_id: str, reason: str) -> JSONResponse:
 async def signed_auth(request: Request, call_next):
     if request.method == "OPTIONS" or request.url.path in PUBLIC_PATHS:
         return await call_next(request)
-    key_id, timestamp, nonce, signature = (request.headers.get(h, "") for h in HEADERS)
+    values = [request.headers.getlist(h) for h in HEADERS]
+    key_id, timestamp, nonce, signature = (v[0] if v else "" for v in values)
+    if any(len(v) > 1 for v in values):
+        return unauthorized(request, key_id, "duplicate_header")
     if not (key_id and timestamp and nonce and signature):
         return unauthorized(request, key_id, "missing_header")
     if not (KEY_ID_RE.fullmatch(key_id) and TIMESTAMP_RE.fullmatch(timestamp) and NONCE_RE.fullmatch(nonce)
@@ -111,13 +120,25 @@ async def signed_auth(request: Request, call_next):
         return unauthorized(request, key_id, "malformed_header")
     if abs(time.time() - int(timestamp)) > SIGNATURE_SKEW_S:
         return unauthorized(request, key_id, "stale_timestamp")
-    body = await read_body(request)
-    if body is None:
+    if int(timestamp) <= STARTED_S:
+        return unauthorized(request, key_id, "stale-after-restart")
+    caller, secret = SIGNING_KEYS.get(key_id, (None, DUMMY_SECRET))
+    global _reading
+    if _reading >= MAX_PREAUTH_READS:
+        LOG.warning("busy pre-auth body reads=%d key_id=%s", _reading, key_id)
+        request.state.key_id = f"unverified:{key_id}"
+        return JSONResponse({"error": "busy"}, status_code=503, headers={"Retry-After": "1"})
+    _reading += 1
+    try:
+        hashed = await hash_body(request, keep=caller is not None)
+    finally:
+        _reading -= 1
+    if hashed is None:
         request.state.key_id = f"unverified:{key_id}"
         return JSONResponse({"error": "request body too large"}, status_code=413)
-    caller, secret = SIGNING_KEYS.get(key_id, (None, DUMMY_SECRET))
-    message = canonical(request.method, request.scope["raw_path"], request.scope["query_string"], timestamp, nonce, body,
-                        key_id)
+    body_sha256, body = hashed
+    message = canonical(request.method, request.scope["raw_path"], request.scope["query_string"], timestamp, nonce,
+                        body_sha256, key_id)
     matches = hmac.compare_digest(hmac.new(secret, message, hashlib.sha256).hexdigest(), signature)
     if caller is None:
         return unauthorized(request, key_id, "unknown_key")
@@ -126,7 +147,7 @@ async def signed_auth(request: Request, call_next):
     seen, expiry = live_nonces(caller)
     if nonce in seen:
         return unauthorized(request, key_id, "replayed_nonce")
-    wait = take((caller, ""), REQUESTS_PER_S, REQUESTS_BURST) or nonce_quota_wait(seen, expiry)
+    wait = nonce_quota_wait(seen, expiry) or take((caller, ""), REQUESTS_PER_S, REQUESTS_BURST)
     if wait:
         LOG.warning("rate limited key_id=%s caller=%s live_nonces=%d retry_after=%d", key_id, caller, len(seen), wait)
         request.state.key_id = key_id
