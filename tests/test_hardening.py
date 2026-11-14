@@ -68,6 +68,7 @@ asyncio.run(main())
 @pytest.mark.parametrize("env,needle", [
     ({"WEB_CONCURRENCY": "2"}, "WEB_CONCURRENCY must be 1"),
     ({"GATEWAY_MAX_INFLIGHT_PER_KEY": "3"}, "GATEWAY_MAX_INFLIGHT_PER_KEY must be below 3"),
+    ({"GATEWAY_MAX_INFLIGHT_PER_KEY": "abc"}, "GATEWAY_MAX_INFLIGHT_PER_KEY must be an integer"),
 ])
 def test_refuses_to_start_when_limits_could_be_bypassed(env, needle):
     r = py("import gateway.config", **env)
@@ -367,45 +368,86 @@ def test_quiet_refusals_are_counted_in_requests_total_and_not_exported_as_spans(
     assert "gateway.requests" in metrics
     assert "401" in metrics and "200" in metrics
 
-def _assert_uvicorn_refused(args, extra_env=None):
-    """Unsupported uvicorn starts exit non-zero in a few seconds, with a refusal line and no signed 200."""
+def _venv_script(name):
+    return os.path.join(os.path.dirname(sys.executable), name)
+
+
+def _try_install(*mods):
+    missing = [m for m in mods if __import__("importlib").util.find_spec(m) is None]
+    if not missing:
+        return True
+    r = subprocess.run([sys.executable, "-m", "pip", "install", *missing],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        return False
+    import importlib
+    return all(importlib.util.find_spec(m) is not None for m in mods)
+
+
+def _assert_launch_refused(kind, argv, extra_env=None):
+    """Unsupported server starts exit non-zero in a few seconds, never serve a signed 200, and do not flood."""
     from conftest import free_port
     port = free_port()
+    if kind == "uvicorn":
+        cmd = [sys.executable, "-m", "uvicorn", *argv, "--host", "127.0.0.1", "--port", str(port)]
+    elif kind == "console":
+        cmd = [_venv_script("uvicorn"), *argv, "--host", "127.0.0.1", "--port", str(port)]
+    elif kind == "gunicorn":
+        cmd = [_venv_script("gunicorn"), *argv, "-b", f"127.0.0.1:{port}"]
+    elif kind == "hypercorn":
+        cmd = [_venv_script("hypercorn"), *argv, "-b", f"127.0.0.1:{port}"]
+    else:
+        raise ValueError(kind)
     env = {**ENV, **(extra_env or {})}
     t0 = time.monotonic()
-    r = subprocess.run(
-        [sys.executable, "-m", "uvicorn", *args, "--host", "127.0.0.1", "--port", str(port)],
-        cwd=ROOT, env=env, capture_output=True, text=True, timeout=8)
+    proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    served = False
+    try:
+        deadline = t0 + 8
+        while proc.poll() is None and time.monotonic() < deadline:
+            try:
+                if httpx.get(f"http://127.0.0.1:{port}/", auth=KEY, timeout=0.2).status_code == 200:
+                    served = True
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.05)
+        if proc.poll() is None:
+            proc.kill()
+        stdout, stderr = proc.communicate(timeout=3)
+    except Exception:
+        proc.kill()
+        raise
     elapsed = time.monotonic() - t0
-    out = r.stderr + r.stdout
-    assert r.returncode != 0, (r.returncode, out)
+    out = (stderr or "") + (stdout or "")
+    assert not served, out
+    assert proc.returncode not in (0, None), (proc.returncode, out)
     assert elapsed < 6, elapsed
     n = out.count("start with `python -m gateway`")
     assert 1 <= n <= 8, out  # one line, or a handful of workers; never a flood
     assert "Traceback" not in out, out
-    try:
-        status = httpx.get(f"http://127.0.0.1:{port}/", auth=KEY, timeout=1).status_code
-    except httpx.HTTPError:
-        status = None
-    assert status != 200, status
     return out
 
 
-@pytest.mark.parametrize("args,extra_env", [
-    (["app:app"], None),
-    (["app:app", "--workers", "2"], None),
-    (["app:app", "--workers=3"], None),
-    (["app:app"], {"WEB_CONCURRENCY": "2"}),
-    (["app:app"], {"UVICORN_WORKERS": "2"}),
-    (["app:app"], {"UVICORN_RELOAD": "true"}),
-    (["app:app", "--reload"], None),
-    (["--factory", "gateway.main:create_app"], None),
-    (["--factory", "gateway.main:create_app", "--workers", "2"], None),
-    (["gateway.main:create_app"], {"UVICORN_FACTORY": "true", "WEB_CONCURRENCY": "2"}),
-    (["app:app", "--workers", "2"], None),  # python -m uvicorn app:app --workers 2 (same helper)
-    (["app:app", "--workers", "1"], {"WEB_CONCURRENCY": "2"}),
-    (["app:app", "--reload-delay", "1"], None),
-    (["app:app", "--reload-dir", "."], None),
+@pytest.mark.parametrize("kind,argv,extra_env", [
+    ("uvicorn", ["app:app"], None),
+    ("uvicorn", ["app:app", "--workers", "2"], None),
+    ("uvicorn", ["app:app", "--workers=3"], None),
+    ("uvicorn", ["app:app"], {"WEB_CONCURRENCY": "2"}),
+    ("uvicorn", ["app:app"], {"UVICORN_WORKERS": "2"}),
+    ("uvicorn", ["app:app"], {"UVICORN_RELOAD": "true"}),
+    ("uvicorn", ["app:app", "--reload"], None),
+    ("uvicorn", ["--factory", "gateway.main:create_app"], None),
+    ("uvicorn", ["--factory", "gateway.main:create_app", "--workers", "2"], None),
+    ("uvicorn", ["gateway.main:create_app"], {"UVICORN_FACTORY": "true", "WEB_CONCURRENCY": "2"}),
+    ("console", ["app:app", "--workers", "2"], None),
+    ("uvicorn", ["app:app", "--workers", "1"], {"WEB_CONCURRENCY": "2"}),
+    ("uvicorn", ["app:app", "--reload-delay", "1"], None),
+    ("uvicorn", ["app:app", "--reload-dir", "."], None),
+    ("uvicorn", ["--factory", "gateway.__main__:create_app"], None),
+    ("uvicorn", ["--factory", "gateway.__main__:create_app", "--workers", "2"], None),
+    ("gunicorn", ["-k", "uvicorn.workers.UvicornWorker", "gateway.__main__:create_app()"], None),
+    ("hypercorn", ["gateway.__main__:create_app()"], None),
 ], ids=[
     "app:app",
     "app:app --workers 2",
@@ -417,14 +459,26 @@ def _assert_uvicorn_refused(args, extra_env=None):
     "factory",
     "factory --workers 2",
     "UVICORN_FACTORY=true WEB_CONCURRENCY=2",
-    "python -m uvicorn app:app --workers 2",
+    "console-script uvicorn --workers 2",
     "WEB_CONCURRENCY=2 --workers 1",
     "--reload-delay 1 without --reload",
     "--reload-dir without --reload",
+    "gateway.__main__:create_app --factory",
+    "gateway.__main__:create_app --factory --workers 2",
+    "gunicorn UvicornWorker gateway.__main__:create_app()",
+    "hypercorn gateway.__main__:create_app()",
 ])
-def test_unsupported_uvicorn_launches_are_refused(args, extra_env):
+def test_unsupported_uvicorn_launches_are_refused(kind, argv, extra_env):
     """Every non-launcher start is refused: one sentinel, no argv/env case list in the guard."""
-    _assert_uvicorn_refused(args, extra_env)
+    if kind in ("gunicorn", "hypercorn"):
+        if not _try_install(kind):
+            pytest.skip(f"{kind} is not installed")
+        exe = _venv_script(kind)
+        if not os.path.exists(exe):
+            pytest.skip(f"{kind} console script is not installed")
+    if kind == "console" and not os.path.exists(_venv_script("uvicorn")):
+        pytest.skip("uvicorn console script is not installed")
+    _assert_launch_refused(kind, argv, extra_env)
 
 
 def test_import_app_under_bash_does_not_signal_the_shell():
@@ -469,10 +523,33 @@ def test_uvicorn_under_a_python_wrapper_does_not_kill_the_wrapper():
     _assert_wrapper_survives([sys.executable, "-c", script])
 
 
+def test_wrap_py_spawn_uvicorn_parent_survives(tmp_path):
+    """python wrap.py spawn uvicorn must not get SIGALRM just because argv contains 'uvicorn'."""
+    wrap = tmp_path / "wrap.py"
+    wrap.write_text(
+        "import multiprocessing, os, sys\n"
+        "sys.path.insert(0, os.getcwd())\n"
+        "def child():\n"
+        "    import app\n"
+        "if __name__ == '__main__':\n"
+        "    p = multiprocessing.get_context('spawn').Process(target=child)\n"
+        "    p.start()\n"
+        "    p.join()\n"
+        "    print('X')\n"
+    )
+    _assert_wrapper_survives([sys.executable, str(wrap), "spawn", "uvicorn"])
+
+
 def test_official_launcher_rejects_web_concurrency_without_traceback():
     r = _run_official({**ENV, "WEB_CONCURRENCY": "2"})
     out = r.stderr + r.stdout
     assert r.returncode != 0 and "WEB_CONCURRENCY must be 1" in out and "Traceback" not in out, out
+
+
+def test_official_launcher_rejects_bad_inflight_without_traceback():
+    r = _run_official({**ENV, "GATEWAY_MAX_INFLIGHT_PER_KEY": "abc"})
+    out = r.stderr + r.stdout
+    assert r.returncode != 0 and "GATEWAY_MAX_INFLIGHT_PER_KEY must be an integer" in out and "Traceback" not in out, out
 
 
 def test_official_launcher_still_serves(tmp_path):

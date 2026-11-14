@@ -4,6 +4,11 @@ import shutil
 
 import h11
 
+# Set when _send swallows an already-sent failure; the uvicorn.error filter
+# reads and clears it so the follow-on "returned without completing" line is
+# dropped only for the probe, not for a real bug on the main port.
+_drop_incomplete = False
+
 from gateway.routes import health as health_state
 
 _JSON = [(b"content-type", b"application/json")]
@@ -29,7 +34,18 @@ async def _send(send, status: int, body: dict):
         if not _already_sent(exc):
             raise
         from gateway.auth import note_quiet
+        global _drop_incomplete
+        _drop_incomplete = True
         note_quiet("http", "malformed")
+
+
+def take_incomplete_drop() -> bool:
+    """True once after probe._send swallowed an already-sent failure."""
+    global _drop_incomplete
+    if not _drop_incomplete:
+        return False
+    _drop_incomplete = False
+    return True
 
 
 async def probe_app(scope, receive, send):

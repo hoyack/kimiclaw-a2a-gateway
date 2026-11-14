@@ -115,7 +115,10 @@ CREATE_BURST = int(os.environ.get("GATEWAY_CREATE_BURST", "5"))
 GET_PER_S = float(os.environ.get("GATEWAY_GET_PER_S", "2"))
 CANCEL_PER_S = float(os.environ.get("GATEWAY_CANCEL_PER_S", "1"))
 MAX_BODY = 1_000_000
-MAX_INFLIGHT_PER_KEY = int(os.environ.get("GATEWAY_MAX_INFLIGHT_PER_KEY", "2"))
+try:
+    MAX_INFLIGHT_PER_KEY = int(os.environ.get("GATEWAY_MAX_INFLIGHT_PER_KEY", "2"))
+except (TypeError, ValueError):
+    raise RuntimeError("GATEWAY_MAX_INFLIGHT_PER_KEY must be an integer") from None
 MAX_PENDING = int(os.environ.get("GATEWAY_MAX_PENDING", "50"))
 MAX_TASKS_PER_KEY = int(os.environ.get("GATEWAY_MAX_TASKS_PER_KEY", "100"))
 PUBLIC_URL = os.environ.get("GATEWAY_PUBLIC_URL", "").strip() or "https://kimiclaw.hoyack.ai/"

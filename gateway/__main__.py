@@ -6,26 +6,17 @@ import signal
 import sys
 import time
 
-from gateway.launcher_guard import mark_launched
-
-mark_launched()
+from gateway.launcher_guard import FACTORY_REFUSAL, mark_launched, refuse_launcher
 
 
 def _exit_with(exc: BaseException) -> None:
     sys.stderr.write(f"{exc}\n")
-    raise SystemExit(2) from None
+    raise SystemExit(3) from None
 
 
-try:
-    from uvicorn import Config, Server
-
-    from gateway.config import LOG
-    from gateway.http_protocol import HeaderTimeoutProtocol
-    from gateway.main import create_app, header_timeout_s, limit_concurrency, probe_port
-    from gateway.probe import probe_app
-    from gateway.routes.health import require_openclaw, set_main_serving
-except RuntimeError as exc:
-    _exit_with(exc)
+def create_app(*_a, **_k):
+    """Not the real factory. Importing this module does not mark the process launched."""
+    refuse_launcher(FACTORY_REFUSAL)
 
 
 # Exact uvicorn.error templates from uvicorn/protocols/http/h11_impl.py (no user data).
@@ -36,10 +27,12 @@ _UVICORN_PROTOCOL_COUNTED = {
 }
 _UVICORN_PROTOCOL_DROP = frozenset({
     *_UVICORN_PROTOCOL_COUNTED,
-    # Follow-on after uvicorn already sent a 400 and probe._send swallowed the failed send.
+    'No supported WebSocket library detected. Please use "pip install \'uvicorn[standard]\'", or install \'websockets\' or \'wsproto\' manually.',
+})
+# Probe-only follow-on after uvicorn already sent a 400 and probe._send swallowed the failed send.
+_PROBE_INCOMPLETE_DROP = frozenset({
     "ASGI callable returned without completing response.",
     "ASGI callable returned without starting response.",
-    'No supported WebSocket library detected. Please use "pip install \'uvicorn[standard]\'", or install \'websockets\' or \'wsproto\' manually.',
 })
 
 
@@ -48,7 +41,12 @@ class _UvicornProtocolFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         msg = record.msg
-        if not isinstance(msg, str) or msg not in _UVICORN_PROTOCOL_DROP:
+        if not isinstance(msg, str):
+            return True
+        if msg in _PROBE_INCOMPLETE_DROP:
+            from gateway.probe import take_incomplete_drop
+            return not take_incomplete_drop()  # main port: leave this as a real bug signal
+        if msg not in _UVICORN_PROTOCOL_DROP:
             return True
         counted = _UVICORN_PROTOCOL_COUNTED.get(msg)
         if counted is not None:
@@ -63,9 +61,10 @@ def _install_uvicorn_error_filter() -> None:
         log.addFilter(_UvicornProtocolFilter())
 
 
-
 def _config(app, host, port, *, cap=None, header_timeout=None):
+    from uvicorn import Config
     import gateway.http_protocol as http_protocol
+    from gateway.http_protocol import HeaderTimeoutProtocol
     if header_timeout is not None:
         http_protocol.HEADER_TIMEOUT_S = header_timeout
     kwargs = dict(app=app, host=host, port=port, access_log=False, http=HeaderTimeoutProtocol, ws="none", workers=1)
@@ -85,8 +84,14 @@ async def _wait_until(predicate, timeout=30, interval=0.02):
 
 async def serve(host: str, port: int, probe: int, cap: int, header_timeout: int):
     """Start the probe listener immediately, then the main app (whose lifespan holds ~31s)."""
+    from uvicorn import Server
+
+    from gateway.config import LOG
+    from gateway.main import create_app
+    from gateway.probe import probe_app
+    from gateway.routes.health import require_openclaw, set_main_serving
+
     set_main_serving(False)
-    mark_launched()
     probe_server = Server(_config(probe_app, host, probe, header_timeout=header_timeout))
     main_server = Server(_config(create_app(), host, port, cap=cap, header_timeout=header_timeout))
     _install_uvicorn_error_filter()
@@ -140,7 +145,12 @@ def main(argv=None):
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args(argv)
+    # Set only here, after parse, before importing gateway.main (its import-time
+    # sentinel check would otherwise refuse the official launcher). Importing this
+    # module never marks the process launched.
+    mark_launched()
     try:
+        from gateway.main import header_timeout_s, limit_concurrency, probe_port
         cap = limit_concurrency()
         timeout = header_timeout_s()
         probe = probe_port()
