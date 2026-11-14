@@ -132,6 +132,7 @@ def test_startup_warns_limits_are_single_replica(caplog):
     import asyncio
     import logging
 
+    os.environ["GATEWAY_PUBLIC_KEYS_FILE"] = KEYS_FILE
     from gateway.main import lifespan
 
     async def run():

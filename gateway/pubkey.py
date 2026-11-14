@@ -20,23 +20,6 @@ L = 2**252 + 27742317777372353535851937790883648493
 _K = (2 * D) % P
 
 
-def _le(n: int) -> bytes:
-    return n.to_bytes(32, "little")
-
-
-# libsodium ge25519_has_small_order: identity, y=0, y=-1, the two order-8 points, and the
-# non-canonical encodings of 0 and 1 (y = p, y = p+1). Compared with the sign bit cleared.
-SMALL_ORDER = frozenset({
-    _le(0),
-    _le(1),
-    bytes.fromhex("26e8958fc2b227b045c3f524ba5eec544d6ecdca7a87654ddc5b701cadb84c59"),
-    bytes.fromhex("c7176a703d4dda708e3d9a29fb4c1adb021ecd0b755554001400000000000000"),
-    _le(P - 1),
-    _le(P),
-    _le(P + 1),
-})
-
-
 def _add(p, q):
     """Extended twisted-Edwards addition, a = -1 (Hisil, Wong, Carter, Dawson)."""
     x1, y1, z1, t1 = p
@@ -61,13 +44,11 @@ def _mul(pt, n):
 
 
 def _decode_point(raw: bytes):
-    """RFC 8032 §5.1.3 decode, or None if non-canonical, off-curve, or small-order listed."""
+    """RFC 8032 §5.1.3 decode, or None if non-canonical or off-curve. Small-order is refused by [8]P / [L]P."""
     if len(raw) != 32:
         return None
     y = int.from_bytes(raw, "little") & ((1 << 255) - 1)
     if y >= P:
-        return None
-    if (raw[:31] + bytes([raw[31] & 0x7F])) in SMALL_ORDER:
         return None
     x_0 = raw[31] >> 7
     u = (y * y - 1) % P

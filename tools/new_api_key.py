@@ -12,7 +12,6 @@ stdout is the public line to append to GATEWAY_PUBLIC_KEYS_FILE (which must star
 Operator-generated (the operator sees the private key; use only when the caller cannot mint):
 
     python tools/new_api_key.py --caller NAME --mint
-    python tools/new_api_key.py NAME
 """
 import argparse
 import base64
@@ -47,7 +46,7 @@ ap.add_argument("--public-key-file", help="file holding the caller's public key 
 ap.add_argument("--public-key", help="the caller's public key, unpadded base64url")
 ap.add_argument("--mint", action="store_true",
                 help="operator generates the keypair (prints the private key; prefer caller-generated)")
-ap.add_argument("caller_pos", nargs="?", help="same as --caller; with no --public-key* this implies --mint")
+ap.add_argument("caller_pos", nargs="?", help="same as --caller; does not imply --mint")
 # a public key is unpadded base64url and may start with '-', which argparse would take as a flag
 argv, i, out = sys.argv[1:], 0, []
 while i < len(argv):
@@ -64,7 +63,7 @@ if a.public_key and a.public_key_file:
 if (a.public_key or a.public_key_file) and a.mint:
     sys.exit("--mint cannot be combined with --public-key or --public-key-file")
 register = a.public_key or a.public_key_file
-if not register and not a.mint and a.caller and not a.caller_pos:
+if not register and not a.mint:
     sys.exit("caller-generated is the default: pass --public-key-file or --public-key "
              "(the caller runs tools/new_keypair.py). To have the operator mint, pass --mint.")
 if a.public_key_file:

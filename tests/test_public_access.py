@@ -152,7 +152,7 @@ def test_removing_a_keys_line_revokes_it(start, tmp_path):
 
 
 def test_new_api_key_tool_mints_a_working_keypair_and_shows_the_private_key_once(start, tmp_path):
-    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "new_api_key.py"), "acme"],
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "new_api_key.py"), "--caller", "acme", "--mint"],
                        capture_output=True, text=True, check=True)
     lines = r.stdout.splitlines()
     assert lines[0].startswith("# WARNING: the next line is the PRIVATE key for acme")
@@ -353,7 +353,10 @@ def _torsion_points():
     x = _sqrt(u)
     y = (_I * x) % _P
     gen = (x, y, 1, x * y % _P)
-    return [_ext_mul(gen, i) for i in range(8)]
+    points = [_ext_mul(gen, i) for i in range(8)]
+    encodings = [_encode_point(pt) for pt in points]
+    assert len(set(encodings)) == 8, "torsion vectors must be 8 distinct points"
+    return points
 
 
 def _honest_point():
@@ -413,36 +416,25 @@ def test_a_weak_ed25519_public_key_is_refused_at_load(tmp_path, label, raw):
     _refuse_at_load_and_tool(tmp_path, raw)
 
 
-def test_a_forged_request_under_each_weak_key_class_is_refused_because_the_key_never_loads(start, tmp_path):
-    """OpenSSL would accept some of these (the identity verifies any message). They must never be served."""
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    identity = _encode_point(_torsion_points()[0])
-    openssl = Ed25519PublicKey.from_public_bytes(identity)
-    try:
-        openssl.verify(b"\x00" * 64, b"any message")  # some OpenSSL builds accept the identity
-    except Exception:
-        pass  # newer OpenSSL may already reject it; the loader must still refuse
 
+
+def test_an_honest_plus_torsion_key_is_refused_at_startup_and_gets_401_on_a_good_gateway(start, tmp_path):
+    """E-1b: a public key that is an honest point plus a torsion point never loads; a request signed by the honest key is 401 on a good-keys gateway."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    private = Ed25519PrivateKey.generate()
+    priv_b64 = _b64(private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                          serialization.NoEncryption()))
+    pub_raw = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    honest = _decode_oncurve(pub_raw)
+    mixed = _encode_point(_ext_add(honest, _torsion_points()[1]))
+    encoded = _b64(mixed)
+    r = boot(tmp_path, HEADER + f"cccccccccc mallory {encoded}\n")
+    assert r.returncode != 0 and "GATEWAY_PUBLIC_KEYS_FILE line 2:" in r.stderr
+    assert encoded[:16] not in r.stderr
     base = start()
-    # one of each class, plus every mixed key, is enough for the request-path check
-    # (load/tool refusal is covered for every vector by test_a_weak_ed25519_public_key_is_refused_at_load)
-    picked, classes = set(), []
-    for label, raw in WEAK_CASES:
-        kind = "mixed" if label.startswith("mixed-") else label.split("-")[0]
-        if kind == "mixed" or kind not in picked:
-            classes.append((label, raw))
-            picked.add(kind)
-    kinds = {"mixed" if k.startswith("mixed-") else k.split("-")[0] for k, _ in classes}
-    assert {"identity", "torsion", "off"} <= kinds
-    assert any(k.startswith("mixed-") for k, _ in classes)
-    for label, raw in classes:
-        _refuse_at_load_and_tool(tmp_path, raw)
-        h = {"X-KC-Key-Id": "aaaaaaaaaa", "X-KC-Timestamp": str(int(time.time())),
-             "X-KC-Nonce": "n" * 24, "X-KC-Content-SHA256": "0" * 64,
-             "X-KC-Signature": "0" * 128, "Content-Type": "application/json"}
-        r = httpx.post(base + "/", content=b"{}", headers=h)
-        assert r.status_code == 401 and r.json() == {"error": "unauthorized"}, label
-        assert _b64(raw) not in r.text
+    signed = post(base, GET, Signer("cccccccccc", priv_b64))
+    assert signed.status_code == 401 and signed.json() == {"error": "unauthorized"}
 
 
 @pytest.mark.parametrize("key_id", [
@@ -453,6 +445,17 @@ def test_the_loader_accepts_only_the_10_lowercase_hex_key_id_the_tool_mints(tmp_
     r = boot(tmp_path, HEADER + f"{key_id} alice {S1}\n")
     assert r.returncode != 0 and "GATEWAY_PUBLIC_KEYS_FILE line 2:" in r.stderr
     assert key_id not in r.stderr and S1[:8] not in r.stderr and "alice" not in r.stderr
+
+
+def test_new_api_key_positional_name_without_mint_does_not_print_a_private_key():
+    r = subprocess.run([sys.executable, os.path.join(ROOT, "tools", "new_api_key.py"), "acme"],
+                       capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "pass --mint" in (r.stderr + r.stdout)
+    combined = r.stdout + r.stderr
+    assert "PRIVATE key" not in combined
+    # no 32-byte unpadded base64url private key line
+    assert not any(len(ln.strip()) == 43 and not ln.startswith("#") for ln in combined.splitlines())
 
 
 def test_new_api_key_issues_only_a_10_lowercase_hex_key_id():

@@ -157,7 +157,7 @@ def _boot_fails(tmp_path, token_env):
     shutil.copytree(ROOT, app, ignore=shutil.ignore_patterns(".venv", ".git", ".env", "telemetry", "__pycache__"))
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
     env.update({"GATEWAY_PUBLIC_KEYS_FILE": KEYS_FILE, "KIMICLAW_LIMIT_CONCURRENCY": "1024", **token_env})
-    r = subprocess.run([sys.executable, "-c", "import app"], cwd=app, env=env, capture_output=True, text=True, timeout=60)
+    r = subprocess.run([sys.executable, "-c", "from gateway.main import create_app; create_app()"], cwd=app, env=env, capture_output=True, text=True, timeout=60)
     return r
 
 

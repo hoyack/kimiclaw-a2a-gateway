@@ -179,7 +179,9 @@ def start_app(app_dir, n8n_port, extra=None):
                HOME=tempfile.mkdtemp(prefix="golden-"),
                GATEWAY_NOTIFY_URL=f"http://127.0.0.1:{n8n_port}/webhook/firewall", NO_PROXY="*")
     env.update(extra or {})
-    p = subprocess.Popen([sys.executable, "-m", "uvicorn", "app:app", "--port", str(port), "--log-level", "warning"], cwd=app_dir, env=env)
+    if "GATEWAY_PROBE_PORT" not in env:
+        env["GATEWAY_PROBE_PORT"] = str(free_port())
+    p = subprocess.Popen([sys.executable, "-m", "gateway", "--host", "127.0.0.1", "--port", str(port)], cwd=app_dir, env=env)
     base = f"http://127.0.0.1:{port}"
     deadline = time.time() + int(env.get("GATEWAY_SIGNATURE_FUTURE_S", "30")) + 10
     while time.time() < deadline:

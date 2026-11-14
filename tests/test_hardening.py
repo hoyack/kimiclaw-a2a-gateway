@@ -108,6 +108,8 @@ def test_oversized_content_length_is_refused_before_the_body_is_read(base):
     ("", "KIMICLAW_LIMIT_CONCURRENCY is not set"),
     ("nope", "must be an integer"),
     ("128.0", "must be an integer"),
+    ("1_024", "must be an integer"),
+    ("+128", "must be an integer"),
     ("63", "from 64 to 4096"),
     ("4097", "from 64 to 4096"),
 ])
@@ -115,16 +117,34 @@ def test_refuses_to_start_without_a_valid_concurrency_cap(value, needle):
     env = {k: v for k, v in ENV.items() if k != "KIMICLAW_LIMIT_CONCURRENCY"}
     if value is not None:
         env["KIMICLAW_LIMIT_CONCURRENCY"] = value
-    r = subprocess.run([sys.executable, "-c", "import gateway.main"], cwd=ROOT, env=env,
-                       capture_output=True, text=True, timeout=30)
+    r = subprocess.run([sys.executable, "-c", "from gateway.main import limit_concurrency; limit_concurrency()"],
+                       cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
     assert r.returncode != 0 and needle in r.stderr
 
+
+def _probe(p):
+    return p.probe_base
+
+
+def test_uvicorn_app_app_is_refused():
+    r = subprocess.run([sys.executable, "-c", "import app"], cwd=ROOT, env=ENV,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode != 0 and "python -m gateway" in r.stderr and "uvicorn app:app" in r.stderr
+
+
+@pytest.mark.parametrize("value,needle", [
+    ("0", "from 1 to 30"),
+    ("31", "from 1 to 30"),
+    ("5.5", "must be an integer"),
+    ("+5", "must be an integer"),
+])
 
 def test_a_valid_concurrency_cap_is_passed_to_uvicorn_and_logged(tmp_path):
     p, base, _ = start_gateway(tmp_path, {"KIMICLAW_LIMIT_CONCURRENCY": "64"})
     try:
         log = (tmp_path / "gateway.log").read_text()
         assert "uvicorn limit_concurrency=64" in log
+        assert "probe_port=" in log and "workers=1" in log
         port = int(base.rsplit(":", 1)[1])
         held = []
         for _ in range(64):
@@ -133,7 +153,155 @@ def test_a_valid_concurrency_cap_is_passed_to_uvicorn_and_logged(tmp_path):
             held.append(s)
         r = httpx.get(base + "/healthz", timeout=5)
         assert r.status_code == 503, r.status_code
+        probe = httpx.get(_probe(p) + "/healthz", timeout=5)
+        assert probe.status_code == 200, probe.status_code
+        assert httpx.get(_probe(p) + "/readyz", timeout=5).status_code == 200
         [s.close() for s in held]
         assert httpx.get(base + "/healthz", timeout=5).status_code == 200
     finally:
         p.terminate(); p.wait(5)
+
+
+def test_probe_healthz_is_up_and_readyz_is_503_during_the_startup_hold(tmp_path):
+    """Probe listener starts at once; /healthz is 200 during the hold, /readyz is 503 until the main port serves."""
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_SIGNATURE_FUTURE_S": "8"}, wait="probe")
+    try:
+        hz = httpx.get(_probe(p) + "/healthz", timeout=2)
+        assert hz.status_code == 200 and hz.json() == {"status": "up"}
+        ready = httpx.get(_probe(p) + "/readyz", timeout=2)
+        assert ready.status_code == 503 and ready.json() == {"status": "starting"}
+        # main port is not serving yet
+        with pytest.raises(httpx.ConnectError):
+            httpx.get(base + "/healthz", timeout=0.4)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            try:
+                if httpx.get(_probe(p) + "/readyz", timeout=0.5).status_code == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+        assert httpx.get(_probe(p) + "/healthz", timeout=2).json() == {"status": "up"}
+        assert httpx.get(_probe(p) + "/readyz", timeout=2).json() == {"status": "ready"}
+        assert httpx.get(base + "/healthz", timeout=2).status_code == 200
+    finally:
+        p.terminate(); p.wait(5)
+
+
+
+
+def test_a_thousand_quiet_refusals_do_not_write_uvicorn_access_lines_or_client_addresses(tmp_path):
+    """A-1: 1000 quiet 401s produce aggregated lines, no uvicorn access line, no client ip:port."""
+    import re
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_REFUSAL_LOG_S": "1"})
+    try:
+        for _ in range(1000):
+            assert httpx.get(base + "/", timeout=5).status_code == 401
+        time.sleep(1.2)
+        text = (tmp_path / "gateway.log").read_text()
+        refused = [ln for ln in text.splitlines() if "auth refused count=" in ln]
+        assert refused, text
+        total = sum(int(ln.split("count=", 1)[1].split()[0]) for ln in refused)
+        assert total >= 1000, (total, refused)
+        # fewer log lines than refusals (aggregated, not per-request)
+        assert len(text.splitlines()) < 1000
+        assert not any("uvicorn.access" in ln for ln in text.splitlines())
+        access = [ln for ln in text.splitlines() if "kimiclaw.access" in ln or "uvicorn.access" in ln]
+        assert not any(re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}:\d+\b", ln) for ln in access), access
+        assert not any(" GET / 401" in ln or ln.endswith("GET / 401") for ln in access)
+    finally:
+        p.terminate(); p.wait(5)
+
+
+def test_quiet_refusals_are_counted_in_requests_total_and_not_exported_as_spans(tmp_path):
+    tdir = tmp_path / "tel"
+    p, base, _ = start_gateway(tmp_path, {"GATEWAY_TELEMETRY_DIR": str(tdir)})
+    try:
+        assert httpx.get(base + "/", timeout=5).status_code == 401
+        assert httpx.get(base + "/", auth=KEY, timeout=5).status_code == 200
+    finally:
+        p.terminate(); p.wait(10)
+    import json
+    traces = (tdir / "traces.jsonl").read_text() if (tdir / "traces.jsonl").exists() else ""
+    assert "kimiclaw.quiet" not in traces
+    spans = [json.loads(l) for l in traces.splitlines() if l.strip()]
+    # no exported span may be the quiet 401 on /
+    for s in spans:
+        attrs = s.get("attributes") or {}
+        path = attrs.get("url.path") or attrs.get("http.target") or attrs.get("http.route")
+        status = attrs.get("http.response.status_code") or attrs.get("http.status_code")
+        assert not (path in ("/", "") and status == 401), s
+    slash_rpc = [s for s in spans if s.get("name") == "rpc" and (s.get("attributes") or {}).get("url.path") == "/"]
+    assert len(slash_rpc) == 1 and slash_rpc[0]["attributes"].get("http.response.status_code") == 200
+    metrics = (tdir / "metrics.jsonl").read_text() if (tdir / "metrics.jsonl").exists() else ""
+    assert "gateway.requests" in metrics
+    assert "401" in metrics and "200" in metrics
+
+def test_plain_uvicorn_including_workers_2_is_refused():
+    """W-1: python -m gateway is the only launcher; a second worker must not be startable."""
+    from conftest import free_port
+    port = free_port()
+    r = subprocess.run(
+        [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=15)
+    assert r.returncode != 0 and "python -m gateway" in (r.stderr + r.stdout)
+    # --workers 2 runs a supervisor that may not exit when the workers fail to import
+    port = free_port()
+    p = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", str(port), "--workers", "2"],
+        cwd=ROOT, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        try:
+            out, _ = p.communicate(timeout=8)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, _ = p.communicate()
+        assert "python -m gateway" in (out or ""), out
+        try:
+            status = httpx.get(f"http://127.0.0.1:{port}/healthz", timeout=1).status_code
+        except httpx.HTTPError:
+            status = None
+        assert status not in (200, 503), status
+    finally:
+        p.kill(); p.wait(5)
+
+def test_concurrency_cap_is_taken_from_the_env_only_and_logged_after_it_is_applied(tmp_path):
+    """C-1: no --limit-concurrency flag; the env value is logged only after Config has it."""
+    r = subprocess.run(
+        [sys.executable, "-m", "gateway", "--limit-concurrency", "128"],
+        cwd=ROOT, env=ENV, capture_output=True, text=True, timeout=15)
+    assert r.returncode != 0
+    err = r.stderr + r.stdout
+    assert "unrecognized arguments" in err or "limit-concurrency" in err
+    assert "uvicorn limit_concurrency=" not in err
+    p, base, _ = start_gateway(tmp_path, {"KIMICLAW_LIMIT_CONCURRENCY": "64"})
+    try:
+        log = (tmp_path / "gateway.log").read_text()
+        assert "uvicorn limit_concurrency=64" in log
+        # logged after the cap was bound onto the main Config, not before serve is configured
+        assert log.index("uvicorn limit_concurrency=64") < log.index("probe listening")
+        assert httpx.get(base + "/healthz", timeout=5).status_code == 200
+    finally:
+        p.terminate(); p.wait(5)
+
+def test_probe_port_404s_every_main_app_route_and_wrong_methods(tmp_path):
+    p, base, _ = start_gateway(tmp_path, {})
+    probe = _probe(p)
+    try:
+        assert httpx.get(probe + "/healthz", timeout=5).json() == {"status": "up"}
+        assert httpx.get(probe + "/readyz", timeout=5).json() == {"status": "ready"}
+        for path in ("/", "/.well-known/agent.json", "/docs", "/openapi.json", "/redoc",
+                     "/healthz/x", "/readyz/x", "/message/send"):
+            unsigned = httpx.get(probe + path, timeout=5)
+            assert unsigned.status_code == 404 and unsigned.json() == {"status": "not found"}, (path, unsigned.status_code)
+            signed = httpx.get(probe + path, auth=KEY, timeout=5)
+            assert signed.status_code == 404, (path, signed.status_code)
+            posted = httpx.post(probe + path, content=b"{}", auth=KEY, timeout=5)
+            assert posted.status_code == 404, (path, posted.status_code)
+        for method, path in (("POST", "/healthz"), ("PUT", "/healthz"), ("POST", "/readyz"),
+                             ("PUT", "/readyz"), ("DELETE", "/healthz")):
+            r = httpx.request(method, probe + path, timeout=5)
+            assert r.status_code == 404 and r.json() == {"status": "not found"}, (method, path, r.status_code)
+    finally:
+        p.terminate(); p.wait(5)
+

@@ -1,8 +1,3 @@
-"""Kimiclaw A2A Gateway entrypoint (kept so `uvicorn app:app` is unchanged).
+"""Importing this module is refused. Start the gateway with `python -m gateway`."""
 
-Exposes the local OpenClaw agent over the A2A protocol (v1.0 subset).
-Public: agent card at /.well-known/agent.json
-Signed requests only (X-KC-* Ed25519 headers): JSON-RPC at / (message/send, message/stream, tasks/get, tasks/cancel)
-"""
-
-from gateway.main import app  # noqa: F401
+raise RuntimeError("start with `python -m gateway`; `uvicorn app:app` is not supported")

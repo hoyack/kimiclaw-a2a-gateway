@@ -9,7 +9,9 @@ sys.path.insert(0, ROOT)
 
 import yaml  # noqa: E402
 
-from gateway.main import app  # noqa: E402
+from gateway.main import create_app  # noqa: E402
+
+app = create_app()
 
 with open(os.path.join(ROOT, "openapi.yaml"), "w") as f:
     yaml.safe_dump(app.openapi(), f, sort_keys=False, allow_unicode=True)

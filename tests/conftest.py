@@ -67,7 +67,9 @@ class Mock:
         return self.requests
 
 
-def start_gateway(tmp_path, extra_env):
+def start_gateway(tmp_path, extra_env, wait="main"):
+    """Start `python -m gateway`. wait='main' blocks until the main port is serving (after the hold);
+    wait='probe' returns as soon as the probe /healthz is up (during the hold)."""
     port = free_port()
     rec = tmp_path / "argv.jsonl"
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GATEWAY_", "KIMICLAW_"))}
@@ -80,18 +82,27 @@ def start_gateway(tmp_path, extra_env):
         "NO_PROXY": "*",
     })
     env.update(extra_env)
+    probe_port = int(env["GATEWAY_PROBE_PORT"]) if env.get("GATEWAY_PROBE_PORT") else free_port()
+    env["GATEWAY_PROBE_PORT"] = str(probe_port)
     log = open(tmp_path / "gateway.log", "w")
-    p = subprocess.Popen([sys.executable, "-m", "uvicorn", "app:app", "--port", str(port)],
+    p = subprocess.Popen([sys.executable, "-m", "gateway", "--host", "127.0.0.1", "--port", str(port)],
                          cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+    log.close()
     base = f"http://127.0.0.1:{port}"
+    probe_base = f"http://127.0.0.1:{probe_port}"
+    p.probe_base = probe_base
+    (tmp_path / "probe_url").write_text(probe_base)
+    ready = (base + "/.well-known/agent.json") if wait == "main" else (probe_base + "/healthz")
     deadline = time.time() + int(env.get("GATEWAY_SIGNATURE_FUTURE_S", "30")) + 10
     while time.time() < deadline:
         if p.poll() is not None:
             break
         try:
-            httpx.get(base + "/.well-known/agent.json", timeout=0.5); break
+            httpx.get(ready, timeout=0.5); break
         except Exception:
-            time.sleep(0.1)
+            time.sleep(0.05)
+    if p.poll() is not None:
+        raise RuntimeError(f"gateway exited {p.returncode}: {(tmp_path / 'gateway.log').read_text()}")
     return p, base, rec
 
 

@@ -346,7 +346,8 @@ os.environ["GATEWAY_PUBLIC_KEYS_FILE"] = KEYS_FILE
 from fastapi.testclient import TestClient
 from sign_request import Signer, signed_headers
 from gateway import auth
-from gateway.main import app
+from gateway.main import create_app
+app = create_app()
 body = b'{"jsonrpc": "2.0", "id": "1", "method": "tasks/get", "params": {"id": "nope"}}'
 auth.STARTED_S = int(time.time()) - 40
 log = io.StringIO()
@@ -378,7 +379,8 @@ os.environ["GATEWAY_PUBLIC_KEYS_FILE"] = KEYS_FILE
 from fastapi.testclient import TestClient
 from sign_request import signed_headers
 from gateway import auth
-from gateway.main import app
+from gateway.main import create_app
+app = create_app()
 body = b'{"jsonrpc": "2.0", "id": "1", "method": "tasks/get", "params": {"id": "nope"}}'
 auth.STARTED_S = int(time.time()) - 400
 def send(skew):
@@ -429,7 +431,8 @@ from conftest import KEY, KEYS_FILE
 os.environ["GATEWAY_PUBLIC_KEYS_FILE"] = KEYS_FILE
 from fastapi.testclient import TestClient
 from gateway import auth
-from gateway.main import app
+from gateway.main import create_app
+app = create_app()
 with TestClient(app, base_url="http://127.0.0.1") as c:
     codes = [c.get("/", auth=KEY).status_code for _ in range(2)]
     auth._nonces.clear()

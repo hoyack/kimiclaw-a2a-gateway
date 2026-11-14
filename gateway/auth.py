@@ -1,9 +1,7 @@
 """Ed25519-signed requests (X-KC-* headers, callers' public keys from GATEWAY_PUBLIC_KEYS_FILE) and per-key token buckets."""
 import asyncio
-import contextvars
 import hashlib
 import heapq
-import logging
 import math
 import os
 import re
@@ -34,20 +32,6 @@ READ_FAILURES = {"too_large": (413, "request body too large"), "read_deadline": 
 QUIET_READS = {"pool_full", "read_deadline", "read_idle"}  # 429/408: aggregate, no per-request log or trace
 _refusals: dict[str, dict] = {}  # pool_name -> {reasons, task}
 REFUSAL_LOG_S = float(os.environ.get("GATEWAY_REFUSAL_LOG_S", "1"))
-_quiet_log = contextvars.ContextVar("kc_quiet_log", default=False)
-
-
-class _SkipQuietAccess(logging.Filter):
-    """Drop uvicorn access-log lines for quiet refusals (precheck 401s and pool 429/408)."""
-
-    def filter(self, record):
-        return not _quiet_log.get()
-
-
-def install_access_log_filter():
-    log = logging.getLogger("uvicorn.access")
-    if not any(isinstance(f, _SkipQuietAccess) for f in log.filters):
-        log.addFilter(_SkipQuietAccess())
 
 
 # rpc method -> (tokens per second, bucket size)
@@ -173,7 +157,6 @@ async def _flush_refusals(pool_name: str):
 def note_refusal(request: Request, pool_name: str, reason: str):
     """Quiet refusal: one aggregated log line per pool per interval, no per-request log, trace, or access log."""
     request.state.quiet_read = True
-    _quiet_log.set(True)
     rec = _refusals.setdefault(pool_name, {"reasons": {}, "task": None})
     rec["reasons"][reason] = rec["reasons"].get(reason, 0) + 1
     if REFUSAL_LOG_S <= 0:

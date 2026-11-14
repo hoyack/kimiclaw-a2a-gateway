@@ -32,6 +32,7 @@ agent_ms = meter.create_histogram("gateway.agent.duration", unit="ms")
 notify_failures = meter.create_counter("gateway.notify.failures")
 breaker_opens = meter.create_counter("gateway.notify.breaker_opens")
 
+ACCESS = logging.getLogger("kimiclaw.access")
 EVENTS = logging.getLogger("kimiclaw.telemetry")  # structured events only; not propagated to stdout
 EVENTS.propagate = False
 EVENTS.setLevel(logging.INFO)
@@ -159,16 +160,18 @@ async def telemetry_middleware(request, call_next):
     state = {"status": 500}
 
     def finish():
-        if getattr(request, "state", None) is not None and getattr(request.state, "quiet_read", False):
-            span.set_attribute("kimiclaw.quiet", True)
-            span.end()
-            return
         ms = (time.perf_counter() - started) * 1000
         status = state["status"]
-        span.set_attribute("http.response.status_code", status)
+        quiet = getattr(request, "state", None) is not None and getattr(request.state, "quiet_read", False)
         attrs = {"http.request.method": request.method, "http.response.status_code": status}
         requests_total.add(1, attrs)
         request_ms.record(ms, attrs)
+        if quiet:
+            span.set_attribute("kimiclaw.quiet", True)
+            span.end()
+            return
+        span.set_attribute("http.response.status_code", status)
+        ACCESS.info("%s %s %s", request.method, request.url.path, status)
         with trace.use_span(span):
             event("http_request", method=request.method, path=request.url.path, status=status,
                   duration_ms=round(ms, 1), key_id=getattr(request.state, "key_id", None),

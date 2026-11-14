@@ -14,17 +14,21 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt            # requirements-dev.txt for tests
 export KIMICLAW_TOKEN=...                  # only with GATEWAY_NOTIFY_URL; or KIMICLAW_TOKEN=... in .env (chmod 600)
 export GATEWAY_PUBLIC_KEYS_FILE=/path/to/keys.txt # callers' Ed25519 public keys, see "Caller keys"
-uvicorn app:app --host 127.0.0.1 --port 8000
+export KIMICLAW_LIMIT_CONCURRENCY=1024     # required; integer 64–4096
+python -m gateway --host 127.0.0.1 --port 8000
 ```
-`openclaw` must be on PATH. The app refuses to start without a valid `GATEWAY_PUBLIC_KEYS_FILE`, or without `KIMICLAW_TOKEN` when `GATEWAY_NOTIFY_URL` is set.
+`openclaw` must be on PATH. The app refuses to start without a valid `GATEWAY_PUBLIC_KEYS_FILE`, without `KIMICLAW_LIMIT_CONCURRENCY`, or without `KIMICLAW_TOKEN` when `GATEWAY_NOTIFY_URL` is set. The only supported launcher is `python -m gateway`, which pins one worker, applies the concurrency cap, starts the probe listener, and arms the request-header timeout. `uvicorn app:app` is refused at import.
 
-Docker: `docker build -t kimiclaw-gw . && docker run -e GATEWAY_PUBLIC_KEYS_FILE=/keys/keys.txt -v $PWD/keys.txt:/keys/keys.txt:ro -p 8000:8000 kimiclaw-gw`
-(the image does not contain openclaw; add it in a derived image or mount it).
+Docker: the image CMD is still `uvicorn app:app` and must be overridden to `["python","-m","gateway"]`, with `KIMICLAW_LIMIT_CONCURRENCY` set and both 8000 and 8001 published. The stock HEALTHCHECK still hits `:8000/healthz` and should be moved to `:8001/healthz`. The image does not contain openclaw; add it in a derived image or mount it.
+
+A reverse proxy with client header and body timeouts (for example ingress nginx) is required in front of the gateway for any public deploy. uvicorn 0.54 counts idle connections toward `limit_concurrency` and will not time them out on its own.
 
 ## Layout
 
 ```
-app.py                     entrypoint shim (uvicorn app:app)
+app.py                     refused shim (`uvicorn app:app` is not supported)
+gateway/__main__.py        only supported entrypoint (`python -m gateway`)
+gateway/probe.py           tiny ASGI app for the uncapped probe port (GET /healthz, GET /readyz only)
 gateway/config.py          env settings + .env fallback
 gateway/models.py          agent card, wire builders, pydantic schemas (docs only)
 gateway/auth.py            signature middleware (per-caller Ed25519 public keys, nonces, POST / rate limit)
@@ -98,12 +102,12 @@ duplicate-key rule to get wrong. This is the reviewed design from the HMAC round
 
 The gateway verifies the signature from headers alone, before it reads the body. Checks run in this order: each of the five headers present exactly once (a repeated `X-KC-*` header is rejected) and well formed (`X-KC-Content-SHA256` is exactly 64 lowercase hex characters); the timestamp at most 300 s behind its clock and at most 30 s ahead (`GATEWAY_SIGNATURE_PAST_S`, `GATEWAY_SIGNATURE_FUTURE_S`) and later than the start second plus `GATEWAY_SIGNATURE_FUTURE_S`; then the key lookup; then the Ed25519 verify over the canonical string that uses the hash from the header (line 5). An unknown `key_id` is refused at lookup with no dummy verify and no body read. A signature that isn't 128 lowercase hex chars is rejected as malformed, and a verify failure of any kind is a plain 401, never an exception. Only a request whose signature verifies has its nonce checked and recorded. A nonce already used by the same caller within the window is rejected (401). Next, the caller's nonce quota must have room (else 429, with no bucket token spent). Then every signed request, including `GET /`, `/docs` and unknown JSON-RPC methods, pays the caller's general token bucket (`GATEWAY_REQUESTS_PER_S`, default 5/s, burst `GATEWAY_REQUESTS_BURST` 10); when it is empty the caller gets 429 and no nonce is kept. Only then is the nonce stored. The per-method limits below apply on top.
 
-Only a request that has already verified enters that caller's reserved read pool. There is no unauthenticated pre-auth pool and no shared unknown-key pool: missing, duplicate or malformed headers, an unknown `key_id`, a timestamp outside the window or caught by the restart rule, a replayed nonce, and a bad signature are all refused with a byte-identical generic 401, without taking a slot, reading the body, writing a per-request log or trace, or emitting an access-log line. Those refusals go into one aggregated log line per second (`auth refused count=N reasons=missing_header:N,...`).
+Only a request that has already verified enters that caller's reserved read pool. There is no unauthenticated pre-auth pool and no shared unknown-key pool: missing, duplicate or malformed headers, an unknown `key_id`, a timestamp outside the window or caught by the restart rule, a replayed nonce, and a bad signature are all refused with a byte-identical generic 401, without taking a slot, reading the body, writing a per-request log or trace, or emitting an access-log line (and no access line contains a client ip:port). Those refusals go into one aggregated log line per second (`auth refused count=N reasons=missing_header:N,...`).
 
 - Each known caller has its own reserved pool of `GATEWAY_READS_PER_CALLER` reads (default 3, allowed 2 to 4, checked at startup). Only that caller's verified requests can use those slots. Over the floor, that caller gets `429 {"error": "rate limited"}` with `Retry-After: 1`. One caller cannot take another caller's reserved slots.
 - The body is then streamed under `MAX_BODY` (1 MB, else 413) with a total deadline (`GATEWAY_BODY_READ_TIMEOUT_S`, default 10 s) and a limit on the gap between chunks (`GATEWAY_BODY_IDLE_TIMEOUT_S`, default 5 s); past either the request gets `408 {"error": "request timeout"}`. As it streams, the body is hashed; if that hash does not match `X-KC-Content-SHA256`, the response is the same generic 401 (`body_hash_mismatch`). A client that disconnects mid-body gets nothing back and no traceback is logged. The slot is always freed in `finally`.
-- 429 and 408 from the read pools (pool_full, read_deadline, read_idle) are not logged or traced per request, and they do not write an access-log line. One aggregated line per pool per second records the count and reasons (`read refused pool=caller count=N reasons=pool_full:N,...`). Per-request logs remain for 413 (`too_large`) and a client disconnect (`client_disconnected`).
-- `GET /healthz` and `GET /readyz` (and `GET /.well-known/agent.json`) are handled before any auth or pool logic and never compete for slots.
+- 429 and 408 from the read pools (pool_full, read_deadline, read_idle) are not logged or traced per request, and they do not write an access-log line (uvicorn access logging is off; our own access logger also skips quiet refusals and never writes a client ip:port). One aggregated line per pool per second records the count and reasons (`read refused pool=caller count=N reasons=pool_full:N,...`). Per-request logs remain for 413 (`too_large`) and a client disconnect (`client_disconnected`).
+- `GET /healthz` and `GET /readyz` exist on the main port, inside the concurrency cap, so they are the wrong targets for Kubernetes probes. Use the uncapped probe listener (`GATEWAY_PROBE_PORT`, default 8001), which is a separate tiny ASGI app (not the main app) that serves only `GET /healthz` and `GET /readyz`. `/healthz` (liveness and startup) returns 200 `{"status":"up"}` as soon as the process is up, including during the ~31 s startup hold. `/readyz` (readiness) returns 503 `{"status":"starting"}` during the hold and 200 `{"status":"ready"}` once the main port is serving (or 503 `{"status":"not ready"}` if `openclaw` is not on PATH). Any other path or method on the probe port is 404 `{"status":"not found"}`, with no auth, no pools and no telemetry. `GET /.well-known/agent.json` stays on the main port only, public, and never competes for reserved read slots.
 
 Unauthenticated floods therefore cannot fill a caller's pool or force a 503 on a signed request. key_ids are not secret (they travel in every request) and an immediate 401 for an unknown `key_id` is a timing oracle for whether that id is loaded; the id format is only 10 lowercase hex characters (40 bits from `secrets`, issued only by `tools/new_api_key.py`; callers never choose a key_id; the loader does not accept `kc_<hex>`). A per-IP connection cap belongs at the edge, not in the gateway.
 
@@ -200,7 +204,8 @@ See `.env.example` for a placeholder template. For the n8n A2A_Firewall webhook 
 | `GATEWAY_REQUESTS_PER_S` / `GATEWAY_REQUESTS_BURST` | `5` / `10` | per caller: every signed request (any path or method), checked before its nonce is stored; empty gets 429 |
 | `GATEWAY_MAX_NONCES_PER_CALLER` | `20000` | per caller: live nonces kept for replay checks; more gets 429 until the oldest expires |
 | `GATEWAY_SIGNATURE_PAST_S` / `GATEWAY_SIGNATURE_FUTURE_S` | `300` / `30` | how far behind / ahead of the gateway clock a signed timestamp may be; ahead must not exceed behind. Startup waits `FUTURE_S + 1` s (~31 s by default) so a future-stamped request captured before a restart cannot be replayed after it |
-| `KIMICLAW_LIMIT_CONCURRENCY` | required (no default) | uvicorn's `--limit-concurrency`; an integer from 64 to 4096, fail closed if missing or out of range. Recommended 1024. The Dockerfile CMD does not pass this flag; the app reads the env and binds it when started as `uvicorn app:app` |
+| `KIMICLAW_LIMIT_CONCURRENCY` | required (no default) | uvicorn concurrency cap on the main port; an integer from 64 to 4096 (`^[0-9]+$` only), fail closed if missing or out of range. Recommended 1024. Applied only by `python -m gateway` (CMD `["python","-m","gateway"]`), which also pins `workers=1`. `uvicorn app:app` is refused; do not pass `--limit-concurrency` or `--workers` on a command line — the launcher does not take those flags, so an env or CLI override cannot fight it |
+| `GATEWAY_PROBE_PORT` | `8001` | uncapped probe listener in the same process: `GET /healthz` and `GET /readyz`. Must differ from the main port. Range 1–65535, digits only |
 | `GATEWAY_READS_PER_CALLER` | `3` | per caller: reserved body-read slots for already-verified requests (2 to 4); more gets 429 |
 | `GATEWAY_BODY_READ_TIMEOUT_S` / `GATEWAY_BODY_IDLE_TIMEOUT_S` | `10` / `5` | total time to read a body / longest gap between chunks; past either gets 408 |
 | `GATEWAY_MAX_TASKS_PER_KEY` | `100` | per caller: stored tasks; the oldest finished ones are dropped past this |

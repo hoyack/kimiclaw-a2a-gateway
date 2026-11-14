@@ -1,7 +1,7 @@
-"""App factory."""
+"""App factory. The process is started only by `python -m gateway`."""
 import asyncio
-import inspect
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 
@@ -12,53 +12,57 @@ from gateway import auth, telemetry
 from gateway.config import LOG, SIGNATURE_FUTURE_S
 from gateway.models import SCHEMAS, SECURITY_SCHEMES
 from gateway.routes import a2a, health
+from gateway.routes.health import set_main_serving
 
 LIMIT_CONCURRENCY_MIN = 64
 LIMIT_CONCURRENCY_MAX = 4096
+PROBE_PORT_DEFAULT = 8001
+_DIGITS = re.compile(r"^[0-9]+$")
+
+
+def _env_int(name: str, raw, lo: int, hi: int, *, required: bool, default: int | None = None) -> int:
+    if raw is None or not str(raw).strip():
+        if required:
+            raise RuntimeError(f"{name} is not set (want an integer from {lo} to {hi})")
+        return default
+    text = str(raw).strip()
+    if not _DIGITS.fullmatch(text):
+        raise RuntimeError(f"{name} must be an integer from {lo} to {hi}")
+    n = int(text, 10)
+    if not lo <= n <= hi:
+        raise RuntimeError(f"{name} must be an integer from {lo} to {hi}")
+    return n
 
 
 def limit_concurrency() -> int:
     """KIMICLAW_LIMIT_CONCURRENCY is required: an integer from 64 to 4096, passed to uvicorn."""
-    raw = os.environ.get("KIMICLAW_LIMIT_CONCURRENCY")
-    if raw is None or not str(raw).strip():
-        raise RuntimeError("KIMICLAW_LIMIT_CONCURRENCY is not set (want an integer from 64 to 4096)")
-    try:
-        n = int(raw, 10)
-    except ValueError:
-        raise RuntimeError("KIMICLAW_LIMIT_CONCURRENCY must be an integer from 64 to 4096") from None
-    if not LIMIT_CONCURRENCY_MIN <= n <= LIMIT_CONCURRENCY_MAX:
-        raise RuntimeError("KIMICLAW_LIMIT_CONCURRENCY must be an integer from 64 to 4096")
-    return n
+    return _env_int("KIMICLAW_LIMIT_CONCURRENCY", os.environ.get("KIMICLAW_LIMIT_CONCURRENCY"),
+                    LIMIT_CONCURRENCY_MIN, LIMIT_CONCURRENCY_MAX, required=True)
 
 
-def bind_uvicorn_limit_concurrency(cap: int) -> None:
-    """When this module is loaded by `uvicorn app:app`, Config already exists; set limit_concurrency on it."""
-    for fr in inspect.stack():
-        self_obj = fr.frame.f_locals.get("self")
-        if (self_obj is not None and type(self_obj).__module__.startswith("uvicorn.")
-                and type(self_obj).__name__ == "Config" and hasattr(self_obj, "limit_concurrency")):
-            self_obj.limit_concurrency = cap
-            return
+def probe_port() -> int:
+    """GATEWAY_PROBE_PORT: uncapped /healthz and /readyz listener (default 8001)."""
+    return _env_int("GATEWAY_PROBE_PORT", os.environ.get("GATEWAY_PROBE_PORT"),
+                    1, 65535, required=False, default=PROBE_PORT_DEFAULT)
+
 
 @asynccontextmanager
 async def lifespan(app):
     LOG.warning("rate limits and task caps are per process; run exactly one replica and one worker")
     await asyncio.sleep(max(0.0, auth.STARTED_S + SIGNATURE_FUTURE_S + 1 - time.time()))  # serve only after STARTED_S + FUTURE_S
     yield
+    set_main_serving(False)
     telemetry.shutdown()  # flush spans/metrics on graceful stop
 
 
 def create_app() -> FastAPI:
-    cap = limit_concurrency()
-    bind_uvicorn_limit_concurrency(cap)
-    LOG.warning("uvicorn limit_concurrency=%d", cap)
-    app = FastAPI(title="Kimiclaw A2A Gateway", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Kimiclaw A2A Gateway", version="0.1.0", lifespan=lifespan,
+                 telemetry={"tracing": False, "operation_spans": False, "metrics": False, "logs": False})
     telemetry.setup()
-    auth.install_access_log_filter()
     app.middleware("http")(auth.signed_auth)
-    app.middleware("http")(telemetry.telemetry_middleware)  # added last = outermost, so 401s are recorded
+    app.middleware("http")(telemetry.telemetry_middleware)  # added last = outermost; quiet refusals are counted, not traced
     app.include_router(a2a.router)
-    app.include_router(health.router)
+    app.include_router(health.router)  # also on the main port, inside the concurrency cap; probes must use GATEWAY_PROBE_PORT
 
     def openapi():
         if app.openapi_schema is None:
@@ -75,6 +79,3 @@ def create_app() -> FastAPI:
 
     app.openapi = openapi
     return app
-
-
-app = create_app()
